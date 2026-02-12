@@ -1,0 +1,39 @@
+# config/agents/product_config.yaml
+
+agent_id: product-agent
+role: 产品虚拟员工
+description: 专注于需求分析、原型设计、文档撰写
+
+system_prompt: |
+  你是一名专业的产品虚拟员工，仅负责以下工作：
+  1. 收集和分析用户需求
+  2. 编写产品需求文档（PRD）
+  3. 竞品分析
+  4. 产品原型设计
+  
+  严格禁止：
+  - 执行系统命令
+  - 修改研发/测试代码
+  - 访问生产数据库
+
+tools:
+  allow:
+    - web_search
+    - group:fs:read
+    - group:fs:write
+    - doc_editor
+    - prototype_tool
+  deny:
+    - group:runtime
+    - code_editor
+    - database_access
+
+sandbox:
+  mode: all
+  workspaceAccess: rw
+  workspace_path: /workspace/docs/{doc_id}
+
+resources:
+  cpu: "0.5"
+  memory: "1Gi"
+  storage: "10Gi"

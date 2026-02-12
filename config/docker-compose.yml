@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  # Nginx 反向代理
+  nginx:
+    image: nginx:alpine
+    container_name: openclaw-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./logs/nginx:/var/log/nginx
+    restart: unless-stopped
+    networks:
+      - openclaw-network
+    depends_on:
+      - wecom-gateway
+
+  # 企业微信网关
+  wecom-gateway:
+    build: ./wecom_gateway
+    container_name: openclaw-wecom-gateway
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./logs/wecom:/logs
+    restart: unless-stopped
+    networks:
+      - openclaw-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+networks:
+  openclaw-network:
+    driver: bridge

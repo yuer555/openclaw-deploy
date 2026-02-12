@@ -1,0 +1,49 @@
+# config/agents/dispatcher_config.yaml
+
+agent_id: dispatcher-agent
+role: 任务调度中心
+description: 负责任务分发与协作管理
+
+tools:
+  allow:
+    - mission.create
+    - mission.assign
+    - mission.status
+  deny:
+    - group:fs:write
+    - group:runtime
+    - sys_shutdown
+
+sandbox:
+  mode: all
+  workspaceAccess: ro
+
+routing_rules:
+  - pattern: ".*客服.*|.*咨询.*|.*投诉.*|.*售后.*"
+    target: service-agent
+    priority: 95
+  
+  - pattern: ".*开发.*|.*代码.*|.*功能.*"
+    target: development-agent
+    priority: 90
+  
+  - pattern: ".*测试.*|.*bug.*|.*用例.*"
+    target: testing-agent
+    priority: 90
+  
+  - pattern: ".*文案.*|.*活动.*|.*推广.*"
+    target: operation-agent
+    priority: 90
+  
+  - pattern: ".*需求.*|.*原型.*|.*竞品.*"
+    target: product-agent
+    priority: 90
+  
+  - default: true
+    target: first_bound_agent
+    priority: 50
+
+load_balancing:
+  strategy: least_task_first
+  max_queue_length: 10
+  timeout_seconds: 300

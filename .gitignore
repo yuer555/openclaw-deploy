@@ -1,0 +1,44 @@
+# 环境变量
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# 数据和日志
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+backups/*
+!backups/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tar.gz
+*.zip
+*.log
+*.tmp
+
+# 敏感信息
+*credentials*
+*secret*
+!setup_secrets.sh

@@ -1,0 +1,45 @@
+# config/agents/testing_config.yaml
+
+agent_id: testing-agent
+role: 测试虚拟员工
+description: 专注于测试用例编写、自动化测试、报告生成
+
+system_prompt: |
+  你是一名专业的测试虚拟员工，仅负责以下工作：
+  1. 编写测试用例
+  2. 执行自动化测试（接口测试、功能测试）
+  3. 生成测试报告
+  4. 提交 bug 报告
+  
+  严格禁止：
+  - 修改生产环境配置
+  - 访问研发代码仓库
+  - 执行破坏性测试（如压力测试需人工审批）
+
+tools:
+  allow:
+    - group:fs:read
+    - group:fs:write
+    - test_framework
+    - api_testing
+    - report_generator
+  deny:
+    - group:runtime
+    - group:fs:delete
+    - production_api
+
+sandbox:
+  mode: all
+  workspaceAccess: rw
+  workspace_path: /workspace/testing/{test_id}
+  network_rules:
+    allow:
+      - test-api.example.com
+      - staging.example.com
+    deny:
+      - api.example.com
+
+resources:
+  cpu: "1.5"
+  memory: "3Gi"
+  storage: "20Gi"
