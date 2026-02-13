@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # 运营虚拟员工
+  operation-agent:
+    image: node:24-alpine
+    container_name: operation-agent
+    restart: unless-stopped
+    working_dir: /workspace
+    environment:
+      - NODE_ENV=production
+      - AGENT_ID=operation
+      - AGENT_NAME=运营助手
+    volumes:
+      - ./agents/operation:/workspace
+      - ./data:/data
+      - ./logs:/logs
+    networks:
+      - openclaw-network
+    command: sh -c "apk add --no-cache git && npm install -g openclaw@latest && openclaw gateway start"
+
+  # 产品虚拟员工
+  product-agent:
+    image: node:24-alpine
+    container_name: product-agent
+    restart: unless-stopped
+    working_dir: /workspace
+    environment:
+      - NODE_ENV=production
+      - AGENT_ID=product
+      - AGENT_NAME=产品经理
+    volumes:
+      - ./agents/product:/workspace
+      - ./data:/data
+      - ./logs:/logs
+    networks:
+      - openclaw-network
+    command: sh -c "apk add --no-cache git && npm install -g openclaw@latest && openclaw gateway start"
+
+  # 研发虚拟员工
+  development-agent:
+    image: node:24-alpine
+    container_name: development-agent
+    restart: unless-stopped
+    working_dir: /workspace
+    environment:
+      - NODE_ENV=production
+      - AGENT_ID=development
+      - AGENT_NAME=开发工程师
+    volumes:
+      - ./agents/development:/workspace
+      - ./data:/data
+      - ./logs:/logs
+    networks:
+      - openclaw-network
+    command: sh -c "apk add --no-cache git && npm install -g openclaw@latest && openclaw gateway start"
+
+  # 测试虚拟员工
+  testing-agent:
+    image: node:24-alpine
+    container_name: testing-agent
+    restart: unless-stopped
+    working_dir: /workspace
+    environment:
+      - NODE_ENV=production
+      - AGENT_ID=testing
+      - AGENT_NAME=测试工程师
+    volumes:
+      - ./agents/testing:/workspace
+      - ./data:/data
+      - ./logs:/logs
+    networks:
+      - openclaw-network
+    command: sh -c "apk add --no-cache git && npm install -g openclaw@latest && openclaw gateway start"
+
+networks:
+  openclaw-network:
+    driver: bridge

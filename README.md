@@ -15,6 +15,8 @@ cat docs/01-快速开始.md    # 新用户入门
 
 ### 2. 部署系统
 
+**方式A：企业微信网关部署（企业微信集成）**
+
 ```bash
 # 自动打包上传
 bash scripts/deploy/deploy-optimizations.sh
@@ -23,9 +25,22 @@ bash scripts/deploy/deploy-optimizations.sh
 bash scripts/deploy/package-only.sh
 ```
 
-### 3. 配置企业微信
+**方式B：虚拟员工容器部署（独立运行）** 🆕
 
-参考 `docs/04-企业微信配置.md`
+```bash
+# 本地一键部署到服务器
+bash scripts/deploy/local-deploy-agents.sh
+
+# 或手动上传后部署
+bash scripts/deploy/deploy-agents.sh
+```
+
+详见 `docs/09-虚拟员工部署.md`
+
+### 3. 配置认证
+
+- **企业微信**：参考 `docs/04-企业微信配置.md`
+- **GitHub Copilot**：参考 `docs/10-GitHub-Copilot配置.md` 🆕
 
 ## 📁 项目结构
 
@@ -84,6 +99,8 @@ openclaw-deploy/
 - ✅ 完整的安全防护体系
 - ✅ 监控告警系统
 - ✅ 自动化运维脚本
+- ✅ 虚拟员工容器化部署 🆕（独立运行模式）
+- ✅ GitHub Copilot 模型支持 🆕
 
 ## 🔒 安全特性
 
