@@ -1,0 +1,81 @@
+version: '3.8'
+
+#==============================================================================
+# OpenClaw 本地测试环境 - Docker Compose 配置
+# 版本: V1.4
+# 用途: 本地开发和测试
+#==============================================================================
+
+services:
+  #----------------------------------------------------------------------------
+  # OpenClaw Gateway 服务
+  #----------------------------------------------------------------------------
+  openclaw-local:
+    image: openclaw/openclaw:latest
+    container_name: openclaw-local
+    restart: unless-stopped
+    
+    # 环境变量
+    environment:
+      - NODE_ENV=development
+      - OPENCLAW_ENV=${OPENCLAW_ENV:-local}
+      - LOG_LEVEL=${LOG_LEVEL:-debug}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///data/openclaw.db}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SECRET_KEY=${SECRET_KEY:-local-secret-key}
+      - AGENTS_ENABLED=${AGENTS_ENABLED:-dispatcher,operation,product,development,testing,service}
+    
+    # 端口映射
+    ports:
+      - "3000:3000"
+    
+    # 数据卷挂载
+    volumes:
+      - ../data/local:/data
+      - ../logs/local:/logs
+      - ../config/agents:/config/agents:ro
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # 网络
+    networks:
+      - openclaw-local-network
+
+#------------------------------------------------------------------------------
+# 网络配置
+#------------------------------------------------------------------------------
+networks:
+  openclaw-local-network:
+    driver: bridge
+    name: openclaw-local-net
+
+#------------------------------------------------------------------------------
+# 数据卷配置（可选）
+#------------------------------------------------------------------------------
+volumes:
+  openclaw-local-data:
+    name: openclaw-local-data

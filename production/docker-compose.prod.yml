@@ -1,0 +1,167 @@
+version: '3.8'
+
+#==============================================================================
+# OpenClaw 生产环境 - Docker Compose 配置
+# 版本: V1.4
+# 用途: 生产部署
+#==============================================================================
+
+services:
+  #----------------------------------------------------------------------------
+  # OpenClaw Gateway 服务
+  #----------------------------------------------------------------------------
+  openclaw-production:
+    image: openclaw/openclaw:latest
+    container_name: openclaw-production
+    restart: always
+    
+    # 环境变量
+    environment:
+      - NODE_ENV=production
+      - OPENCLAW_ENV=${OPENCLAW_ENV:-production}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - DATABASE_URL=${DATABASE_URL}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SECRET_KEY=${SECRET_KEY}
+      - AGENTS_ENABLED=${AGENTS_ENABLED}
+      - WECOM_CORP_ID=${WECOM_CORP_ID:-}
+      - WECOM_AGENT_ID=${WECOM_AGENT_ID:-}
+      - WECOM_SECRET=${WECOM_SECRET:-}
+      - WECOM_TOKEN=${WECOM_TOKEN:-}
+      - WECOM_ENCODING_AES_KEY=${WECOM_ENCODING_AES_KEY:-}
+    
+    # 端口映射（不直接暴露，通过 Nginx 代理）
+    expose:
+      - "3000"
+    
+    # 数据卷挂载
+    volumes:
+      - /opt/openclaw/data:/data
+      - /opt/openclaw/logs/gateway:/logs
+      - /opt/openclaw/config/agents:/config/agents:ro
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+    
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+    
+    # 网络
+    networks:
+      - openclaw-network
+  
+  #----------------------------------------------------------------------------
+  # Nginx 反向代理
+  #----------------------------------------------------------------------------
+  openclaw-nginx:
+    image: nginx:alpine
+    container_name: openclaw-nginx
+    restart: always
+    
+    # 端口映射
+    ports:
+      - "80:80"
+      - "443:443"
+    
+    # 数据卷
+    volumes:
+      - /opt/openclaw/config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /opt/openclaw/config/ssl:/etc/nginx/ssl:ro
+      - /opt/openclaw/logs/nginx:/var/log/nginx
+    
+    # 依赖
+    depends_on:
+      - openclaw-production
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    
+    # 网络
+    networks:
+      - openclaw-network
+  
+  #----------------------------------------------------------------------------
+  # PostgreSQL 数据库（可选，如不使用 SQLite）
+  #----------------------------------------------------------------------------
+  # openclaw-database:
+  #   image: postgres:15-alpine
+  #   container_name: openclaw-database
+  #   restart: always
+  #   
+  #   environment:
+  #     - POSTGRES_DB=${DB_NAME:-openclaw}
+  #     - POSTGRES_USER=${DB_USER:-openclaw}
+  #     - POSTGRES_PASSWORD=${DB_PASSWORD}
+  #   
+  #   volumes:
+  #     - /opt/openclaw/data/database:/var/lib/postgresql/data
+  #   
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-openclaw}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   
+  #   networks:
+  #     - openclaw-network
+
+#------------------------------------------------------------------------------
+# 网络配置
+#------------------------------------------------------------------------------
+networks:
+  openclaw-network:
+    driver: bridge
+    name: openclaw-prod-net
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+#------------------------------------------------------------------------------
+# 数据卷配置
+#------------------------------------------------------------------------------
+volumes:
+  openclaw-data:
+    name: openclaw-prod-data
+  openclaw-logs:
+    name: openclaw-prod-logs

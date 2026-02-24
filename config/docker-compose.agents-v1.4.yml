@@ -3,7 +3,7 @@ version: '3.8'
 services:
   # 运营虚拟员工
   operation-agent:
-    image: node:24
+    image: openclaw-agent:v1.4
     container_name: operation-agent
     restart: unless-stopped
     working_dir: /workspace
@@ -12,17 +12,18 @@ services:
       - AGENT_ID=operation
       - AGENT_NAME=运营助手
       - OPENCLAW_MODEL=github-copilot/claude-sonnet-4.5
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-change-me-please}
     volumes:
       - ./agents/operation:/workspace
       - ./data:/data
       - ./logs:/logs
     networks:
       - openclaw-network
-    command: sh -c "apt-get update  && apt-get install -y  git && git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.com/' && git config --global http.postBuffer 524288000 && git config --global http.timeout 300 && npm config set registry https://registry.npmmirror.com && npm install -g openclaw@latest && npx openclaw gateway --allow-unconfigured --token my-secret-token-$$(hostname)"
+    command: npx openclaw gateway --allow-unconfigured
 
   # 产品虚拟员工
   product-agent:
-    image: node:24
+    image: openclaw-agent:v1.4
     container_name: product-agent
     restart: unless-stopped
     working_dir: /workspace
@@ -31,17 +32,18 @@ services:
       - AGENT_ID=product
       - AGENT_NAME=产品经理
       - OPENCLAW_MODEL=github-copilot/claude-sonnet-4.5
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-change-me-please}
     volumes:
       - ./agents/product:/workspace
       - ./data:/data
       - ./logs:/logs
     networks:
       - openclaw-network
-    command: sh -c "apt-get update  && apt-get install -y  git && git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.com/' && git config --global http.postBuffer 524288000 && git config --global http.timeout 300 && npm config set registry https://registry.npmmirror.com && npm install -g openclaw@latest && npx openclaw gateway --allow-unconfigured --token my-secret-token-$$(hostname)"
+    command: npx openclaw gateway --allow-unconfigured
 
   # 研发虚拟员工
   development-agent:
-    image: node:24
+    image: openclaw-agent:v1.4
     container_name: development-agent
     restart: unless-stopped
     working_dir: /workspace
@@ -50,17 +52,18 @@ services:
       - AGENT_ID=development
       - AGENT_NAME=开发工程师
       - OPENCLAW_MODEL=github-copilot/claude-sonnet-4.5
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-change-me-please}
     volumes:
       - ./agents/development:/workspace
       - ./data:/data
       - ./logs:/logs
     networks:
       - openclaw-network
-    command: sh -c "apt-get update  && apt-get install -y  git && git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.com/' && git config --global http.postBuffer 524288000 && git config --global http.timeout 300 && npm config set registry https://registry.npmmirror.com && npm install -g openclaw@latest && npx openclaw gateway --allow-unconfigured --token my-secret-token-$$(hostname)"
+    command: npx openclaw gateway --allow-unconfigured
 
   # 测试虚拟员工
   testing-agent:
-    image: node:24
+    image: openclaw-agent:v1.4
     container_name: testing-agent
     restart: unless-stopped
     working_dir: /workspace
@@ -69,13 +72,14 @@ services:
       - AGENT_ID=testing
       - AGENT_NAME=测试工程师
       - OPENCLAW_MODEL=github-copilot/claude-sonnet-4.5
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-change-me-please}
     volumes:
       - ./agents/testing:/workspace
       - ./data:/data
       - ./logs:/logs
     networks:
       - openclaw-network
-    command: sh -c "apt-get update  && apt-get install -y  git && git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.com/' && git config --global http.postBuffer 524288000 && git config --global http.timeout 300 && npm config set registry https://registry.npmmirror.com && npm install -g openclaw@latest && npx openclaw gateway --allow-unconfigured --token my-secret-token-$$(hostname)"
+    command: npx openclaw gateway --allow-unconfigured
 
 networks:
   openclaw-network:
