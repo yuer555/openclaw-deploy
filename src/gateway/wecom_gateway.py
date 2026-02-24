@@ -566,15 +566,68 @@ def test_send():
     data = request.json
     user_id = data.get('user_id')
     content = data.get('content')
-    
+
     if not user_id or not content:
         return jsonify({'error': 'user_id and content are required'}), 400
-    
+
     success = send_wecom_message(user_id, content)
-    
+
     return jsonify({
         'success': success,
         'user_id': user_id,
+        'timestamp': int(time.time())
+    })
+
+
+# ============= Telegram Bot 路由 =============
+
+# 初始化 Telegram 适配器（如果配置了 Token）
+telegram_adapter = None
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_WEBHOOK_SECRET = os.getenv('TELEGRAM_WEBHOOK_SECRET', '')
+
+if TELEGRAM_BOT_TOKEN:
+    try:
+        from telegram_adapter import TelegramAdapter
+        telegram_adapter = TelegramAdapter(
+            bot_token=TELEGRAM_BOT_TOKEN,
+            db_path=DB_PATH,
+            openclaw_url=OPENCLAW_GATEWAY_URL
+        )
+        logger.info("✅ Telegram 适配器初始化成功")
+    except Exception as e:
+        logger.error(f"❌ Telegram 适配器初始化失败: {e}")
+
+
+@app.route('/telegram/webhook', methods=['POST'])
+def telegram_webhook():
+    """Telegram Webhook 端点"""
+    if not telegram_adapter:
+        return jsonify({'error': 'Telegram adapter not initialized'}), 503
+
+    # 验证 Secret Token
+    if TELEGRAM_WEBHOOK_SECRET:
+        request_token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
+        if request_token != TELEGRAM_WEBHOOK_SECRET:
+            logger.warning("Telegram Webhook 验证失败")
+            return jsonify({'error': 'Unauthorized'}), 403
+
+    # 处理 Update
+    try:
+        update = request.json
+        result = telegram_adapter.handle_webhook(update)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"处理 Telegram Webhook 失败: {e}")
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/telegram/health', methods=['GET'])
+def telegram_health():
+    """Telegram 健康检查"""
+    return jsonify({
+        'status': 'healthy' if telegram_adapter else 'disabled',
+        'service': 'telegram-adapter',
         'timestamp': int(time.time())
     })
 

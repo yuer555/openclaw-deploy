@@ -28,6 +28,10 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - SECRET_KEY=${SECRET_KEY:-local-secret-key}
       - AGENTS_ENABLED=${AGENTS_ENABLED:-dispatcher,operation,product,development,testing,service}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
+      - OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-http://localhost:18789}
+      - DB_PATH=${DB_PATH:-/data/openclaw.db}
     
     # 端口映射
     ports:

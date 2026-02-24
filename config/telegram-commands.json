@@ -1,0 +1,48 @@
+{
+  "commands": [
+    {
+      "command": "start",
+      "description": "开始使用，显示欢迎信息"
+    },
+    {
+      "command": "help",
+      "description": "显示帮助信息"
+    },
+    {
+      "command": "agents",
+      "description": "显示所有虚拟员工"
+    },
+    {
+      "command": "dispatcher",
+      "description": "切换到调度员"
+    },
+    {
+      "command": "operation",
+      "description": "切换到运营专员"
+    },
+    {
+      "command": "product",
+      "description": "切换到产品经理"
+    },
+    {
+      "command": "development",
+      "description": "切换到开发工程师"
+    },
+    {
+      "command": "testing",
+      "description": "切换到测试工程师"
+    },
+    {
+      "command": "service",
+      "description": "切换到客服专员"
+    },
+    {
+      "command": "current",
+      "description": "显示当前虚拟员工"
+    },
+    {
+      "command": "reset",
+      "description": "重置会话"
+    }
+  ]
+}

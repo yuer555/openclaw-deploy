@@ -17,77 +17,77 @@
 - [ ] 配置 Bot 头像和描述信息
 
 #### 1.2 项目结构创建
-- [ ] 创建 `src/gateway/telegram_adapter.py` 文件（集成适配器）
-- [ ] 更新 `src/gateway/main.py` 或 `wecom_gateway.py` 添加 Telegram 路由
-- [ ] 更新 `src/gateway/requirements.txt` 添加依赖：
+- [x] 创建 `src/gateway/telegram_adapter.py` 文件（集成适配器）
+- [x] 更新 `src/gateway/main.py` 或 `wecom_gateway.py` 添加 Telegram 路由
+- [x] 更新 `src/gateway/requirements.txt` 添加依赖：
   - `requests==2.31.0`（用于调用 Telegram API）
 
 #### 1.3 数据库表创建
-- [ ] 创建数据库迁移脚本 `migrations/001_create_telegram_sessions.sql`
-- [ ] 创建 `telegram_sessions` 表（存储 user_id, current_agent, last_active）
-- [ ] 添加索引优化查询性能（idx_last_active）
+- [x] 创建数据库迁移脚本 `migrations/001_create_telegram_sessions.sql`
+- [x] 创建 `telegram_sessions` 表（存储 user_id, current_agent, last_active）
+- [x] 添加索引优化查询性能（idx_last_active）
 
 #### 1.4 配置文件更新
-- [ ] 在 `local/.env.local.example` 添加 Telegram 配置项
-- [ ] 在 `production/.env.prod.example` 添加 Telegram 配置项
-- [ ] 更新 `config/.env.example` 添加 Telegram 配置
+- [x] 在 `local/.env.local.example` 添加 Telegram 配置项
+- [x] 在 `production/.env.prod.example` 添加 Telegram 配置项
+- [x] 更新 `config/.env.example` 添加 Telegram 配置
 
 ---
 
 ### 阶段 2: 核心功能实现
 
 #### 2.1 TelegramAdapter 类实现
-- [ ] 实现 `TelegramAdapter` 类初始化（bot_token, db_path, agents 配置）
-- [ ] 实现 `handle_webhook(update)` 方法处理 Telegram Update
-- [ ] 实现 Webhook 签名验证（X-Telegram-Bot-Api-Secret-Token）
-- [ ] 实现 Update 对象解析（提取 user_id, chat_id, text）
-- [ ] 添加请求日志记录和错误处理
+- [x] 实现 `TelegramAdapter` 类初始化（bot_token, db_path, agents 配置）
+- [x] 实现 `handle_webhook(update)` 方法处理 Telegram Update
+- [x] 实现 Webhook 签名验证（X-Telegram-Bot-Api-Secret-Token）
+- [x] 实现 Update 对象解析（提取 user_id, chat_id, text）
+- [x] 添加请求日志记录和错误处理
 
 #### 2.2 命令处理实现
-- [ ] 实现 `_handle_command(user_id, chat_id, text)` 方法
-- [ ] 实现 `/start` 命令处理（`_cmd_start`）
-- [ ] 实现 `/help` 命令处理（`_cmd_help`）
-- [ ] 实现 `/agents` 命令处理（`_cmd_agents`）
-- [ ] 实现 `/dispatcher` 命令处理（`_cmd_switch_agent`）
-- [ ] 实现 `/operation` 命令处理
-- [ ] 实现 `/product` 命令处理
-- [ ] 实现 `/development` 命令处理
-- [ ] 实现 `/testing` 命令处理
-- [ ] 实现 `/service` 命令处理
-- [ ] 实现 `/current` 命令处理（`_cmd_current`）
-- [ ] 实现 `/reset` 命令处理（`_cmd_reset`）
+- [x] 实现 `_handle_command(user_id, chat_id, text)` 方法
+- [x] 实现 `/start` 命令处理（`_cmd_start`）
+- [x] 实现 `/help` 命令处理（`_cmd_help`）
+- [x] 实现 `/agents` 命令处理（`_cmd_agents`）
+- [x] 实现 `/dispatcher` 命令处理（`_cmd_switch_agent`）
+- [x] 实现 `/operation` 命令处理
+- [x] 实现 `/product` 命令处理
+- [x] 实现 `/development` 命令处理
+- [x] 实现 `/testing` 命令处理
+- [x] 实现 `/service` 命令处理
+- [x] 实现 `/current` 命令处理（`_cmd_current`）
+- [x] 实现 `/reset` 命令处理（`_cmd_reset`）
 
 #### 2.3 消息路由和会话管理
-- [ ] 实现 `_handle_message(user_id, chat_id, text)` 方法
-- [ ] 实现 `_get_current_agent(user_id)` 获取当前 Agent
-- [ ] 实现 `_create_session(user_id, agent_id)` 创建会话
-- [ ] 实现 `_switch_agent(user_id, agent_id)` 切换 Agent
-- [ ] 实现 `_call_agent(agent_id, message, user_id)` 调用 OpenClaw
-- [ ] 实现错误处理和超时处理
+- [x] 实现 `_handle_message(user_id, chat_id, text)` 方法
+- [x] 实现 `_get_current_agent(user_id)` 获取当前 Agent
+- [x] 实现 `_create_session(user_id, agent_id)` 创建会话
+- [x] 实现 `_switch_agent(user_id, agent_id)` 切换 Agent
+- [x] 实现 `_call_agent(agent_id, message, user_id)` 调用 OpenClaw
+- [x] 实现错误处理和超时处理
 
 #### 2.4 消息发送功能
-- [ ] 实现 `send_message(chat_id, text)` 方法
-- [ ] 实现 `send_chat_action(chat_id, action)` 方法（typing 状态）
-- [ ] 实现消息格式化（Markdown 支持）
-- [ ] 实现发送失败重试机制
+- [x] 实现 `send_message(chat_id, text)` 方法
+- [x] 实现 `send_chat_action(chat_id, action)` 方法（typing 状态）
+- [x] 实现消息格式化（Markdown 支持）
+- [x] 实现发送失败重试机制
 
 ---
 
 ### 阶段 3: Flask 路由集成
 
 #### 3.1 Flask 路由配置
-- [ ] 在 `src/gateway/main.py` 中初始化 TelegramAdapter
-- [ ] 添加 Flask 路由 `/telegram/webhook` (POST)
-- [ ] 添加健康检查路由 `/telegram/health` (GET)
-- [ ] 实现 Webhook 验证中间件
-- [ ] 配置环境变量读取（TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET）
+- [x] 在 `src/gateway/main.py` 中初始化 TelegramAdapter
+- [x] 添加 Flask 路由 `/telegram/webhook` (POST)
+- [x] 添加健康检查路由 `/telegram/health` (GET)
+- [x] 实现 Webhook 验证中间件
+- [x] 配置环境变量读取（TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET）
 
 #### 3.2 Bot 命令菜单配置
-- [ ] 编写命令菜单配置脚本 `scripts/setup-telegram-commands.sh`
-- [ ] 创建命令配置 JSON 文件 `config/telegram-commands.json`
-- [ ] 调用 Telegram API `setMyCommands` 设置命令列表
-- [ ] 验证命令在 Telegram 中正确显示
-- [ ] 添加命令描述和使用说明
+- [x] 编写命令菜单配置脚本 `scripts/setup-telegram-commands.sh`
+- [x] 创建命令配置 JSON 文件 `config/telegram-commands.json`
+- [x] 调用 Telegram API `setMyCommands` 设置命令列表
+- [x] 验证命令在 Telegram 中正确显示
+- [x] 添加命令描述和使用说明
 
 #### 3.3 Bot 信息配置
 - [ ] 设置 Bot 简介（About）
@@ -100,24 +100,24 @@
 ### 阶段 4: 本地测试和部署配置
 
 #### 4.1 本地测试配置
-- [ ] 更新 `local/.env.local.example` 添加 Telegram 配置项
-- [ ] 创建 `local/6-setup-telegram-local.sh` 本地 Telegram 配置脚本
-- [ ] 配置 ngrok 暴露本地端口（用于 Webhook 测试）
-- [ ] 实现 Webhook 设置脚本 `scripts/set-telegram-webhook.sh`
-- [ ] 配置 Webhook URL（ngrok URL）
-- [ ] 配置 Webhook Secret Token
-- [ ] 验证 Webhook 连接
-- [ ] 添加 Webhook 删除脚本 `scripts/delete-telegram-webhook.sh`（用于测试）
+- [x] 更新 `local/.env.local.example` 添加 Telegram 配置项
+- [x] 创建 `local/6-setup-telegram-local.sh` 本地 Telegram 配置脚本
+- [x] 配置 ngrok 暴露本地端口（用于 Webhook 测试）
+- [x] 实现 Webhook 设置脚本 `scripts/set-telegram-webhook.sh`
+- [x] 配置 Webhook URL（ngrok URL）
+- [x] 配置 Webhook Secret Token
+- [x] 验证 Webhook 连接
+- [x] 添加 Webhook 删除脚本 `scripts/delete-telegram-webhook.sh`（用于测试）
 
 #### 4.2 Docker 配置更新
-- [ ] 更新 `src/gateway/Dockerfile` 添加 Telegram 依赖
-- [ ] 更新 `local/docker-compose.local.yml` 添加 Telegram 环境变量
-- [ ] 更新 `production/docker-compose.prod.yml` 添加 Telegram 配置
-- [ ] 确保数据库挂载包含 telegram_sessions 表
+- [x] 更新 `src/gateway/Dockerfile` 添加 Telegram 依赖
+- [x] 更新 `local/docker-compose.local.yml` 添加 Telegram 环境变量
+- [x] 更新 `production/docker-compose.prod.yml` 添加 Telegram 配置
+- [x] 确保数据库挂载包含 telegram_sessions 表
 
 #### 4.3 生产部署配置
-- [ ] 更新 `production/.env.prod.example` 添加 Telegram 配置项
-- [ ] 创建 `production/7-setup-telegram-prod.sh` 生产 Telegram 配置脚本
+- [x] 更新 `production/.env.prod.example` 添加 Telegram 配置项
+- [x] 创建 `production/7-setup-telegram-prod.sh` 生产 Telegram 配置脚本
 - [ ] 配置生产域名（如 bot.openclaw.com）
 - [ ] 配置 SSL 证书（Let's Encrypt 或现有证书）
 - [ ] 配置 Nginx 反向代理（可选，用于 SSL 终止）
@@ -128,11 +128,11 @@
 ### 阶段 5: 测试
 
 #### 5.1 单元测试
-- [ ] 编写 TelegramAdapter 测试 `tests/test_telegram_adapter.py`
-- [ ] 测试命令处理逻辑（所有命令）
-- [ ] 测试会话管理逻辑（创建、获取、切换）
-- [ ] 测试消息路由逻辑
-- [ ] 测试 Webhook 验证逻辑
+- [x] 编写 TelegramAdapter 测试 `tests/test_telegram_adapter.py`
+- [x] 测试命令处理逻辑（所有命令）
+- [x] 测试会话管理逻辑（创建、获取、切换）
+- [x] 测试消息路由逻辑
+- [x] 测试 Webhook 验证逻辑
 - [ ] 确保测试覆盖率 > 80%
 
 #### 5.2 集成测试
@@ -158,7 +158,7 @@
 ### 阶段 6: 文档编写
 
 #### 6.1 配置文档
-- [ ] 创建 `docs/11-Telegram配置.md`
+- [x] 创建 `docs/11-Telegram配置.md`
   - Bot 创建步骤
   - Token 获取方法
   - Webhook 配置说明
@@ -166,7 +166,7 @@
   - 常见问题解答
 
 #### 6.2 部署文档
-- [ ] 创建 `docs/12-Telegram部署.md`
+- [x] 创建 `docs/12-Telegram部署.md`
   - 本地测试部署步骤
   - 生产环境部署步骤
   - 环境变量配置说明
@@ -174,7 +174,7 @@
   - 故障排查指南
 
 #### 6.3 用户文档
-- [ ] 创建 `docs/13-Telegram使用指南.md`
+- [x] 创建 `docs/13-Telegram使用指南.md`
   - 如何开始使用
   - 命令列表和说明
   - 使用示例
@@ -187,7 +187,7 @@
 - [ ] 添加错误码说明
 
 #### 6.5 项目文档更新
-- [ ] 更新 `README.md` 添加 Telegram 支持说明
+- [x] 更新 `README.md` 添加 Telegram 支持说明
 - [ ] 更新 `QUICK_START.md` 添加 Telegram 快速开始
 - [ ] 更新 `SYSTEM_ANALYSIS.md` 添加 Telegram 架构说明
 - [ ] 更新 `openspec/project.md` 添加 Telegram 技术栈

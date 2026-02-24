@@ -1,0 +1,385 @@
+"""
+Telegram Bot 适配器
+负责处理 Telegram Webhook 请求，管理用户会话，路由消息到 OpenClaw
+"""
+
+import os
+import logging
+import sqlite3
+import requests
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+# 配置日志
+logger = logging.getLogger(__name__)
+
+
+class TelegramAdapter:
+    """Telegram Bot 适配器"""
+
+    # 虚拟员工配置
+    AGENTS = {
+        'dispatcher': {'name': '调度员', 'desc': '智能任务分发和路由'},
+        'operation': {'name': '运营专员', 'desc': '数据分析、报表生成'},
+        'product': {'name': '产品经理', 'desc': '需求管理、功能设计'},
+        'development': {'name': '开发工程师', 'desc': '技术支持、代码审查'},
+        'testing': {'name': '测试工程师', 'desc': '质量保障、测试用例'},
+        'service': {'name': '客服专员', 'desc': '客户服务、问题解答'},
+    }
+
+    def __init__(self, bot_token: str, db_path: str, openclaw_url: str):
+        """
+        初始化适配器
+
+        Args:
+            bot_token: Telegram Bot Token
+            db_path: 数据库路径
+            openclaw_url: OpenClaw Gateway URL
+        """
+        self.bot_token = bot_token
+        self.api_base = f"https://api.telegram.org/bot{bot_token}"
+        self.db_path = db_path
+        self.openclaw_url = openclaw_url
+
+        # 初始化数据库
+        self._init_database()
+
+    def _init_database(self):
+        """初始化数据库表"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # 创建 telegram_sessions 表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_sessions (
+                    user_id BIGINT PRIMARY KEY,
+                    current_agent VARCHAR(50) DEFAULT 'dispatcher',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # 创建索引
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_last_active
+                ON telegram_sessions(last_active)
+            """)
+
+            conn.commit()
+            conn.close()
+            logger.info("✅ Telegram 数据库表初始化成功")
+        except Exception as e:
+            logger.error(f"❌ 数据库初始化失败: {e}")
+
+    def handle_webhook(self, update: dict) -> dict:
+        """
+        处理 Webhook 请求
+
+        Args:
+            update: Telegram Update 对象
+
+        Returns:
+            响应字典
+        """
+        try:
+            message = update.get('message')
+            if not message:
+                return {'ok': True}
+
+            user_id = message['from']['id']
+            chat_id = message['chat']['id']
+            text = message.get('text', '')
+
+            # 记录日志
+            logger.info(f"收到消息: user_id={user_id}, text={text[:50]}")
+
+            # 判断是命令还是普通消息
+            if text.startswith('/'):
+                response = self._handle_command(user_id, chat_id, text)
+            else:
+                response = self._handle_message(user_id, chat_id, text)
+
+            # 发送响应
+            if response:
+                self.send_message(chat_id, response)
+
+            return {'ok': True}
+
+        except Exception as e:
+            logger.error(f"处理 Webhook 失败: {e}")
+            return {'ok': False, 'error': str(e)}
+
+    def _handle_command(self, user_id: int, chat_id: int, text: str) -> str:
+        """处理命令"""
+        command = text.split()[0].lower()
+
+        if command == '/start':
+            return self._cmd_start(user_id)
+        elif command == '/help':
+            return self._cmd_help()
+        elif command == '/agents':
+            return self._cmd_agents()
+        elif command == '/current':
+            return self._cmd_current(user_id)
+        elif command == '/reset':
+            return self._cmd_reset(user_id)
+        elif command in ['/dispatcher', '/operation', '/product',
+                        '/development', '/testing', '/service']:
+            agent_id = command[1:]
+            return self._cmd_switch_agent(user_id, agent_id)
+        else:
+            return "❓ 未知命令，使用 /help 查看帮助"
+
+    def _handle_message(self, user_id: int, chat_id: int, text: str) -> str:
+        """处理普通消息"""
+        # 获取当前 Agent
+        agent_id = self._get_current_agent(user_id)
+
+        # 发送"正在输入"状态
+        self.send_chat_action(chat_id, 'typing')
+
+        # 调用 OpenClaw Agent
+        try:
+            response = self._call_agent(agent_id, text, user_id)
+            return response
+        except Exception as e:
+            logger.error(f"调用 Agent 失败: {e}")
+            return "❌ 系统暂时无法处理您的请求，请稍后再试"
+
+    def _call_agent(self, agent_id: str, message: str, user_id: int) -> str:
+        """
+        调用 OpenClaw Agent
+
+        Args:
+            agent_id: Agent ID
+            message: 用户消息
+            user_id: 用户 ID
+
+        Returns:
+            AI 响应
+        """
+        url = f"{self.openclaw_url}/api/v1/sessions/send"
+
+        payload = {
+            'message': message,
+            'agentId': f"{agent_id}-agent",
+            'label': f"telegram-{user_id}",
+            'timeoutSeconds': 30
+        }
+
+        headers = {
+            'Content-Type': 'application/json'
+        }
+
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=35)
+
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('reply', data.get('message', '收到回复但内容为空'))
+            else:
+                logger.error(f"OpenClaw API 返回错误: {response.status_code}")
+                return f"❌ API 返回错误: {response.status_code}"
+
+        except requests.exceptions.Timeout:
+            return "⏱️ 处理超时，请稍后重试"
+        except Exception as e:
+            logger.error(f"调用 OpenClaw 失败: {e}")
+            return "❌ 系统暂时无法处理您的请求，请稍后再试"
+
+    def send_message(self, chat_id: int, text: str, retry_count: int = 3) -> dict:
+        """
+        发送消息（带重试机制）
+
+        Args:
+            chat_id: 聊天 ID
+            text: 消息文本
+            retry_count: 重试次数
+
+        Returns:
+            API 响应字典
+        """
+        url = f"{self.api_base}/sendMessage"
+        payload = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': 'Markdown'
+        }
+
+        for attempt in range(retry_count):
+            try:
+                response = requests.post(url, json=payload, timeout=10)
+                result = response.json()
+
+                if result.get('ok'):
+                    return result
+                else:
+                    logger.warning(f"发送消息失败 (尝试 {attempt + 1}/{retry_count}): {result}")
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"发送消息超时 (尝试 {attempt + 1}/{retry_count})")
+            except Exception as e:
+                logger.error(f"发送消息异常 (尝试 {attempt + 1}/{retry_count}): {e}")
+
+            # 如果不是最后一次尝试，等待后重试
+            if attempt < retry_count - 1:
+                import time
+                time.sleep(1)
+
+        # 所有重试都失败
+        logger.error(f"发送消息失败，已重试 {retry_count} 次")
+        return {'ok': False, 'error': 'Max retries exceeded'}
+
+    def send_chat_action(self, chat_id: int, action: str = 'typing'):
+        """发送聊天动作"""
+        url = f"{self.api_base}/sendChatAction"
+        payload = {'chat_id': chat_id, 'action': action}
+
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            logger.error(f"发送聊天动作失败: {e}")
+
+    # ============= 会话管理方法 =============
+
+    def _get_current_agent(self, user_id: int) -> str:
+        """获取当前 Agent"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT current_agent FROM telegram_sessions WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            conn.close()
+
+            if row:
+                return row[0]
+            else:
+                # 创建新会话，默认调度员
+                self._create_session(user_id, 'dispatcher')
+                return 'dispatcher'
+        except Exception as e:
+            logger.error(f"获取当前 Agent 失败: {e}")
+            return 'dispatcher'
+
+    def _create_session(self, user_id: int, agent_id: str):
+        """创建会话"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT OR REPLACE INTO telegram_sessions
+                   (user_id, current_agent, last_active)
+                   VALUES (?, ?, ?)""",
+                (user_id, agent_id, datetime.now())
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"创建会话失败: {e}")
+
+    def _switch_agent(self, user_id: int, agent_id: str):
+        """切换 Agent"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """UPDATE telegram_sessions
+                   SET current_agent = ?, last_active = ?
+                   WHERE user_id = ?""",
+                (agent_id, datetime.now(), user_id)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"切换 Agent 失败: {e}")
+
+    # ============= 命令处理方法 =============
+
+    def _cmd_start(self, user_id: int) -> str:
+        """处理 /start 命令"""
+        self._create_session(user_id, 'dispatcher')
+        return """👋 欢迎使用 OpenClaw 虚拟员工！
+
+我们有 6 位专业的 AI 虚拟员工为您服务：
+• 调度员 - 智能任务分发
+• 运营专员 - 数据分析
+• 产品经理 - 需求管理
+• 开发工程师 - 技术支持
+• 测试工程师 - 质量保障
+• 客服专员 - 客户服务
+
+💡 使用 /agents 查看所有员工
+💡 使用 /help 查看帮助信息
+💡 直接发送消息开始对话
+
+当前默认员工：调度员"""
+
+    def _cmd_help(self) -> str:
+        """处理 /help 命令"""
+        return """📖 OpenClaw 使用指南
+
+🤖 切换虚拟员工：
+/dispatcher - 调度员
+/operation - 运营专员
+/product - 产品经理
+/development - 开发工程师
+/testing - 测试工程师
+/service - 客服专员
+
+📋 其他命令：
+/agents - 查看所有虚拟员工
+/current - 查看当前员工
+/reset - 重置会话
+/help - 显示此帮助
+
+💬 使用方法：
+1. 选择一个虚拟员工（使用命令切换）
+2. 直接发送消息进行对话
+3. 随时切换到其他员工"""
+
+    def _cmd_agents(self) -> str:
+        """处理 /agents 命令"""
+        lines = ["🤖 可用的虚拟员工：\n"]
+        emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣']
+
+        for i, (agent_id, info) in enumerate(self.AGENTS.items()):
+            lines.append(f"{emojis[i]} {info['name']} - {info['desc']}")
+            lines.append(f"   命令：/{agent_id}\n")
+
+        lines.append("💡 使用命令切换虚拟员工，或直接发送消息给当前员工")
+        return '\n'.join(lines)
+
+    def _cmd_current(self, user_id: int) -> str:
+        """处理 /current 命令"""
+        agent_id = self._get_current_agent(user_id)
+        agent_info = self.AGENTS.get(agent_id, {})
+
+        return f"""📍 当前虚拟员工：{agent_info.get('name', '未知')}
+职责：{agent_info.get('desc', '无描述')}
+
+💬 直接发送消息即可与当前员工对话
+🔄 使用 /agents 查看其他员工"""
+
+    def _cmd_reset(self, user_id: int) -> str:
+        """处理 /reset 命令"""
+        self._switch_agent(user_id, 'dispatcher')
+        return """🔄 会话已重置
+
+• 当前员工：调度员
+
+💡 使用 /agents 选择其他员工"""
+
+    def _cmd_switch_agent(self, user_id: int, agent_id: str) -> str:
+        """处理切换员工命令"""
+        self._switch_agent(user_id, agent_id)
+        agent_info = self.AGENTS.get(agent_id, {})
+
+        return f"""✅ 已切换到：{agent_info.get('name', '未知')}
+
+我可以帮您：{agent_info.get('desc', '无描述')}
+
+💬 直接发送消息开始对话"""
