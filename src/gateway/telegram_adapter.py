@@ -250,15 +250,7 @@ class TelegramAdapter:
                 if payload.get('sessionKey') != session_key:
                     return
                 state = payload.get('state')
-                if state == 'final':
-                    done.set()
-                elif state == 'error':
-                    error_msg = payload.get('errorMessage', 'chat error')
-                    done.set()
-                elif state == 'aborted':
-                    error_msg = '请求被中止'
-                    done.set()
-                elif state == 'delta':
+                if state in ('final', 'delta'):
                     msg_obj = payload.get('message')
                     if isinstance(msg_obj, dict):
                         for block in msg_obj.get('content', []):
@@ -267,6 +259,14 @@ class TelegramAdapter:
                                 break
                     elif isinstance(msg_obj, str):
                         result_text = msg_obj
+                    if state == 'final':
+                        done.set()
+                elif state == 'error':
+                    error_msg = payload.get('errorMessage', 'chat error')
+                    done.set()
+                elif state == 'aborted':
+                    error_msg = '请求被中止'
+                    done.set()
 
         def on_error(ws, err):
             nonlocal error_msg
