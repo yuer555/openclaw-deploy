@@ -28,12 +28,9 @@ logger = logging.getLogger(__name__)
 # 数据库配置
 DB_PATH = os.getenv('DB_PATH', '/data/user_roles.db')
 
-# 企业微信配置
-WECOM_CORP_ID = os.getenv('WECOM_CORP_ID', '')
-WECOM_SECRET = os.getenv('WECOM_SECRET', '')
+# 企业微信智能机器人配置
 WECOM_TOKEN = os.getenv('WECOM_TOKEN', '')
 WECOM_ENCODING_AES_KEY = os.getenv('WECOM_ENCODING_AES_KEY', '')
-WECOM_AGENT_ID = os.getenv('WECOM_AGENT_ID', '')
 
 # OpenClaw Gateway 配置
 OPENCLAW_GATEWAY_URL = os.getenv('OPENCLAW_GATEWAY_URL', 'http://localhost:18789')
@@ -167,68 +164,16 @@ class AIDispatcher:
 
 _dispatcher = AIDispatcher()
 
-# ============= Access Token 管理器 =============
-
-class AccessTokenManager:
-    """企业微信 Access Token 管理器（单例模式）"""
-    
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance.token = None
-                    cls._instance.expire_time = 0
-        return cls._instance
-    
-    def get_token(self):
-        """获取有效的 access_token"""
-        # 如果 token 有效且未过期，直接返回
-        if self.token and time.time() < self.expire_time:
-            logger.debug(f"使用缓存的 access_token，剩余有效时间: {int(self.expire_time - time.time())}秒")
-            return self.token
-        
-        # 刷新 token
-        logger.info("正在刷新 access_token...")
-        try:
-            url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken"
-            params = {
-                'corpid': WECOM_CORP_ID,
-                'corpsecret': WECOM_SECRET
-            }
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
-            
-            if data.get('errcode') == 0:
-                self.token = data['access_token']
-                # 提前 5 分钟过期（7200秒 - 300秒 = 6900秒）
-                self.expire_time = time.time() + data.get('expires_in', 7200) - 300
-                logger.info(f"✅ access_token 刷新成功，有效期: {int(self.expire_time - time.time())}秒")
-                return self.token
-            else:
-                logger.error(f"❌ 获取 access_token 失败: {data}")
-                return None
-        except Exception as e:
-            logger.error(f"❌ 获取 access_token 异常: {e}")
-            return None
-
-# 全局 token 管理器实例
-token_manager = AccessTokenManager()
-
 
 # ============= 企业微信加解密工具类 =============
 
 class WXBizMsgCrypt:
-    """企业微信消息加解密"""
-    
-    def __init__(self, token, encoding_aes_key, corp_id):
+    """企业微信智能机器人消息加解密（receiveid 为空字符串）"""
+
+    def __init__(self, token, encoding_aes_key):
         self.token = token
         self.encoding_aes_key = base64.b64decode(encoding_aes_key + "=")
-        self.corp_id = corp_id
-        
+
     def verify_signature(self, signature, timestamp, nonce, echo_str=""):
         """验证签名"""
         sha = hashlib.sha1()
@@ -236,57 +181,55 @@ class WXBizMsgCrypt:
         items.sort()
         sha.update(''.join(items).encode('utf-8'))
         return sha.hexdigest() == signature
-    
+
     def decrypt(self, encrypt_msg):
-        """解密消息"""
+        """解密消息，返回明文字符串"""
         try:
             cipher = AES.new(self.encoding_aes_key, AES.MODE_CBC, self.encoding_aes_key[:16])
             plain_text = cipher.decrypt(base64.b64decode(encrypt_msg))
-            
-            # 去除补位字符
             pad = plain_text[-1]
             if isinstance(pad, str):
                 pad = ord(pad)
             plain_text = plain_text[:-pad]
-            
-            # 提取消息内容
             content_length = struct.unpack('!I', plain_text[16:20])[0]
             content = plain_text[20:20+content_length].decode('utf-8')
-            from_corpid = plain_text[20+content_length:].decode('utf-8')
-            
-            if from_corpid and self.corp_id and from_corpid != self.corp_id:
-                logger.error(f"corpid 不匹配: 收到={from_corpid}, 配置={self.corp_id}")
-                raise ValueError("corpid 不匹配")
-            
             return content
         except Exception as e:
             logger.error(f"解密失败: {e}")
             return None
-    
+
     def encrypt(self, msg_text):
         """加密消息"""
         try:
-            # 16位随机字符串
             rand_str = os.urandom(16)
-            
-            # 消息长度（4字节网络字节序）
             msg_len = struct.pack('!I', len(msg_text.encode('utf-8')))
-            
-            # 拼接: 随机字符串 + 消息长度 + 消息内容 + corpid
-            plain_text = rand_str + msg_len + msg_text.encode('utf-8') + self.corp_id.encode('utf-8')
-            
-            # PKCS#7 补位
+            # receiveid 为空字符串
+            plain_text = rand_str + msg_len + msg_text.encode('utf-8') + b''
             pad = 32 - len(plain_text) % 32
             plain_text += bytes([pad] * pad)
-            
-            # AES 加密
             cipher = AES.new(self.encoding_aes_key, AES.MODE_CBC, self.encoding_aes_key[:16])
             cipher_text = cipher.encrypt(plain_text)
-            
             return base64.b64encode(cipher_text).decode('utf-8')
         except Exception as e:
             logger.error(f"加密失败: {e}")
             return None
+
+    def build_reply(self, msg_text, timestamp, nonce):
+        """构造加密回复包"""
+        encrypt = self.encrypt(msg_text)
+        if not encrypt:
+            return None
+        sha = hashlib.sha1()
+        items = [self.token, str(timestamp), nonce, encrypt]
+        items.sort()
+        sha.update(''.join(items).encode('utf-8'))
+        signature = sha.hexdigest()
+        return {
+            "encrypt": encrypt,
+            "msgsignature": signature,
+            "timestamp": timestamp,
+            "nonce": nonce,
+        }
 
 
 # ============= 数据库操作 =============
@@ -437,82 +380,25 @@ def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
         }
 
 
-# ============= 企业微信消息发送 =============
+# ============= 异步处理 =============
 
-def send_wecom_message(user_id, content, safe=0):
-    """发送消息到企业微信用户"""
-    try:
-        # 获取 access_token
-        access_token = token_manager.get_token()
-        if not access_token:
-            logger.error("❌ 无法获取 access_token，消息发送失败")
-            return False
-        
-        # 构造消息发送请求
-        url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}"
-        
-        # 消息内容（限制长度，企业微信单条消息最大2048字节）
-        if len(content.encode('utf-8')) > 2000:
-            content = content[:600] + "\n\n...(内容过长，已截断)"
-        
-        payload = {
-            "touser": user_id,
-            "msgtype": "text",
-            "agentid": WECOM_AGENT_ID,
-            "text": {
-                "content": content
-            },
-            "safe": safe  # 0=可转发分享 1=不可转发
-        }
-        
-        logger.info(f"📤 发送消息到企业微信: {user_id}")
-        logger.debug(f"消息内容: {content[:100]}...")
-        
-        # 发送请求
-        response = requests.post(url, json=payload, timeout=10)
-        result = response.json()
-        
-        if result.get('errcode') == 0:
-            logger.info(f"✅ 消息发送成功: {user_id}")
-            return True
-        else:
-            logger.error(f"❌ 消息发送失败: {result}")
-            
-            # 如果是 token 过期，清除缓存的 token
-            if result.get('errcode') in [40014, 42001]:
-                logger.warning("⚠️  access_token 可能已过期，清除缓存")
-                token_manager.token = None
-                token_manager.expire_time = 0
-            
-            return False
-            
-    except Exception as e:
-        logger.error(f"❌ 发送消息异常: {e}")
-        return False
-
-
-# ============= 异步处理（简化版） =============
-
-def process_message_async(user_id, content, agent_id, agent_url, task_id):
-    """异步处理消息（在后台线程中执行）"""
+def process_message_async(user_id, content, agent_id, agent_url, task_id, response_url, crypto, timestamp, nonce):
+    """异步处理消息，用 response_url 主动回复"""
     def worker():
         try:
-            # 调用 OpenClaw Agent
             result = call_openclaw_agent(agent_id, content, user_id, task_id, gateway_url=agent_url)
-            
-            # 发送回复到企业微信
             reply = result.get('reply', '处理失败，请稍后再试。')
-            send_wecom_message(user_id, reply)
-            
+            # 用 response_url 主动回复（markdown 格式）
+            payload = {
+                "msgtype": "markdown",
+                "markdown": {"content": reply}
+            }
+            resp = requests.post(response_url, json=payload, timeout=10)
+            logger.info(f"✅ 主动回复结果: {resp.status_code}")
         except Exception as e:
             logger.error(f"❌ 异步处理消息失败: {e}")
-            # 发送错误提示
-            send_wecom_message(user_id, "抱歉，处理您的请求时出现错误，请稍后再试。")
-    
-    # 在新线程中执行
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    
+
+    threading.Thread(target=worker, daemon=True).start()
     logger.info(f"✅ 已启动异步处理线程: task_id={task_id}")
 
 
@@ -520,97 +406,80 @@ def process_message_async(user_id, content, agent_id, agent_url, task_id):
 
 @app.route('/wecom/callback', methods=['GET', 'POST'])
 def wecom_callback():
-    """企业微信回调接口"""
-    
-    # 获取参数
+    """企业微信智能机器人回调接口"""
     msg_signature = request.args.get('msg_signature', '')
     timestamp = request.args.get('timestamp', '')
     nonce = request.args.get('nonce', '')
-    
-    # 初始化加解密工具
-    crypto = WXBizMsgCrypt(WECOM_TOKEN, WECOM_ENCODING_AES_KEY, WECOM_CORP_ID)
-    
-    # GET 请求：验证回调 URL
+
+    crypto = WXBizMsgCrypt(WECOM_TOKEN, WECOM_ENCODING_AES_KEY)
+
+    # GET：验证回调 URL
     if request.method == 'GET':
         echo_str = request.args.get('echostr', '')
-        
         logger.info("收到企业微信回调验证请求")
-        
-        # 验证签名
         if not crypto.verify_signature(msg_signature, timestamp, nonce, echo_str):
             logger.error("❌ 签名验证失败")
             return "signature verification failed", 403
-        
-        # 解密 echostr
         decrypted = crypto.decrypt(echo_str)
         if not decrypted:
             logger.error("❌ 解密失败")
             return "decryption failed", 500
-        
         logger.info("✅ 回调验证成功")
         return decrypted
-    
-    # POST 请求：接收消息
+
+    # POST：接收消息（JSON 格式）
     if request.method == 'POST':
         try:
-            # 解析 XML
-            xml_data = request.data
-            logger.info(f"收到 POST body: {xml_data[:500]}")
-            root = ET.fromstring(xml_data)
-            
-            # 提取加密消息
-            encrypt_msg = root.find('Encrypt').text
-            
-            # 验证签名
+            body = request.get_json(force=True)
+            logger.info(f"收到 POST body: {str(body)[:200]}")
+            encrypt_msg = body.get('encrypt', '')
+
             if not crypto.verify_signature(msg_signature, timestamp, nonce, encrypt_msg):
                 logger.error("❌ 消息签名验证失败")
-                return "signature verification failed", 403
-            
-            # 解密消息
-            decrypted_xml = crypto.decrypt(encrypt_msg)
-            if not decrypted_xml:
+                return jsonify({}), 403
+
+            decrypted = crypto.decrypt(encrypt_msg)
+            if not decrypted:
                 logger.error("❌ 消息解密失败")
-                return "decryption failed", 500
-            
-            # 解析解密后的 XML
-            msg_root = ET.fromstring(decrypted_xml)
-            
-            msg_type = msg_root.find('MsgType').text
-            from_user = msg_root.find('FromUserName').text
-            
-            logger.info(f"📩 收到企业微信消息: type={msg_type}, from={from_user}")
-            
+                return jsonify({}), 500
+
+            msg = json.loads(decrypted)
+            logger.info(f"📩 解密消息: {str(msg)[:200]}")
+
+            msg_type = msg.get('msgtype', '')
+            from_user = msg.get('from', {}).get('userid', '')
+            response_url = msg.get('response_url', '')
+
+            # 流式刷新事件：直接返回空包
+            if msg_type == 'stream':
+                return jsonify({}), 200
+
             # 只处理文本消息
             if msg_type == 'text':
-                content = msg_root.find('Content').text
-                
-                logger.info(f"消息内容: {content}")
-                
-                # 生成任务 ID
-                task_id = str(uuid.uuid4())
-                
-                # 查询用户绑定的代理（保留用于日志记录）
-                user_agents = get_user_agents(from_user)
-                
-                # 路由消息
-                agent_id, agent_url = route_message(content)
+                content = msg.get('text', {}).get('content', '')
+                logger.info(f"消息内容: {content}, from: {from_user}")
 
-                # 记录任务日志
+                task_id = str(uuid.uuid4())
+                agent_id, agent_url = route_message(content)
                 log_task(task_id, from_user, agent_id, content, status='processing')
 
-                # 异步处理消息（避免企业微信回调超时）
-                process_message_async(from_user, content, agent_id, agent_url, task_id)
-                
-                # 立即返回成功（企业微信要求5秒内响应）
-                return "success", 200
-            
+                # 先被动回复"处理中"，再异步用 response_url 主动回复
+                processing_msg = json.dumps({"msgtype": "text", "text": {"content": "⏳ 正在处理，请稍候..."}})
+                reply_pkg = crypto.build_reply(processing_msg, int(timestamp), nonce)
+
+                process_message_async(from_user, content, agent_id, agent_url, task_id, response_url, crypto, timestamp, nonce)
+
+                if reply_pkg:
+                    return jsonify(reply_pkg), 200
+                return jsonify({}), 200
+
             else:
-                logger.info(f"⚠️  忽略非文本消息: {msg_type}")
-                return "success", 200
-                
+                logger.info(f"⚠️  忽略消息类型: {msg_type}")
+                return jsonify({}), 200
+
         except Exception as e:
             logger.error(f"❌ 处理消息失败: {e}")
-            return "error", 500
+            return jsonify({}), 500
 
 
 @app.route('/health', methods=['GET'])
@@ -661,21 +530,17 @@ def stats():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/test/send', methods=['POST'])
-def test_send():
-    """测试消息发送接口（仅供调试）"""
+@app.route('/test/route', methods=['POST'])
+def test_route():
+    """测试 AI 路由接口（仅供调试）"""
     data = request.json
-    user_id = data.get('user_id')
     content = data.get('content')
-
-    if not user_id or not content:
-        return jsonify({'error': 'user_id and content are required'}), 400
-
-    success = send_wecom_message(user_id, content)
-
+    if not content:
+        return jsonify({'error': 'content is required'}), 400
+    agent_id, agent_url = route_message(content)
     return jsonify({
-        'success': success,
-        'user_id': user_id,
+        'agent_id': agent_id,
+        'agent_url': agent_url,
         'timestamp': int(time.time())
     })
 
@@ -749,35 +614,20 @@ def telegram_health():
 
 
 if __name__ == '__main__':
-    # 启动时检查配置
     logger.info("=" * 60)
     logger.info("OpenClaw 企业微信网关启动中...")
     logger.info("=" * 60)
-    
-    # 检查必需的环境变量
+
     required_env = {
-        'WECOM_CORP_ID': WECOM_CORP_ID,
-        'WECOM_SECRET': WECOM_SECRET,
         'WECOM_TOKEN': WECOM_TOKEN,
         'WECOM_ENCODING_AES_KEY': WECOM_ENCODING_AES_KEY,
-        'WECOM_AGENT_ID': WECOM_AGENT_ID,
     }
-    
     missing = [k for k, v in required_env.items() if not v]
     if missing:
         logger.warning(f"⚠️  以下环境变量未配置: {', '.join(missing)}")
-    
+
     logger.info(f"✅ 数据库路径: {DB_PATH}")
     logger.info(f"✅ OpenClaw Gateway: {OPENCLAW_GATEWAY_URL}")
-    logger.info(f"✅ 企业微信 Agent ID: {WECOM_AGENT_ID}")
     logger.info("=" * 60)
-    
-    # 预先获取一次 access_token
-    token = token_manager.get_token()
-    if token:
-        logger.info("✅ Access Token 已就绪")
-    else:
-        logger.warning("⚠️  Access Token 获取失败，请检查企业微信配置")
-    
-    # 启动 Flask 应用
+
     app.run(host='0.0.0.0', port=8000, debug=False)
