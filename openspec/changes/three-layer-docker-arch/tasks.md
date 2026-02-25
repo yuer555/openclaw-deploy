@@ -11,8 +11,8 @@
 
 - [x] 2.1 创建 `src/gateway/Dockerfile.gateway`：基于 python:3.11-slim + node:24，安装 Flask 依赖和 openclaw，COPY dispatcher.md 到 `/workspace/CLAUDE.md`
 - [x] 2.2 更新 `config/Dockerfile.agents`：在构建阶段 COPY 对应角色 CLAUDE.md（通过 build arg `ROLE` 选择），预置到 `/workspace/CLAUDE.md`
-- [ ] 2.3 验证 Gateway 镜像构建：`docker build -f src/gateway/Dockerfile.gateway -t openclaw-gateway:local .`
-- [ ] 2.4 验证 Agent 镜像构建：`docker build --build-arg ROLE=testing -f config/Dockerfile.agents -t openclaw-agent:local .`
+- [x] 2.3 验证 Gateway 镜像构建：`docker build -f src/gateway/Dockerfile.gateway -t openclaw-gateway:local .`
+- [x] 2.4 验证 Agent 镜像构建：`docker build --build-arg ROLE=testing -f config/Dockerfile.agents -t openclaw-agent:local .`
 
 ## 3. Python 网关代码
 

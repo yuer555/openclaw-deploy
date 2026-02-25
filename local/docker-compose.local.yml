@@ -65,5 +65,5 @@ services:
 #------------------------------------------------------------------------------
 networks:
   openclaw-network:
-    driver: bridge
+    external: true
     name: openclaw-network

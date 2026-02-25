@@ -8,6 +8,10 @@ LABEL version="2.0"
 # 构建参数：角色名称（operation/product/development/testing/service）
 ARG ROLE=service
 
+# 换用国内 debian 镜像源
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null || true
+
 # 安装系统依赖
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git curl && \
@@ -25,15 +29,16 @@ RUN npm config set registry https://registry.npmmirror.com
 # 安装 OpenClaw
 RUN npm install -g openclaw@latest
 
+# 预置角色性格到备份路径（不会被 volume 覆盖）
+RUN mkdir -p /etc/openclaw
+COPY config/agents/workspace/${ROLE}.md /etc/openclaw/CLAUDE.md
+
 # 设置工作目录
 WORKDIR /workspace
-
-# 预置角色性格（通过 build arg 选择对应 CLAUDE.md）
-COPY agents/workspace/${ROLE}.md /workspace/CLAUDE.md
 
 # 暴露端口
 EXPOSE 18789
 
-# 启动命令
-CMD ["npx", "openclaw", "gateway", "--allow-unconfigured"]
+# 启动时若 CLAUDE.md 不存在则从备份恢复，再启动 gateway
+CMD ["sh", "-c", "[ -f /workspace/CLAUDE.md ] || cp /etc/openclaw/CLAUDE.md /workspace/CLAUDE.md && npx openclaw gateway --allow-unconfigured"]
 
