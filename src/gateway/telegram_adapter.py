@@ -4,6 +4,7 @@ Telegram Bot 适配器
 """
 
 import os
+import json
 import logging
 import sqlite3
 import threading
@@ -42,6 +43,7 @@ class TelegramAdapter:
         self.api_base = f"https://api.telegram.org/bot{bot_token}"
         self.db_path = db_path
         self.openclaw_url = openclaw_url
+        self.openclaw_token = self._load_openclaw_token()
 
         # 轮询状态
         self._polling_thread = None
@@ -52,6 +54,20 @@ class TelegramAdapter:
 
         # 初始化数据库
         self._init_database()
+
+    def _load_openclaw_token(self) -> str:
+        """从 ~/.openclaw/openclaw.json 读取 gateway token"""
+        try:
+            config_path = os.path.expanduser('~/.openclaw/openclaw.json')
+            with open(config_path) as f:
+                cfg = json.load(f)
+            token = cfg.get('gateway', {}).get('auth', {}).get('token', '')
+            if token:
+                logger.info("✅ OpenClaw gateway token 已加载")
+            return token
+        except Exception as e:
+            logger.warning(f"⚠️  无法读取 OpenClaw token: {e}")
+            return os.getenv('OPENCLAW_API_KEY', '')
 
     def _init_database(self):
         """初始化数据库表"""
@@ -158,7 +174,7 @@ class TelegramAdapter:
 
     def _call_agent(self, agent_id: str, message: str, user_id: int) -> str:
         """
-        调用 OpenClaw Agent
+        调用 OpenClaw Agent（通过 WebSocket RPC 协议）
 
         Args:
             agent_id: Agent ID
@@ -168,31 +184,118 @@ class TelegramAdapter:
         Returns:
             AI 响应
         """
-        url = f"{self.openclaw_url}/api/v1/sessions/send"
+        import websocket
+        import uuid as _uuid
 
-        payload = {
-            'message': message,
-            'agentId': f"{agent_id}-agent",
-            'label': f"telegram-{user_id}",
-            'timeoutSeconds': 30
-        }
+        ws_url = self.openclaw_url.replace('http://', 'ws://').replace('https://', 'wss://')
+        token = self.openclaw_token
+        session_key = f"agent:{agent_id}-agent:telegram-{user_id}"
+        idempotency_key = str(_uuid.uuid4())
 
-        headers = {
-            'Content-Type': 'application/json'
-        }
+        result_text = None
+        error_msg = None
+        connected = threading.Event()
+        done = threading.Event()
+
+        def on_message(ws, raw):
+            nonlocal result_text, error_msg
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                return
+
+            if msg.get('type') == 'event' and msg.get('event') == 'connect.challenge':
+                nonce = msg.get('payload', {}).get('nonce', '')
+                req = {
+                    'type': 'req',
+                    'id': str(_uuid.uuid4()),
+                    'method': 'connect',
+                    'params': {
+                        'minProtocol': 3,
+                        'maxProtocol': 3,
+                        'client': {
+                            'id': 'openclaw-probe',
+                            'version': 'dev',
+                            'platform': 'python',
+                            'mode': 'backend',
+                        },
+                        'auth': {'token': token} if token else None,
+                    }
+                }
+                ws.send(json.dumps(req))
+
+            elif msg.get('type') == 'res':
+                if not connected.is_set():
+                    if msg.get('ok'):
+                        connected.set()
+                        # send chat.send
+                        req = {
+                            'type': 'req',
+                            'id': str(_uuid.uuid4()),
+                            'method': 'chat.send',
+                            'params': {
+                                'sessionKey': session_key,
+                                'message': message,
+                                'deliver': False,
+                                'idempotencyKey': idempotency_key,
+                            }
+                        }
+                        ws.send(json.dumps(req))
+                    else:
+                        error_msg = msg.get('error', {}).get('message', 'connect failed')
+                        done.set()
+
+            elif msg.get('type') == 'event' and msg.get('event') == 'chat':
+                payload = msg.get('payload', {})
+                if payload.get('sessionKey') != session_key:
+                    return
+                state = payload.get('state')
+                if state == 'final':
+                    done.set()
+                elif state == 'error':
+                    error_msg = payload.get('errorMessage', 'chat error')
+                    done.set()
+                elif state == 'aborted':
+                    error_msg = '请求被中止'
+                    done.set()
+                elif state == 'delta':
+                    msg_obj = payload.get('message')
+                    if isinstance(msg_obj, dict):
+                        for block in msg_obj.get('content', []):
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                result_text = block.get('text', result_text)
+                                break
+                    elif isinstance(msg_obj, str):
+                        result_text = msg_obj
+
+        def on_error(ws, err):
+            nonlocal error_msg
+            error_msg = str(err)
+            done.set()
+
+        def on_close(ws, *args):
+            done.set()
 
         try:
-            response = requests.post(url, json=payload, headers=headers, timeout=35)
+            ws = websocket.WebSocketApp(
+                ws_url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            t = threading.Thread(target=ws.run_forever, daemon=True)
+            t.start()
 
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('reply', data.get('message', '收到回复但内容为空'))
-            else:
-                logger.error(f"OpenClaw API 返回错误: {response.status_code}")
-                return f"❌ API 返回错误: {response.status_code}"
+            done.wait(timeout=60)
+            ws.close()
 
-        except requests.exceptions.Timeout:
-            return "⏱️ 处理超时，请稍后重试"
+            if error_msg:
+                logger.error(f"OpenClaw WebSocket 错误: {error_msg}")
+                return f"❌ {error_msg}"
+            if result_text:
+                return result_text
+            return "❌ 未收到响应，请稍后重试"
+
         except Exception as e:
             logger.error(f"调用 OpenClaw 失败: {e}")
             return "❌ 系统暂时无法处理您的请求，请稍后再试"
