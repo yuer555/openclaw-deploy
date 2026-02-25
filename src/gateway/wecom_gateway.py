@@ -86,7 +86,7 @@ class AIDispatcher:
                         'maxProtocol': 3,
                         'client': {'id': 'openclaw-probe', 'version': 'dev',
                                    'platform': 'python', 'mode': 'backend'},
-                        'auth': None,
+                        'auth': {},
                     }
                 }
                 ws.send(json.dumps(req))
@@ -233,6 +233,34 @@ class WXBizMsgCrypt:
 
 
 # ============= 数据库操作 =============
+
+def init_db():
+    """初始化数据库表"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_roles (
+            user_id TEXT PRIMARY KEY,
+            roles TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS task_logs (
+            task_id TEXT PRIMARY KEY,
+            user_id TEXT,
+            agent_id TEXT,
+            task_content TEXT,
+            status TEXT,
+            result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        conn.commit()
+        conn.close()
+        logger.info("✅ 数据库初始化完成")
+    except Exception as e:
+        logger.error(f"❌ 数据库初始化失败: {e}")
+
+init_db()
 
 def get_user_agents(user_id):
     """查询用户绑定的代理"""
