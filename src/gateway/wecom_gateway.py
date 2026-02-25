@@ -585,9 +585,11 @@ def test_send():
 telegram_adapter = None
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_WEBHOOK_SECRET = os.getenv('TELEGRAM_WEBHOOK_SECRET', '')
+TELEGRAM_MODE = os.getenv('TELEGRAM_MODE', 'webhook').lower()
 
 if TELEGRAM_BOT_TOKEN:
     try:
+        import atexit
         from telegram_adapter import TelegramAdapter
         telegram_adapter = TelegramAdapter(
             bot_token=TELEGRAM_BOT_TOKEN,
@@ -595,6 +597,9 @@ if TELEGRAM_BOT_TOKEN:
             openclaw_url=OPENCLAW_GATEWAY_URL
         )
         logger.info("✅ Telegram 适配器初始化成功")
+        if TELEGRAM_MODE == 'polling':
+            telegram_adapter.start_polling()
+            atexit.register(telegram_adapter.stop_polling)
     except Exception as e:
         logger.error(f"❌ Telegram 适配器初始化失败: {e}")
 
@@ -604,6 +609,9 @@ def telegram_webhook():
     """Telegram Webhook 端点"""
     if not telegram_adapter:
         return jsonify({'error': 'Telegram adapter not initialized'}), 503
+
+    if TELEGRAM_MODE == 'polling':
+        return jsonify({'error': 'Webhook disabled, running in polling mode'}), 400
 
     # 验证 Secret Token
     if TELEGRAM_WEBHOOK_SECRET:
@@ -625,11 +633,18 @@ def telegram_webhook():
 @app.route('/telegram/health', methods=['GET'])
 def telegram_health():
     """Telegram 健康检查"""
-    return jsonify({
+    health_data = {
         'status': 'healthy' if telegram_adapter else 'disabled',
         'service': 'telegram-adapter',
-        'timestamp': int(time.time())
-    })
+        'mode': TELEGRAM_MODE,
+        'timestamp': int(time.time()),
+    }
+    if telegram_adapter and TELEGRAM_MODE == 'polling':
+        health_data['polling_active'] = (
+            telegram_adapter._polling_thread is not None
+            and telegram_adapter._polling_thread.is_alive()
+        )
+    return jsonify(health_data)
 
 
 if __name__ == '__main__':

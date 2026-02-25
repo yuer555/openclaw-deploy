@@ -6,6 +6,8 @@ Telegram Bot 适配器
 import os
 import logging
 import sqlite3
+import threading
+import time
 import requests
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -40,6 +42,13 @@ class TelegramAdapter:
         self.api_base = f"https://api.telegram.org/bot{bot_token}"
         self.db_path = db_path
         self.openclaw_url = openclaw_url
+
+        # 轮询状态
+        self._polling_thread = None
+        self._stop_event = threading.Event()
+        self._poll_offset = 0
+        self._poll_timeout = 30
+        self._retry_delay = 5
 
         # 初始化数据库
         self._init_database()
@@ -383,3 +392,73 @@ class TelegramAdapter:
 我可以帮您：{agent_info.get('desc', '无描述')}
 
 💬 直接发送消息开始对话"""
+
+    # ============= 长轮询方法 =============
+
+    def delete_webhook(self):
+        """清除已有 Webhook，切换到轮询模式前调用"""
+        try:
+            url = f"{self.api_base}/deleteWebhook"
+            response = requests.post(url, timeout=10)
+            result = response.json()
+            if result.get('ok'):
+                logger.info("✅ Telegram Webhook 已清除")
+            else:
+                logger.warning(f"清除 Webhook 返回: {result}")
+        except Exception as e:
+            logger.error(f"清除 Webhook 失败: {e}")
+
+    def _poll_once(self) -> list:
+        """单次 getUpdates 调用，返回 update 列表"""
+        url = f"{self.api_base}/getUpdates"
+        params = {
+            'offset': self._poll_offset,
+            'timeout': self._poll_timeout,
+            'allowed_updates': ['message'],
+        }
+        response = requests.get(url, params=params, timeout=self._poll_timeout + 5)
+        data = response.json()
+        if not data.get('ok'):
+            logger.warning(f"getUpdates 返回错误: {data}")
+            return []
+        updates = data.get('result', [])
+        if updates:
+            self._poll_offset = updates[-1]['update_id'] + 1
+        return updates
+
+    def _polling_loop(self):
+        """轮询主循环，在独立线程中运行"""
+        logger.info("✅ Telegram 长轮询已启动")
+        while not self._stop_event.is_set():
+            try:
+                updates = self._poll_once()
+                for update in updates:
+                    try:
+                        self.handle_webhook(update)
+                    except Exception as e:
+                        logger.error(f"处理 update 失败: {e}")
+            except requests.exceptions.Timeout:
+                continue
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"轮询连接错误，{self._retry_delay}s 后重试: {e}")
+                self._stop_event.wait(self._retry_delay)
+            except Exception as e:
+                logger.error(f"轮询异常，{self._retry_delay}s 后重试: {e}")
+                self._stop_event.wait(self._retry_delay)
+        logger.info("Telegram 长轮询已停止")
+
+    def start_polling(self):
+        """启动后台轮询线程"""
+        self.delete_webhook()
+        self._stop_event.clear()
+        self._polling_thread = threading.Thread(
+            target=self._polling_loop, daemon=True, name="telegram-polling"
+        )
+        self._polling_thread.start()
+
+    def stop_polling(self):
+        """停止轮询线程"""
+        self._stop_event.set()
+        if self._polling_thread and self._polling_thread.is_alive():
+            self._polling_thread.join(timeout=self._poll_timeout + 10)
+            logger.info("Telegram 轮询线程已退出")
