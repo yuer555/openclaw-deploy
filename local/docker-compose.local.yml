@@ -30,12 +30,12 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
       - TELEGRAM_MODE=${TELEGRAM_MODE:-polling}
-      - DISPATCHER_URL=http://localhost:18789
-      - AGENT_OPERATION_URL=http://localhost:18791
-      - AGENT_PRODUCT_URL=http://localhost:18792
-      - AGENT_DEVELOPMENT_URL=http://localhost:18793
-      - AGENT_TESTING_URL=http://localhost:18794
-      - AGENT_SERVICE_URL=http://localhost:18795
+      - DISPATCHER_URL=${DISPATCHER_URL:-http://openclaw-local:18789}
+      - AGENT_OPERATION_URL=${AGENT_OPERATION_URL:-http://openclaw-agent-operation:18789}
+      - AGENT_PRODUCT_URL=${AGENT_PRODUCT_URL:-http://openclaw-agent-product:18789}
+      - AGENT_DEVELOPMENT_URL=${AGENT_DEVELOPMENT_URL:-http://openclaw-agent-development:18789}
+      - AGENT_TESTING_URL=${AGENT_TESTING_URL:-http://openclaw-agent-testing:18789}
+      - AGENT_SERVICE_URL=${AGENT_SERVICE_URL:-http://openclaw-agent-service:18789}
 
     ports:
       - "8000:8000"
