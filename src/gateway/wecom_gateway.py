@@ -555,6 +555,7 @@ def wecom_callback():
         try:
             # 解析 XML
             xml_data = request.data
+            logger.info(f"收到 POST body: {xml_data[:500]}")
             root = ET.fromstring(xml_data)
             
             # 提取加密消息
