@@ -1,6 +1,55 @@
 #!/bin/sh
 set -e
 
+# Configure openclaw with token auth and third-party API provider
+mkdir -p /root/.openclaw/agents/main/agent
+INTERNAL_TOKEN="${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}"
+
+# Gateway auth config
+cat > /root/.openclaw/openclaw.json << CONF
+{
+  "gateway": {
+    "auth": {
+      "mode": "token",
+      "token": "${INTERNAL_TOKEN}"
+    }
+  }
+}
+CONF
+
+# Model provider config (third-party OpenAI-compatible API)
+API_BASE="${API_BASE_URL:-}"
+API_SECRET="${API_KEY:-}"
+MODEL="${MODEL_NAME:-claude-sonnet-4}"
+
+if [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
+  cat > /root/.openclaw/agents/main/agent/models.json << CONF
+{
+  "providers": {
+    "openai-compatible": {
+      "baseUrl": "${API_BASE}",
+      "models": ["${MODEL}"]
+    }
+  },
+  "default": "openai-compatible/${MODEL}"
+}
+CONF
+  cat > /root/.openclaw/agents/main/agent/auth.json << CONF
+{
+  "openai-compatible": {
+    "apiKey": "${API_SECRET}"
+  }
+}
+CONF
+  echo "Configured third-party API: ${API_BASE} model: ${MODEL}"
+else
+  echo "WARNING: API_BASE_URL or API_KEY not set, openclaw may not work"
+  echo '{"providers":{}}' > /root/.openclaw/agents/main/agent/models.json
+  echo '{}' > /root/.openclaw/agents/main/agent/auth.json
+fi
+
+export OPENCLAW_INTERNAL_TOKEN="$INTERNAL_TOKEN"
+
 echo "Starting OpenClaw dispatcher (port 18789)..."
 cd /workspace
 npx openclaw gateway --allow-unconfigured &

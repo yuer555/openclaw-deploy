@@ -21,6 +21,9 @@ services:
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - API_BASE_URL=${API_BASE_URL:-}
+      - API_KEY=${API_KEY:-}
+      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4}
       - DB_PATH=/data/gateway.db
       - WECOM_CORP_ID=${WECOM_CORP_ID:-}
       - WECOM_SECRET=${WECOM_SECRET:-}
@@ -30,7 +33,7 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
       - TELEGRAM_MODE=${TELEGRAM_MODE:-polling}
-      - DISPATCHER_URL=${DISPATCHER_URL:-http://openclaw-local:18789}
+      - DISPATCHER_URL=http://localhost:18789
       - AGENT_OPERATION_URL=${AGENT_OPERATION_URL:-http://openclaw-agent-operation:18789}
       - AGENT_PRODUCT_URL=${AGENT_PRODUCT_URL:-http://openclaw-agent-product:18789}
       - AGENT_DEVELOPMENT_URL=${AGENT_DEVELOPMENT_URL:-http://openclaw-agent-development:18789}

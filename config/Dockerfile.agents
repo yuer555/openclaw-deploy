@@ -39,6 +39,14 @@ WORKDIR /workspace
 # 暴露端口
 EXPOSE 18789
 
-# 启动时若 CLAUDE.md 不存在则从备份恢复，再启动 gateway
-CMD ["sh", "-c", "[ -f /workspace/CLAUDE.md ] || cp /etc/openclaw/CLAUDE.md /workspace/CLAUDE.md && npx openclaw gateway --allow-unconfigured"]
+# 启动时：恢复 CLAUDE.md、配置第三方 API、启动 gateway
+CMD ["sh", "-c", "\
+  [ -f /workspace/CLAUDE.md ] || cp /etc/openclaw/CLAUDE.md /workspace/CLAUDE.md && \
+  mkdir -p /root/.openclaw/agents/main/agent && \
+  if [ -n \"$API_BASE_URL\" ] && [ -n \"$API_KEY\" ]; then \
+    MODEL=${MODEL_NAME:-claude-sonnet-4} && \
+    printf '{\"providers\":{\"openai-compatible\":{\"baseUrl\":\"%s\",\"models\":[\"%s\"]}},\"default\":\"openai-compatible/%s\"}' \"$API_BASE_URL\" \"$MODEL\" \"$MODEL\" > /root/.openclaw/agents/main/agent/models.json && \
+    printf '{\"openai-compatible\":{\"apiKey\":\"%s\"}}' \"$API_KEY\" > /root/.openclaw/agents/main/agent/auth.json; \
+  fi && \
+  npx openclaw gateway --allow-unconfigured"]
 

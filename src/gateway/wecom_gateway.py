@@ -37,6 +37,9 @@ OPENCLAW_GATEWAY_URL = os.getenv('OPENCLAW_GATEWAY_URL', 'http://localhost:18789
 OPENCLAW_API_KEY = os.getenv('OPENCLAW_API_KEY', '')
 OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '30'))
 
+# OpenClaw 内部通信 Token
+OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-internal-secret')
+
 # Agent 注册表
 from agent_registry import AGENT_REGISTRY, DISPATCHER_URL
 
@@ -44,20 +47,11 @@ from agent_registry import AGENT_REGISTRY, DISPATCHER_URL
 # ============= AI 调度员 =============
 
 class AIDispatcher:
-    """通过 WebSocket RPC 调用调度员 openclaw 分析意图，返回目标 agent"""
+    """通过 openclaw CLI 调用调度员分析意图，返回目标 agent"""
 
     def route(self, message: str) -> tuple:
         """分析消息意图，返回 (agent_id, agent_url)"""
-        import websocket
-        import uuid as _uuid
-
-        ws_url = DISPATCHER_URL.replace('http://', 'ws://').replace('https://', 'wss://')
-        session_key = 'agent:dispatcher:gateway-routing'
-        idempotency_key = str(_uuid.uuid4())
-
-        result_text = None
-        error_msg = None
-        done = threading.Event()
+        import subprocess
 
         agents_desc = '\n'.join(
             f"- {aid}: {info['name']}（{info['desc']}）"
@@ -69,93 +63,19 @@ class AIDispatcher:
             f"用户消息：{message}"
         )
 
-        def on_message(ws, raw):
-            nonlocal result_text, error_msg
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                return
-
-            if msg.get('type') == 'event' and msg.get('event') == 'connect.challenge':
-                req = {
-                    'type': 'req',
-                    'id': str(_uuid.uuid4()),
-                    'method': 'connect',
-                    'params': {
-                        'minProtocol': 3,
-                        'maxProtocol': 3,
-                        'client': {'id': 'openclaw-probe', 'version': 'dev',
-                                   'platform': 'python', 'mode': 'backend'},
-                        'auth': {},
-                    }
-                }
-                ws.send(json.dumps(req))
-
-            elif msg.get('type') == 'res':
-                if msg.get('ok'):
-                    req = {
-                        'type': 'req',
-                        'id': str(_uuid.uuid4()),
-                        'method': 'chat.send',
-                        'params': {
-                            'sessionKey': session_key,
-                            'message': prompt,
-                            'deliver': False,
-                            'idempotencyKey': idempotency_key,
-                        }
-                    }
-                    ws.send(json.dumps(req))
-                else:
-                    error_msg = msg.get('error', {}).get('message', 'connect failed')
-                    done.set()
-
-            elif msg.get('type') == 'event' and msg.get('event') == 'chat':
-                payload = msg.get('payload', {})
-                if payload.get('sessionKey') != session_key:
-                    return
-                state = payload.get('state')
-                if state in ('final', 'delta'):
-                    msg_obj = payload.get('message')
-                    if isinstance(msg_obj, dict):
-                        for block in msg_obj.get('content', []):
-                            if isinstance(block, dict) and block.get('type') == 'text':
-                                result_text = block.get('text', result_text)
-                                break
-                    elif isinstance(msg_obj, str):
-                        result_text = msg_obj
-                    if state == 'final':
-                        done.set()
-                elif state in ('error', 'aborted'):
-                    error_msg = payload.get('errorMessage', 'chat error')
-                    done.set()
-
-        def on_error(ws, err):
-            nonlocal error_msg
-            error_msg = str(err)
-            done.set()
-
-        def on_close(ws, *args):
-            done.set()
-
         try:
-            ws = websocket.WebSocketApp(
-                ws_url,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close,
+            result = subprocess.run(
+                ['npx', 'openclaw', 'agent', '-m', prompt, '--json', '--timeout', '15'],
+                capture_output=True, text=True, timeout=20, cwd='/workspace'
             )
-            t = threading.Thread(target=ws.run_forever, daemon=True)
-            t.start()
-            done.wait(timeout=5)
-            ws.close()
-
-            if result_text:
-                agent_id = result_text.strip().lower().split()[0] if result_text.strip() else 'service'
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+                reply = data.get('reply', data.get('text', ''))
+                agent_id = reply.strip().lower().split()[0] if reply.strip() else 'service'
                 if agent_id in AGENT_REGISTRY:
                     logger.info(f"AI 路由结果: {agent_id}")
                     return agent_id, AGENT_REGISTRY[agent_id]['url']
-
-            logger.warning(f"AI 路由失败（{error_msg or '无响应'}），fallback 到 service")
+            logger.warning(f"AI 路由失败（CLI 返回: {result.stderr[:100]}），fallback 到 service")
         except Exception as e:
             logger.warning(f"AI 路由异常: {e}，fallback 到 service")
 
