@@ -255,6 +255,7 @@ class WXBizMsgCrypt:
             from_corpid = plain_text[20+content_length:].decode('utf-8')
             
             if from_corpid != self.corp_id:
+                logger.error(f"corpid 不匹配: 收到={from_corpid}, 配置={self.corp_id}")
                 raise ValueError("corpid 不匹配")
             
             return content
