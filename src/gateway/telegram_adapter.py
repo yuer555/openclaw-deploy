@@ -12,6 +12,7 @@ import time
 import requests
 from datetime import datetime
 from typing import Optional, Dict, Any
+from agent_registry import AGENT_REGISTRY
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -19,16 +20,6 @@ logger = logging.getLogger(__name__)
 
 class TelegramAdapter:
     """Telegram Bot 适配器"""
-
-    # 虚拟员工配置
-    AGENTS = {
-        'dispatcher': {'name': '调度员', 'desc': '智能任务分发和路由'},
-        'operation': {'name': '运营专员', 'desc': '数据分析、报表生成'},
-        'product': {'name': '产品经理', 'desc': '需求管理、功能设计'},
-        'development': {'name': '开发工程师', 'desc': '技术支持、代码审查'},
-        'testing': {'name': '测试工程师', 'desc': '质量保障、测试用例'},
-        'service': {'name': '客服专员', 'desc': '客户服务、问题解答'},
-    }
 
     def __init__(self, bot_token: str, db_path: str, openclaw_url: str):
         """
@@ -149,7 +140,7 @@ class TelegramAdapter:
             return self._cmd_current(user_id)
         elif command == '/reset':
             return self._cmd_reset(user_id)
-        elif command in ['/dispatcher', '/operation', '/product',
+        elif command in ['/auto', '/operation', '/product',
                         '/development', '/testing', '/service']:
             agent_id = command[1:]
             return self._cmd_switch_agent(user_id, agent_id)
@@ -158,21 +149,29 @@ class TelegramAdapter:
 
     def _handle_message(self, user_id: int, chat_id: int, text: str) -> str:
         """处理普通消息"""
-        # 获取当前 Agent
+        # 获取当前 Agent（None 表示使用 AI 自动路由）
         agent_id = self._get_current_agent(user_id)
 
         # 发送"正在输入"状态
         self.send_chat_action(chat_id, 'typing')
 
-        # 调用 OpenClaw Agent
         try:
-            response = self._call_agent(agent_id, text, user_id)
+            if agent_id == 'auto':
+                # AI 自动路由
+                from agent_registry import DISPATCHER_URL
+                from wecom_gateway import AIDispatcher
+                dispatcher = AIDispatcher()
+                routed_id, agent_url = dispatcher.route(text)
+                response = self._call_agent(routed_id, text, user_id, openclaw_url=agent_url)
+            else:
+                agent_url = AGENT_REGISTRY.get(agent_id, {}).get('url', self.openclaw_url)
+                response = self._call_agent(agent_id, text, user_id, openclaw_url=agent_url)
             return response
         except Exception as e:
             logger.error(f"调用 Agent 失败: {e}")
             return "❌ 系统暂时无法处理您的请求，请稍后再试"
 
-    def _call_agent(self, agent_id: str, message: str, user_id: int) -> str:
+    def _call_agent(self, agent_id: str, message: str, user_id: int, openclaw_url: str = None) -> str:
         """
         调用 OpenClaw Agent（通过 WebSocket RPC 协议）
 
@@ -187,7 +186,8 @@ class TelegramAdapter:
         import websocket
         import uuid as _uuid
 
-        ws_url = self.openclaw_url.replace('http://', 'ws://').replace('https://', 'wss://')
+        base_url = openclaw_url or self.openclaw_url
+        ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
         token = self.openclaw_token
         session_key = f"agent:{agent_id}-agent:telegram-{user_id}"
         idempotency_key = str(_uuid.uuid4())
@@ -370,12 +370,12 @@ class TelegramAdapter:
             if row:
                 return row[0]
             else:
-                # 创建新会话，默认调度员
-                self._create_session(user_id, 'dispatcher')
-                return 'dispatcher'
+                # 创建新会话，默认 AI 自动路由
+                self._create_session(user_id, 'auto')
+                return 'auto'
         except Exception as e:
             logger.error(f"获取当前 Agent 失败: {e}")
-            return 'dispatcher'
+            return 'auto'
 
     def _create_session(self, user_id: int, agent_id: str):
         """创建会话"""
@@ -413,29 +413,28 @@ class TelegramAdapter:
 
     def _cmd_start(self, user_id: int) -> str:
         """处理 /start 命令"""
-        self._create_session(user_id, 'dispatcher')
+        self._create_session(user_id, 'auto')
         return """👋 欢迎使用 OpenClaw 虚拟员工！
 
-我们有 6 位专业的 AI 虚拟员工为您服务：
-• 调度员 - 智能任务分发
-• 运营专员 - 数据分析
-• 产品经理 - 需求管理
-• 开发工程师 - 技术支持
-• 测试工程师 - 质量保障
-• 客服专员 - 客户服务
+我们有 5 位专业的 AI 虚拟员工为您服务：
+• 运营专员 - 数据分析、运营策略
+• 产品经理 - 需求管理、产品规划
+• 开发工程师 - 代码实现、技术架构
+• 测试工程师 - 测试用例、质量保障
+• 客服专员 - 客户服务、问题解答
 
 💡 使用 /agents 查看所有员工
 💡 使用 /help 查看帮助信息
-💡 直接发送消息开始对话
+💡 直接发送消息，AI 调度员自动为您选择最合适的员工
 
-当前默认员工：调度员"""
+当前模式：AI 自动路由"""
 
     def _cmd_help(self) -> str:
         """处理 /help 命令"""
         return """📖 OpenClaw 使用指南
 
 🤖 切换虚拟员工：
-/dispatcher - 调度员
+/auto - AI 自动路由（推荐）
 /operation - 运营专员
 /product - 产品经理
 /development - 开发工程师
@@ -445,31 +444,33 @@ class TelegramAdapter:
 📋 其他命令：
 /agents - 查看所有虚拟员工
 /current - 查看当前员工
-/reset - 重置会话
+/reset - 重置会话（切回自动路由）
 /help - 显示此帮助
 
 💬 使用方法：
-1. 选择一个虚拟员工（使用命令切换）
-2. 直接发送消息进行对话
+1. 直接发送消息，AI 自动选择合适员工
+2. 或使用命令手动切换到指定员工
 3. 随时切换到其他员工"""
 
     def _cmd_agents(self) -> str:
         """处理 /agents 命令"""
         lines = ["🤖 可用的虚拟员工：\n"]
-        emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣']
+        emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣']
 
-        for i, (agent_id, info) in enumerate(self.AGENTS.items()):
+        for i, (agent_id, info) in enumerate(AGENT_REGISTRY.items()):
             lines.append(f"{emojis[i]} {info['name']} - {info['desc']}")
             lines.append(f"   命令：/{agent_id}\n")
 
-        lines.append("💡 使用命令切换虚拟员工，或直接发送消息给当前员工")
+        lines.append("🤖 自动路由：/auto（由 AI 调度员自动选择员工）")
+        lines.append("\n💡 使用命令切换虚拟员工，或直接发送消息给当前员工")
         return '\n'.join(lines)
 
     def _cmd_current(self, user_id: int) -> str:
         """处理 /current 命令"""
         agent_id = self._get_current_agent(user_id)
-        agent_info = self.AGENTS.get(agent_id, {})
-
+        if agent_id == 'auto':
+            return "📍 当前模式：AI 自动路由\n\n💬 消息将由调度员自动分配给最合适的员工\n🔄 使用 /agents 查看其他员工"
+        agent_info = AGENT_REGISTRY.get(agent_id, {})
         return f"""📍 当前虚拟员工：{agent_info.get('name', '未知')}
 职责：{agent_info.get('desc', '无描述')}
 
@@ -478,18 +479,19 @@ class TelegramAdapter:
 
     def _cmd_reset(self, user_id: int) -> str:
         """处理 /reset 命令"""
-        self._switch_agent(user_id, 'dispatcher')
+        self._switch_agent(user_id, 'auto')
         return """🔄 会话已重置
 
-• 当前员工：调度员
+• 当前模式：AI 自动路由
 
 💡 使用 /agents 选择其他员工"""
 
     def _cmd_switch_agent(self, user_id: int, agent_id: str) -> str:
         """处理切换员工命令"""
         self._switch_agent(user_id, agent_id)
-        agent_info = self.AGENTS.get(agent_id, {})
-
+        if agent_id == 'auto':
+            return "✅ 已切换到：AI 自动路由\n\n消息将由调度员自动分配给最合适的员工\n\n💬 直接发送消息开始对话"
+        agent_info = AGENT_REGISTRY.get(agent_id, {})
         return f"""✅ 已切换到：{agent_info.get('name', '未知')}
 
 我可以帮您：{agent_info.get('desc', '无描述')}

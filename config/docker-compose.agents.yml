@@ -1,82 +1,166 @@
 version: '3.8'
 
+#==============================================================================
+# OpenClaw 虚拟员工容器配置
+# 版本: V2.0（三层架构）
+# 每个员工独立容器，各自运行 openclaw，预置角色性格
+#==============================================================================
+
 services:
-  # 运营虚拟员工
-  operation-agent:
-    image: node:24
-    container_name: operation-agent
+  openclaw-agent-operation:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: operation
+    image: openclaw-agent-operation:local
+    container_name: openclaw-agent-operation
     restart: unless-stopped
-    working_dir: /workspace
     environment:
-      - NODE_ENV=production
-      - AGENT_ID=operation
-      - AGENT_NAME=运营助手
-      - OPENCLAW_MODEL=github-copilot/claude-sonnet-4.5
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    ports:
+      - "18791:18789"
     volumes:
-      - ./agents/operation:/workspace
-      - ./data:/data
-      - ./logs:/logs
+      - ../data/agents/operation:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - openclaw-network
-    command: sh -c "apt-get update  && apt-get install -y  git && git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.com/' && git config --global http.postBuffer 524288000 && git config --global http.timeout 300 && npm config set registry https://registry.npmmirror.com && npm install -g openclaw@latest && npx openclaw gateway --allow-unconfigured --token my-secret-token-$$(hostname)"
 
-  # 产品虚拟员工
-  product-agent:
-    image: node:24
-    container_name: product-agent
+  openclaw-agent-product:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: product
+    image: openclaw-agent-product:local
+    container_name: openclaw-agent-product
     restart: unless-stopped
-    working_dir: /workspace
     environment:
-      - NODE_ENV=production
-      - AGENT_ID=product
-      - AGENT_NAME=产品经理
-      - OPENCLAW_MODEL=github-copilot/claude-sonnet-4.5
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    ports:
+      - "18792:18789"
     volumes:
-      - ./agents/product:/workspace
-      - ./data:/data
-      - ./logs:/logs
+      - ../data/agents/product:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - openclaw-network
-    command: sh -c "apt-get update  && apt-get install -y  git && git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.com/' && git config --global http.postBuffer 524288000 && git config --global http.timeout 300 && npm config set registry https://registry.npmmirror.com && npm install -g openclaw@latest && npx openclaw gateway --allow-unconfigured --token my-secret-token-$$(hostname)"
 
-  # 研发虚拟员工
-  development-agent:
-    image: node:24
-    container_name: development-agent
+  openclaw-agent-development:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: development
+    image: openclaw-agent-development:local
+    container_name: openclaw-agent-development
     restart: unless-stopped
-    working_dir: /workspace
     environment:
-      - NODE_ENV=production
-      - AGENT_ID=development
-      - AGENT_NAME=开发工程师
-      - OPENCLAW_MODEL=github-copilot/claude-sonnet-4.5
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    ports:
+      - "18793:18789"
     volumes:
-      - ./agents/development:/workspace
-      - ./data:/data
-      - ./logs:/logs
+      - ../data/agents/development:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - openclaw-network
-    command: sh -c "apt-get update  && apt-get install -y  git && git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.com/' && git config --global http.postBuffer 524288000 && git config --global http.timeout 300 && npm config set registry https://registry.npmmirror.com && npm install -g openclaw@latest && npx openclaw gateway --allow-unconfigured --token my-secret-token-$$(hostname)"
 
-  # 测试虚拟员工
-  testing-agent:
-    image: node:24
-    container_name: testing-agent
+  openclaw-agent-testing:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: testing
+    image: openclaw-agent-testing:local
+    container_name: openclaw-agent-testing
     restart: unless-stopped
-    working_dir: /workspace
     environment:
-      - NODE_ENV=production
-      - AGENT_ID=testing
-      - AGENT_NAME=测试工程师
-      - OPENCLAW_MODEL=github-copilot/claude-sonnet-4.5
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    ports:
+      - "18794:18789"
     volumes:
-      - ./agents/testing:/workspace
-      - ./data:/data
-      - ./logs:/logs
+      - ../data/agents/testing:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - openclaw-network
-    command: sh -c "apt-get update  && apt-get install -y  git && git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.com/' && git config --global http.postBuffer 524288000 && git config --global http.timeout 300 && npm config set registry https://registry.npmmirror.com && npm install -g openclaw@latest && npx openclaw gateway --allow-unconfigured --token my-secret-token-$$(hostname)"
 
+  openclaw-agent-service:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: service
+    image: openclaw-agent-service:local
+    container_name: openclaw-agent-service
+    restart: unless-stopped
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    ports:
+      - "18795:18789"
+    volumes:
+      - ../data/agents/service:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - openclaw-network
+
+#------------------------------------------------------------------------------
+# 网络配置（与 gateway 共享）
+#------------------------------------------------------------------------------
 networks:
   openclaw-network:
-    driver: bridge
+    external: true
+    name: openclaw-network

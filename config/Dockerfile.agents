@@ -3,11 +3,14 @@ FROM node:24
 # 设置标签
 LABEL maintainer="OpenClaw Team"
 LABEL description="OpenClaw Virtual Agent - Pre-built with all dependencies"
-LABEL version="1.0"
+LABEL version="2.0"
+
+# 构建参数：角色名称（operation/product/development/testing/service）
+ARG ROLE=service
 
 # 安装系统依赖
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git && \
+    apt-get install -y --no-install-recommends git curl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -25,8 +28,12 @@ RUN npm install -g openclaw@latest
 # 设置工作目录
 WORKDIR /workspace
 
-# 暴露端口（虽然默认只监听 127.0.0.1）
+# 预置角色性格（通过 build arg 选择对应 CLAUDE.md）
+COPY agents/workspace/${ROLE}.md /workspace/CLAUDE.md
+
+# 暴露端口
 EXPOSE 18789
 
-# 启动命令（将通过 docker-compose 覆盖）
+# 启动命令
 CMD ["npx", "openclaw", "gateway", "--allow-unconfigured"]
+

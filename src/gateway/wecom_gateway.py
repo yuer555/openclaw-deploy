@@ -40,14 +40,132 @@ OPENCLAW_GATEWAY_URL = os.getenv('OPENCLAW_GATEWAY_URL', 'http://localhost:18789
 OPENCLAW_API_KEY = os.getenv('OPENCLAW_API_KEY', '')
 OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '30'))
 
-# 路由关键词配置
-ROUTING_KEYWORDS = {
-    'service-agent': ['客服', '咨询', '投诉', '售后', '反馈', '帮助', '问题', '咨询一下'],
-    'development-agent': ['开发', '代码', '功能', '接口', '部署', 'bug', '修复', '技术'],
-    'testing-agent': ['测试', '用例', '自动化', 'qa', '质量', '测试用例'],
-    'operation-agent': ['文案', '活动', '推广', '内容', '社群', '运营', '推广方案'],
-    'product-agent': ['需求', '原型', '竞品', '分析', '文档', 'prd', '产品需求'],
-}
+# Agent 注册表
+from agent_registry import AGENT_REGISTRY, DISPATCHER_URL
+
+
+# ============= AI 调度员 =============
+
+class AIDispatcher:
+    """通过 WebSocket RPC 调用调度员 openclaw 分析意图，返回目标 agent"""
+
+    def route(self, message: str) -> tuple:
+        """分析消息意图，返回 (agent_id, agent_url)"""
+        import websocket
+        import uuid as _uuid
+
+        ws_url = DISPATCHER_URL.replace('http://', 'ws://').replace('https://', 'wss://')
+        session_key = 'agent:dispatcher:gateway-routing'
+        idempotency_key = str(_uuid.uuid4())
+
+        result_text = None
+        error_msg = None
+        done = threading.Event()
+
+        agents_desc = '\n'.join(
+            f"- {aid}: {info['name']}（{info['desc']}）"
+            for aid, info in AGENT_REGISTRY.items()
+        )
+        prompt = (
+            f"根据以下用户消息，从可用员工中选择最合适的一位，只返回 agent ID，不返回其他内容。\n\n"
+            f"可用员工：\n{agents_desc}\n\n"
+            f"用户消息：{message}"
+        )
+
+        def on_message(ws, raw):
+            nonlocal result_text, error_msg
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                return
+
+            if msg.get('type') == 'event' and msg.get('event') == 'connect.challenge':
+                req = {
+                    'type': 'req',
+                    'id': str(_uuid.uuid4()),
+                    'method': 'connect',
+                    'params': {
+                        'minProtocol': 3,
+                        'maxProtocol': 3,
+                        'client': {'id': 'openclaw-probe', 'version': 'dev',
+                                   'platform': 'python', 'mode': 'backend'},
+                        'auth': None,
+                    }
+                }
+                ws.send(json.dumps(req))
+
+            elif msg.get('type') == 'res':
+                if msg.get('ok'):
+                    req = {
+                        'type': 'req',
+                        'id': str(_uuid.uuid4()),
+                        'method': 'chat.send',
+                        'params': {
+                            'sessionKey': session_key,
+                            'message': prompt,
+                            'deliver': False,
+                            'idempotencyKey': idempotency_key,
+                        }
+                    }
+                    ws.send(json.dumps(req))
+                else:
+                    error_msg = msg.get('error', {}).get('message', 'connect failed')
+                    done.set()
+
+            elif msg.get('type') == 'event' and msg.get('event') == 'chat':
+                payload = msg.get('payload', {})
+                if payload.get('sessionKey') != session_key:
+                    return
+                state = payload.get('state')
+                if state in ('final', 'delta'):
+                    msg_obj = payload.get('message')
+                    if isinstance(msg_obj, dict):
+                        for block in msg_obj.get('content', []):
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                result_text = block.get('text', result_text)
+                                break
+                    elif isinstance(msg_obj, str):
+                        result_text = msg_obj
+                    if state == 'final':
+                        done.set()
+                elif state in ('error', 'aborted'):
+                    error_msg = payload.get('errorMessage', 'chat error')
+                    done.set()
+
+        def on_error(ws, err):
+            nonlocal error_msg
+            error_msg = str(err)
+            done.set()
+
+        def on_close(ws, *args):
+            done.set()
+
+        try:
+            ws = websocket.WebSocketApp(
+                ws_url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            t = threading.Thread(target=ws.run_forever, daemon=True)
+            t.start()
+            done.wait(timeout=5)
+            ws.close()
+
+            if result_text:
+                agent_id = result_text.strip().lower().split()[0] if result_text.strip() else 'service'
+                if agent_id in AGENT_REGISTRY:
+                    logger.info(f"AI 路由结果: {agent_id}")
+                    return agent_id, AGENT_REGISTRY[agent_id]['url']
+
+            logger.warning(f"AI 路由失败（{error_msg or '无响应'}），fallback 到 service")
+        except Exception as e:
+            logger.warning(f"AI 路由异常: {e}，fallback 到 service")
+
+        return 'service', AGENT_REGISTRY['service']['url']
+
+
+_dispatcher = AIDispatcher()
 
 # ============= Access Token 管理器 =============
 
@@ -224,38 +342,19 @@ def update_task_status(task_id, status, result=''):
 
 # ============= 消息路由 =============
 
-def route_message(content, user_agents):
-    """智能路由消息到合适的代理"""
-    # 优先级路由：基于关键词匹配
-    for agent_id, keywords in ROUTING_KEYWORDS.items():
-        for keyword in keywords:
-            if keyword in content:
-                # 检查用户是否有权限访问该代理
-                if user_agents and agent_id not in user_agents:
-                    logger.warning(f"⚠️  用户无权限访问 {agent_id}，跳过")
-                    continue
-                logger.info(f"✅ 消息路由到: {agent_id} (关键词: {keyword})")
-                return agent_id
-    
-    # 如果没有匹配到关键词，使用默认代理
-    if user_agents and len(user_agents) > 0:
-        default_agent = user_agents[0]
-        logger.info(f"✅ 使用用户默认代理: {default_agent}")
-        return default_agent
-    
-    # 全局默认代理
-    default_agent = 'service-agent'
-    logger.info(f"✅ 使用全局默认代理: {default_agent}")
-    return default_agent
+def route_message(content):
+    """AI 路由消息到合适的代理，返回 (agent_id, agent_url)"""
+    return _dispatcher.route(content)
 
 
 # ============= OpenClaw Gateway API 调用 =============
 
-def call_openclaw_agent(agent_id, message, user_id, task_id):
+def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
     """调用 OpenClaw Gateway API"""
     try:
         # 构造 API 请求
-        url = f"{OPENCLAW_GATEWAY_URL}/api/v1/sessions/send"
+        base_url = gateway_url or OPENCLAW_GATEWAY_URL
+        url = f"{base_url}/api/v1/sessions/send"
         
         headers = {
             'Content-Type': 'application/json'
@@ -393,12 +492,12 @@ def send_wecom_message(user_id, content, safe=0):
 
 # ============= 异步处理（简化版） =============
 
-def process_message_async(user_id, content, agent_id, task_id):
+def process_message_async(user_id, content, agent_id, agent_url, task_id):
     """异步处理消息（在后台线程中执行）"""
     def worker():
         try:
             # 调用 OpenClaw Agent
-            result = call_openclaw_agent(agent_id, content, user_id, task_id)
+            result = call_openclaw_agent(agent_id, content, user_id, task_id, gateway_url=agent_url)
             
             # 发送回复到企业微信
             reply = result.get('reply', '处理失败，请稍后再试。')
@@ -488,17 +587,17 @@ def wecom_callback():
                 # 生成任务 ID
                 task_id = str(uuid.uuid4())
                 
-                # 查询用户绑定的代理
+                # 查询用户绑定的代理（保留用于日志记录）
                 user_agents = get_user_agents(from_user)
                 
                 # 路由消息
-                agent_id = route_message(content, user_agents)
-                
+                agent_id, agent_url = route_message(content)
+
                 # 记录任务日志
                 log_task(task_id, from_user, agent_id, content, status='processing')
-                
+
                 # 异步处理消息（避免企业微信回调超时）
-                process_message_async(from_user, content, agent_id, task_id)
+                process_message_async(from_user, content, agent_id, agent_url, task_id)
                 
                 # 立即返回成功（企业微信要求5秒内响应）
                 return "success", 200

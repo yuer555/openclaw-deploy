@@ -5,48 +5,154 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-OpenClaw V1.4 是一个基于 AI 的企业微信虚拟员工系统，通过 Docker 容器化部署，支持多个智能代理（Agent）角色，包括调度员、运营专员、产品经理、开发工程师、测试工程师和客服专员。
+OpenClaw V2.0 是一个基于 AI 的企业微信/Telegram 虚拟员工系统，采用三层 Docker 容器化架构，支持 AI 智能路由和多个独立虚拟员工角色。
 
 ## 核心架构
 
-### 三层部署架构
+### 三层 Docker 架构
 
-1. **本地测试环境** (`local/`)
-   - 用于开发和功能验证
-   - 使用 SQLite 数据库
-   - 单容器部署（openclaw-local）
-   - 端口：3000
+1. **Gateway 容器** (`src/gateway/`)
+   - Flask 网关：处理企业微信 + Telegram 消息
+   - openclaw 调度员（:18789）：AI 意图分析，路由到对应员工
+   - 角色性格：`config/agents/workspace/dispatcher.md` → `/workspace/CLAUDE.md`
+   - 本地端口：8000；生产固定 IP：172.20.0.10
 
-2. **生产环境** (`production/`)
-   - 用于正式部署到云服务器
-   - 支持 PostgreSQL（可选）
-   - 多容器部署：openclaw-production + nginx
-   - 端口：80/443（通过 Nginx 反向代理）
+2. **虚拟员工容器** × 5（`config/docker-compose.agents.yml`）
+   - 每个员工独立 Docker 容器，各自运行 openclaw（:18789）
+   - 角色性格预置于镜像中（`config/agents/workspace/{role}.md`）
+   - 本地端口：18791-18795；生产固定 IP：172.20.0.11-15
 
-3. **企业微信网关** (`src/gateway/`)
-   - Flask 应用，处理企业微信消息
-   - 负责消息加解密、路由分发
-   - 与 OpenClaw Gateway 通信
+3. **AI 路由机制**
+   - `AIDispatcher` 类通过 WebSocket RPC 调用调度员 openclaw
+   - 调度员分析用户意图，返回目标 agent ID
+   - Fallback 到 `service` agent
 
-### 关键组件
+### 关键文件
 
-- **虚拟员工配置** (`config/agents/*.yml`)：定义每个 AI 角色的能力、路由规则、AI 模型配置
-- **Docker Compose 配置**：
-  - `local/docker-compose.local.yml`：本地测试
-  - `production/docker-compose.prod.yml`：生产部署
-  - `config/docker-compose.agents.yml`：虚拟员工容器配置
-- **企业微信网关** (`src/gateway/wecom_gateway.py`)：处理企业微信 API 交互
+- **角色性格**：`config/agents/workspace/{role}.md`（预置到镜像 `/workspace/CLAUDE.md`）
+- **Agent 注册表**：`src/gateway/agent_registry.py`（URL 从环境变量读取）
+- **Gateway 镜像**：`src/gateway/Dockerfile.gateway` + `src/gateway/entrypoint.sh`
+- **Agent 镜像**：`config/Dockerfile.agents`（ARG ROLE 选择角色）
+- **企业微信网关**：`src/gateway/wecom_gateway.py`
+- **Telegram 适配器**：`src/gateway/telegram_adapter.py`
 
 ## 常用命令
 
 ### 本地测试
 
 ```bash
-# 进入本地测试目录
 cd local/
 
-# 初始化环境（首次运行）
-./1-init-local.sh
+# 首次运行
+./1-init-local.sh          # 检查端口、创建目录、生成 .env.local
+vi .env.local              # 填入 GITHUB_TOKEN 等配置
+./0-build-images.sh        # 构建所有镜像（首次或代码变更后）
+./2-start-local.sh         # 启动 gateway + 5 个 agent 容器
+
+# 日常操作
+./3-test-local.sh          # 健康检查 + AI 路由测试
+./4-stop-local.sh          # 停止所有容器
+./5-clean-local.sh         # 清理容器、镜像、数据
+```
+
+### 生产部署
+
+```bash
+cd production/
+
+./1-prepare-server.sh      # 安装 Docker（服务器执行）
+./2-upload-to-server.sh    # 上传代码（本地执行）
+./3-deploy-production.sh   # 构建镜像 + 创建目录（服务器执行）
+vi .env.prod               # 填入生产配置
+./5-start-production.sh    # 启动所有容器
+./6-health-check.sh        # 检查所有服务状态
+```
+
+### Docker 操作
+
+```bash
+# 查看容器状态
+docker ps | grep openclaw
+
+# 查看日志
+docker logs openclaw-gateway -f
+docker logs openclaw-agent-testing -f
+
+# 进入容器
+docker exec -it openclaw-gateway bash
+docker exec -it openclaw-agent-operation sh
+
+# 重启单个容器
+docker restart openclaw-agent-service
+```
+
+## 目录结构
+
+```
+openclaw-deploy/
+├── local/                         # 本地测试脚本
+│   ├── 0-build-images.sh          # 构建镜像
+│   ├── 1-init-local.sh            # 初始化
+│   ├── 2-start-local.sh           # 启动
+│   ├── 3-test-local.sh            # 测试
+│   ├── 4-stop-local.sh            # 停止
+│   ├── 5-clean-local.sh           # 清理
+│   ├── docker-compose.local.yml   # Gateway compose
+│   └── .env.local.example
+├── production/                    # 生产部署脚本
+│   ├── docker-compose.prod.yml    # 全量 compose（gateway + agents）
+│   └── .env.prod.example
+├── config/
+│   ├── agents/workspace/          # 角色性格 CLAUDE.md 文件
+│   │   ├── dispatcher.md
+│   │   ├── operation.md
+│   │   ├── product.md
+│   │   ├── development.md
+│   │   ├── testing.md
+│   │   └── service.md
+│   ├── Dockerfile.agents          # Agent 镜像（ARG ROLE）
+│   └── docker-compose.agents.yml  # 本地 agent compose
+├── src/gateway/
+│   ├── wecom_gateway.py           # 企业微信网关 + AIDispatcher
+│   ├── telegram_adapter.py        # Telegram 适配器
+│   ├── agent_registry.py          # Agent URL 注册表
+│   ├── Dockerfile.gateway         # Gateway 镜像
+│   └── entrypoint.sh              # 启动脚本（openclaw → Flask）
+├── data/                          # 运行时数据（自动生成）
+├── logs/                          # 日志（自动生成）
+└── openspec/changes/              # OpenSpec 变更记录
+```
+
+## 环境变量
+
+### 必填
+
+| 变量 | 说明 |
+|------|------|
+| `GITHUB_TOKEN` | GitHub Copilot Token（AI 模型） |
+| `WECOM_CORP_ID` | 企业微信企业 ID |
+| `WECOM_SECRET` | 企业微信应用 Secret |
+| `WECOM_TOKEN` | 企业微信回调 Token |
+| `WECOM_ENCODING_AES_KEY` | 企业微信加密 Key |
+| `WECOM_AGENT_ID` | 企业微信应用 ID |
+
+### Agent URL（本地默认 localhost，生产用 Docker 固定 IP）
+
+| 变量 | 本地默认 | 生产默认 |
+|------|---------|---------|
+| `AGENT_OPERATION_URL` | http://localhost:18791 | http://172.20.0.11:18789 |
+| `AGENT_PRODUCT_URL` | http://localhost:18792 | http://172.20.0.12:18789 |
+| `AGENT_DEVELOPMENT_URL` | http://localhost:18793 | http://172.20.0.13:18789 |
+| `AGENT_TESTING_URL` | http://localhost:18794 | http://172.20.0.14:18789 |
+| `AGENT_SERVICE_URL` | http://localhost:18795 | http://172.20.0.15:18789 |
+
+## 开发注意事项
+
+- 修改 Python 网关代码后需重新构建 Gateway 镜像：`./0-build-images.sh`
+- 修改角色性格（`config/agents/workspace/*.md`）后需重新构建对应 Agent 镜像
+- `agent_registry.py` 是 agent URL 的唯一来源，`wecom_gateway.py` 和 `telegram_adapter.py` 均从此导入
+- 调度员 openclaw 运行在 Gateway 容器内部（:18789），不对外暴露
+
 
 # 启动服务
 ./2-start-local.sh

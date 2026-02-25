@@ -2,156 +2,232 @@ version: '3.8'
 
 #==============================================================================
 # OpenClaw 生产环境 - Docker Compose 配置
-# 版本: V1.4
-# 用途: 生产部署
+# 版本: V2.0（三层架构）
+# 用途: 生产部署，Docker 固定 IP，无 Nginx
+# 子网: 172.20.0.0/16
+#   gateway:     172.20.0.10:8000
+#   operation:   172.20.0.11:18789
+#   product:     172.20.0.12:18789
+#   development: 172.20.0.13:18789
+#   testing:     172.20.0.14:18789
+#   service:     172.20.0.15:18789
 #==============================================================================
 
 services:
   #----------------------------------------------------------------------------
-  # OpenClaw Gateway 服务
+  # Gateway 容器（Flask + openclaw 调度员）
   #----------------------------------------------------------------------------
-  openclaw-production:
-    image: openclaw/openclaw:latest
-    container_name: openclaw-production
+  openclaw-gateway:
+    build:
+      context: ..
+      dockerfile: src/gateway/Dockerfile.gateway
+    image: openclaw-gateway:prod
+    container_name: openclaw-gateway
     restart: always
-    
-    # 环境变量
+
     environment:
-      - NODE_ENV=production
-      - OPENCLAW_ENV=${OPENCLAW_ENV:-production}
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      - DATABASE_URL=${DATABASE_URL}
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - SECRET_KEY=${SECRET_KEY}
-      - AGENTS_ENABLED=${AGENTS_ENABLED}
-      - WECOM_CORP_ID=${WECOM_CORP_ID:-}
-      - WECOM_AGENT_ID=${WECOM_AGENT_ID:-}
-      - WECOM_SECRET=${WECOM_SECRET:-}
-      - WECOM_TOKEN=${WECOM_TOKEN:-}
-      - WECOM_ENCODING_AES_KEY=${WECOM_ENCODING_AES_KEY:-}
+      - DB_PATH=/data/gateway.db
+      - WECOM_CORP_ID=${WECOM_CORP_ID}
+      - WECOM_SECRET=${WECOM_SECRET}
+      - WECOM_TOKEN=${WECOM_TOKEN}
+      - WECOM_ENCODING_AES_KEY=${WECOM_ENCODING_AES_KEY}
+      - WECOM_AGENT_ID=${WECOM_AGENT_ID}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
-      - OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-http://localhost:18789}
-      - DB_PATH=${DB_PATH:-/data/openclaw.db}
-    
-    # 端口映射（不直接暴露，通过 Nginx 代理）
-    expose:
-      - "3000"
-    
-    # 数据卷挂载
+      - TELEGRAM_MODE=${TELEGRAM_MODE:-polling}
+      - DISPATCHER_URL=http://localhost:18789
+      - AGENT_OPERATION_URL=${AGENT_OPERATION_URL}
+      - AGENT_PRODUCT_URL=${AGENT_PRODUCT_URL}
+      - AGENT_DEVELOPMENT_URL=${AGENT_DEVELOPMENT_URL}
+      - AGENT_TESTING_URL=${AGENT_TESTING_URL}
+      - AGENT_SERVICE_URL=${AGENT_SERVICE_URL}
+
+    ports:
+      - "8000:8000"
+
     volumes:
-      - /opt/openclaw/data:/data
+      - /opt/openclaw/data/gateway:/data
       - /opt/openclaw/logs/gateway:/logs
-      - /opt/openclaw/config/agents:/config/agents:ro
-    
-    # 健康检查
+
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 60s
-    
-    # 资源限制
-    deploy:
-      resources:
-        limits:
-          cpus: '4.0'
-          memory: 8G
-        reservations:
-          cpus: '2.0'
-          memory: 4G
-    
-    # 日志配置
+
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "10"
-    
-    # 网络
+
     networks:
-      - openclaw-network
-  
+      openclaw-network:
+        ipv4_address: 172.20.0.10
+
   #----------------------------------------------------------------------------
-  # Nginx 反向代理
+  # 虚拟员工容器
   #----------------------------------------------------------------------------
-  openclaw-nginx:
-    image: nginx:alpine
-    container_name: openclaw-nginx
+  openclaw-agent-operation:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: operation
+    image: openclaw-agent-operation:prod
+    container_name: openclaw-agent-operation
     restart: always
-    
-    # 端口映射
-    ports:
-      - "80:80"
-      - "443:443"
-    
-    # 数据卷
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    expose:
+      - "18789"
     volumes:
-      - /opt/openclaw/config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - /opt/openclaw/config/ssl:/etc/nginx/ssl:ro
-      - /opt/openclaw/logs/nginx:/var/log/nginx
-    
-    # 依赖
-    depends_on:
-      - openclaw-production
-    
-    # 健康检查
+      - /opt/openclaw/data/agents/operation:/workspace
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-    
-    # 资源限制
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 512M
-        reservations:
-          cpus: '0.5'
-          memory: 256M
-    
-    # 日志配置
+      start_period: 60s
     logging:
       driver: "json-file"
       options:
-        max-size: "20m"
-        max-file: "5"
-    
-    # 网络
+        max-size: "50m"
+        max-file: "10"
     networks:
-      - openclaw-network
-  
-  #----------------------------------------------------------------------------
-  # PostgreSQL 数据库（可选，如不使用 SQLite）
-  #----------------------------------------------------------------------------
-  # openclaw-database:
-  #   image: postgres:15-alpine
-  #   container_name: openclaw-database
-  #   restart: always
-  #   
-  #   environment:
-  #     - POSTGRES_DB=${DB_NAME:-openclaw}
-  #     - POSTGRES_USER=${DB_USER:-openclaw}
-  #     - POSTGRES_PASSWORD=${DB_PASSWORD}
-  #   
-  #   volumes:
-  #     - /opt/openclaw/data/database:/var/lib/postgresql/data
-  #   
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-openclaw}"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-  #   
-  #   networks:
-  #     - openclaw-network
+      openclaw-network:
+        ipv4_address: 172.20.0.11
+
+  openclaw-agent-product:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: product
+    image: openclaw-agent-product:prod
+    container_name: openclaw-agent-product
+    restart: always
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    expose:
+      - "18789"
+    volumes:
+      - /opt/openclaw/data/agents/product:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+    networks:
+      openclaw-network:
+        ipv4_address: 172.20.0.12
+
+  openclaw-agent-development:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: development
+    image: openclaw-agent-development:prod
+    container_name: openclaw-agent-development
+    restart: always
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    expose:
+      - "18789"
+    volumes:
+      - /opt/openclaw/data/agents/development:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+    networks:
+      openclaw-network:
+        ipv4_address: 172.20.0.13
+
+  openclaw-agent-testing:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: testing
+    image: openclaw-agent-testing:prod
+    container_name: openclaw-agent-testing
+    restart: always
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    expose:
+      - "18789"
+    volumes:
+      - /opt/openclaw/data/agents/testing:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+    networks:
+      openclaw-network:
+        ipv4_address: 172.20.0.14
+
+  openclaw-agent-service:
+    build:
+      context: ..
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: service
+    image: openclaw-agent-service:prod
+    container_name: openclaw-agent-service
+    restart: always
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    expose:
+      - "18789"
+    volumes:
+      - /opt/openclaw/data/agents/service:/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+    networks:
+      openclaw-network:
+        ipv4_address: 172.20.0.15
 
 #------------------------------------------------------------------------------
-# 网络配置
+# 网络配置（固定子网）
 #------------------------------------------------------------------------------
 networks:
   openclaw-network:
@@ -160,12 +236,3 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
-
-#------------------------------------------------------------------------------
-# 数据卷配置
-#------------------------------------------------------------------------------
-volumes:
-  openclaw-data:
-    name: openclaw-prod-data
-  openclaw-logs:
-    name: openclaw-prod-logs

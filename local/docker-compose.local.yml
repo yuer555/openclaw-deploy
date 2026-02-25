@@ -2,87 +2,68 @@ version: '3.8'
 
 #==============================================================================
 # OpenClaw 本地测试环境 - Docker Compose 配置
-# 版本: V1.4
+# 版本: V2.0（三层架构）
 # 用途: 本地开发和测试
 #==============================================================================
 
 services:
   #----------------------------------------------------------------------------
-  # OpenClaw Gateway 服务
+  # Gateway 容器（Flask + openclaw 调度员）
   #----------------------------------------------------------------------------
-  openclaw-local:
+  openclaw-gateway:
     build:
-      context: ../src/gateway
-      dockerfile: Dockerfile
-    image: openclaw-local:latest
-    container_name: openclaw-local
+      context: ..
+      dockerfile: src/gateway/Dockerfile.gateway
+    image: openclaw-gateway:local
+    container_name: openclaw-gateway
     restart: unless-stopped
-    
-    # 环境变量
+
     environment:
-      - NODE_ENV=development
-      - OPENCLAW_ENV=${OPENCLAW_ENV:-local}
-      - LOG_LEVEL=${LOG_LEVEL:-debug}
-      - DATABASE_URL=${DATABASE_URL:-sqlite:///data/openclaw.db}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - SECRET_KEY=${SECRET_KEY:-local-secret-key}
-      - AGENTS_ENABLED=${AGENTS_ENABLED:-dispatcher,operation,product,development,testing,service}
+      - DB_PATH=/data/gateway.db
+      - WECOM_CORP_ID=${WECOM_CORP_ID:-}
+      - WECOM_SECRET=${WECOM_SECRET:-}
+      - WECOM_TOKEN=${WECOM_TOKEN:-}
+      - WECOM_ENCODING_AES_KEY=${WECOM_ENCODING_AES_KEY:-}
+      - WECOM_AGENT_ID=${WECOM_AGENT_ID:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
-      - OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-http://localhost:18789}
-      - DB_PATH=${DB_PATH:-/data/openclaw.db}
-    
-    # 端口映射
+      - TELEGRAM_MODE=${TELEGRAM_MODE:-polling}
+      - DISPATCHER_URL=http://localhost:18789
+      - AGENT_OPERATION_URL=http://localhost:18791
+      - AGENT_PRODUCT_URL=http://localhost:18792
+      - AGENT_DEVELOPMENT_URL=http://localhost:18793
+      - AGENT_TESTING_URL=http://localhost:18794
+      - AGENT_SERVICE_URL=http://localhost:18795
+
     ports:
-      - "3000:8000"
-    
-    # 数据卷挂载
+      - "8000:8000"
+
     volumes:
-      - ../data/local:/data
-      - ../logs/local:/logs
-      - ../config/agents:/config/agents:ro
-    
-    # 健康检查
+      - ../data/gateway:/data
+      - ../logs/gateway:/logs
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
-    
-    # 资源限制
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4G
-        reservations:
-          cpus: '1.0'
-          memory: 2G
-    
-    # 日志配置
+      start_period: 60s
+
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-    
-    # 网络
+
     networks:
-      - openclaw-local-network
+      - openclaw-network
 
 #------------------------------------------------------------------------------
 # 网络配置
 #------------------------------------------------------------------------------
 networks:
-  openclaw-local-network:
+  openclaw-network:
     driver: bridge
-    name: openclaw-local-net
-
-#------------------------------------------------------------------------------
-# 数据卷配置（可选）
-#------------------------------------------------------------------------------
-volumes:
-  openclaw-local-data:
-    name: openclaw-local-data
+    name: openclaw-network

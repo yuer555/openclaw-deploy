@@ -1,0 +1,43 @@
+FROM python:3.11-slim
+
+LABEL maintainer="OpenClaw Team"
+LABEL description="OpenClaw Gateway - Flask + Dispatcher openclaw"
+LABEL version="2.0"
+
+# 安装 Node.js 24
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+        gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 配置 npm 国内镜像并安装 openclaw
+RUN npm config set registry https://registry.npmmirror.com && \
+    npm install -g openclaw@latest
+
+# 安装 Python 依赖
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制网关源码
+COPY wecom_gateway.py .
+COPY telegram_adapter.py .
+COPY agent_registry.py .
+
+# 预置调度员性格（openclaw workspace）
+RUN mkdir -p /workspace
+COPY ../../config/agents/workspace/dispatcher.md /workspace/CLAUDE.md
+
+# 启动脚本：先启动 openclaw 调度员，再启动 Flask
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8000
+
+ENTRYPOINT ["/entrypoint.sh"]
