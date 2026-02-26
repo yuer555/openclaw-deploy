@@ -104,7 +104,7 @@ fi
 export OPENCLAW_INTERNAL_TOKEN="$INTERNAL_TOKEN"
 
 echo "Starting OpenClaw dispatcher (port 18789)..."
-cd /workspace
+cd /root/.openclaw/workspace
 npx openclaw gateway --allow-unconfigured &
 OPENCLAW_PID=$!
 

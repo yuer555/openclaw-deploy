@@ -49,7 +49,7 @@ from agent_registry import AGENT_REGISTRY
 class AIDispatcher:
     """通过 openclaw CLI 调用调度员分析意图，返回目标 agent"""
 
-    def route(self, message: str) -> tuple:
+    def route(self, message: str, user_id: str = 'anonymous') -> tuple:
         """分析消息意图，返回 (agent_id, agent_url, direct_reply)
         当 direct_reply 不为 None 时，表示调度员直接回答，不路由到员工
         """
@@ -69,12 +69,12 @@ class AIDispatcher:
         )
 
         try:
-            route_session = f"route-{uuid.uuid4()}"
+            route_session = f"dispatcher-{user_id}"
             result = subprocess.run(
                 ['npx', 'openclaw', 'agent', '--agent', 'main', '--local',
                  '--session-id', route_session,
                  '-m', prompt, '--json', '--timeout', '30'],
-                capture_output=True, text=True, timeout=40, cwd='/workspace'
+                capture_output=True, text=True, timeout=40, cwd='/root/.openclaw/workspace'
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = None
@@ -287,9 +287,9 @@ def update_task_status(task_id, status, result=''):
 
 # ============= 消息路由 =============
 
-def route_message(content):
+def route_message(content, user_id='anonymous'):
     """AI 路由消息到合适的代理，返回 (agent_id, agent_url, direct_reply)"""
-    return _dispatcher.route(content)
+    return _dispatcher.route(content, user_id)
 
 
 # ============= OpenClaw Agent 调用（docker exec + CLI）=============
@@ -309,7 +309,7 @@ def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
              '--session-id', session_id,
              '-m', message, '--json', '--timeout', str(OPENCLAW_TIMEOUT)],
             capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT + 10,
-            cwd='/workspace'
+            cwd='/root/.openclaw/workspace'
         )
 
         logger.info(f"Agent {agent_id} CLI 返回码: {result.returncode}, stdout长度: {len(result.stdout)}, stderr长度: {len(result.stderr)}")
@@ -398,7 +398,7 @@ def process_message_async(user_id, content, task_id, response_url, crypto, times
     """异步处理消息：先路由，再调用 agent 或直接回复，最后用 response_url 主动回复"""
     def worker():
         try:
-            agent_id, agent_url, direct_reply = route_message(content)
+            agent_id, agent_url, direct_reply = route_message(content, user_id)
             log_task(task_id, user_id, agent_id, content, status='processing')
 
             if direct_reply:

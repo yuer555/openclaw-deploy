@@ -48,9 +48,9 @@ COPY src/gateway/wecom_gateway.py .
 COPY src/gateway/telegram_adapter.py .
 COPY src/gateway/agent_registry.py .
 
-# 预置调度员性格（openclaw workspace）
-RUN mkdir -p /workspace
-COPY config/agents/workspace/dispatcher.md /workspace/CLAUDE.md
+# 预置调度员 workspace 文件到 openclaw workspace 目录
+RUN mkdir -p /root/.openclaw/workspace
+COPY config/agents/workspace/dispatcher/ /root/.openclaw/workspace/
 
 # 启动脚本：先启动 openclaw 调度员，再启动 Flask
 COPY src/gateway/entrypoint.sh /entrypoint.sh
