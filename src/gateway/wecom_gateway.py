@@ -64,8 +64,11 @@ class AIDispatcher:
         )
 
         try:
+            route_session = f"route-{uuid.uuid4()}"
             result = subprocess.run(
-                ['npx', 'openclaw', 'agent', '--agent', 'main', '--local', '-m', prompt, '--json', '--timeout', '30'],
+                ['npx', 'openclaw', 'agent', '--agent', 'main', '--local',
+                 '--session-id', route_session,
+                 '-m', prompt, '--json', '--timeout', '30'],
                 capture_output=True, text=True, timeout=40, cwd='/workspace'
             )
             if result.returncode == 0 and result.stdout.strip():
@@ -252,9 +255,11 @@ def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
     logger.info(f"调用 Agent {agent_id}: docker exec {container_name}")
 
     try:
+        session_id = f"{agent_id}-{user_id}"
         result = subprocess.run(
             ['docker', 'exec', container_name,
              'npx', 'openclaw', 'agent', '--agent', 'main', '--local',
+             '--session-id', session_id,
              '-m', message, '--json', '--timeout', str(OPENCLAW_TIMEOUT)],
             capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT + 10,
             cwd='/workspace'
