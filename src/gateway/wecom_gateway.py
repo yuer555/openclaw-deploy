@@ -41,7 +41,7 @@ OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '30'))
 OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-internal-secret')
 
 # Agent 注册表
-from agent_registry import AGENT_REGISTRY, DISPATCHER_URL
+from agent_registry import AGENT_REGISTRY
 
 
 # ============= AI 调度员 =============

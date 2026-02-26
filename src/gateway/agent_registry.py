@@ -37,6 +37,3 @@ AGENT_REGISTRY = {
         "desc": "客户服务、问题解答、投诉处理",
     },
 }
-
-# 调度员 openclaw URL（Gateway 容器内部）
-DISPATCHER_URL = os.getenv("DISPATCHER_URL", "http://localhost:18789")

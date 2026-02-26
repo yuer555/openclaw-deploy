@@ -30,7 +30,6 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
       - TELEGRAM_MODE=${TELEGRAM_MODE:-polling}
-      - DISPATCHER_URL=http://localhost:18789
       - AGENT_OPERATION_URL=${AGENT_OPERATION_URL:-http://openclaw-agent-operation:18789}
       - AGENT_PRODUCT_URL=${AGENT_PRODUCT_URL:-http://openclaw-agent-product:18789}
       - AGENT_DEVELOPMENT_URL=${AGENT_DEVELOPMENT_URL:-http://openclaw-agent-development:18789}

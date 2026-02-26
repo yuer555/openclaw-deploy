@@ -158,7 +158,6 @@ class TelegramAdapter:
         try:
             if agent_id == 'auto':
                 # AI 自动路由
-                from agent_registry import DISPATCHER_URL
                 from wecom_gateway import AIDispatcher
                 dispatcher = AIDispatcher()
                 routed_id, agent_url = dispatcher.route(text)
