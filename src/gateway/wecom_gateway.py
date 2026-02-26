@@ -279,9 +279,12 @@ def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
             cwd='/workspace'
         )
 
+        logger.info(f"Agent {agent_id} CLI 返回码: {result.returncode}, stdout长度: {len(result.stdout)}, stderr长度: {len(result.stderr)}")
+
         if result.returncode == 0 and result.stdout.strip():
             # stdout 可能包含多个 JSON 对象（每行一个），取最后一个完整的
             lines = result.stdout.strip().split('\n')
+            logger.info(f"Agent {agent_id} stdout 行数: {len(lines)}")
             data = None
             for line in reversed(lines):
                 line = line.strip()
@@ -299,12 +302,16 @@ def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
 
             if data:
                 payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
+                logger.info(f"Agent {agent_id} payloads 数量: {len(payloads)}")
                 # 合并所有 payload 的 text
                 parts = [p.get('text', '') for p in payloads if p.get('text')]
                 reply = '\n'.join(parts)
+                logger.info(f"Agent {agent_id} 回复长度: {len(reply)}, 前200字: {reply[:200]}")
                 if reply:
                     update_task_status(task_id, 'success', reply[:500])
                     return {'success': True, 'reply': reply, 'agent_id': agent_id}
+            else:
+                logger.error(f"Agent {agent_id} JSON 解析失败, stdout前500字: {result.stdout[:500]}")
 
         error_msg = result.stderr[:200] if result.stderr else '无响应'
         logger.error(f"Agent {agent_id} CLI 调用失败: {error_msg}")
