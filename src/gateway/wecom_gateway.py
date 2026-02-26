@@ -72,15 +72,29 @@ class AIDispatcher:
                 capture_output=True, text=True, timeout=40, cwd='/workspace'
             )
             if result.returncode == 0 and result.stdout.strip():
-                data = json.loads(result.stdout)
-                # --local --json 输出: {"payloads": [{"text": "..."}], ...}
-                # gateway --json 输出: {"result": {"payloads": [{"text": "..."}]}, ...}
-                payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
-                reply = payloads[0].get('text', '') if payloads else ''
-                agent_id = reply.strip().lower().split()[0] if reply.strip() else 'service'
-                if agent_id in AGENT_REGISTRY:
-                    logger.info(f"AI 路由结果: {agent_id}")
-                    return agent_id, AGENT_REGISTRY[agent_id]['url']
+                # 解析 JSON（可能多行输出，取最后一个有效 JSON）
+                data = None
+                for line in reversed(result.stdout.strip().split('\n')):
+                    if line.strip().startswith('{'):
+                        try:
+                            data = json.loads(line.strip())
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                if not data:
+                    try:
+                        data = json.loads(result.stdout)
+                    except json.JSONDecodeError:
+                        data = None
+
+                if data:
+                    payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
+                    parts = [p.get('text', '') for p in payloads if p.get('text')]
+                    reply = '\n'.join(parts)
+                    agent_id = reply.strip().lower().split()[0] if reply.strip() else 'service'
+                    if agent_id in AGENT_REGISTRY:
+                        logger.info(f"AI 路由结果: {agent_id}")
+                        return agent_id, AGENT_REGISTRY[agent_id]['url']
             logger.warning(f"AI 路由失败（CLI 返回: {result.stderr[:100]}），fallback 到 service")
         except Exception as e:
             logger.warning(f"AI 路由异常: {e}，fallback 到 service")
@@ -266,12 +280,31 @@ def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
         )
 
         if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
-            reply = payloads[0].get('text', '') if payloads else ''
-            if reply:
-                update_task_status(task_id, 'success', reply[:500])
-                return {'success': True, 'reply': reply, 'agent_id': agent_id}
+            # stdout 可能包含多个 JSON 对象（每行一个），取最后一个完整的
+            lines = result.stdout.strip().split('\n')
+            data = None
+            for line in reversed(lines):
+                line = line.strip()
+                if line.startswith('{'):
+                    try:
+                        data = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            if not data:
+                try:
+                    data = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    data = None
+
+            if data:
+                payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
+                # 合并所有 payload 的 text
+                parts = [p.get('text', '') for p in payloads if p.get('text')]
+                reply = '\n'.join(parts)
+                if reply:
+                    update_task_status(task_id, 'success', reply[:500])
+                    return {'success': True, 'reply': reply, 'agent_id': agent_id}
 
         error_msg = result.stderr[:200] if result.stderr else '无响应'
         logger.error(f"Agent {agent_id} CLI 调用失败: {error_msg}")
