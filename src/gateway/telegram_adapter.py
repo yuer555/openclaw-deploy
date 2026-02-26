@@ -160,11 +160,21 @@ class TelegramAdapter:
                 # AI 自动路由
                 from wecom_gateway import AIDispatcher
                 dispatcher = AIDispatcher()
-                routed_id, agent_url = dispatcher.route(text)
-                response = self._call_agent(routed_id, text, user_id, openclaw_url=agent_url)
+                routed_id, agent_url, direct_reply = dispatcher.route(text)
+                if direct_reply:
+                    # 调度员直接回复（模糊/闲聊类消息）
+                    response = direct_reply
+                else:
+                    response = self._call_agent(routed_id, text, user_id, openclaw_url=agent_url)
+                    # 添加虚拟员工标识前缀
+                    agent_name = AGENT_REGISTRY.get(routed_id, {}).get('name', routed_id)
+                    response = f"【{agent_name}】\n{response}"
             else:
                 agent_url = AGENT_REGISTRY.get(agent_id, {}).get('url', self.openclaw_url)
                 response = self._call_agent(agent_id, text, user_id, openclaw_url=agent_url)
+                # 添加虚拟员工标识前缀
+                agent_name = AGENT_REGISTRY.get(agent_id, {}).get('name', agent_id)
+                response = f"【{agent_name}】\n{response}"
             return response
         except Exception as e:
             logger.error(f"调用 Agent 失败: {e}")

@@ -50,7 +50,9 @@ class AIDispatcher:
     """通过 openclaw CLI 调用调度员分析意图，返回目标 agent"""
 
     def route(self, message: str) -> tuple:
-        """分析消息意图，返回 (agent_id, agent_url)"""
+        """分析消息意图，返回 (agent_id, agent_url, direct_reply)
+        当 direct_reply 不为 None 时，表示调度员直接回答，不路由到员工
+        """
         import subprocess
 
         agents_desc = '\n'.join(
@@ -58,7 +60,10 @@ class AIDispatcher:
             for aid, info in AGENT_REGISTRY.items()
         )
         prompt = (
-            f"根据以下用户消息，从可用员工中选择最合适的一位，只返回 agent ID，不返回其他内容。\n\n"
+            f"根据以下用户消息，判断应该路由到哪个员工，或者直接回复。只返回 JSON。\n"
+            f"路由格式：{{\"action\":\"route\",\"agent\":\"agent_id\"}}\n"
+            f"直接回复格式：{{\"action\":\"reply\",\"message\":\"回复内容\"}}\n"
+            f"如果消息含义模糊、没有具体工作意图（如打招呼、闲聊），直接回复。\n\n"
             f"可用员工：\n{agents_desc}\n\n"
             f"用户消息：{message}"
         )
@@ -72,7 +77,6 @@ class AIDispatcher:
                 capture_output=True, text=True, timeout=40, cwd='/workspace'
             )
             if result.returncode == 0 and result.stdout.strip():
-                # 解析 JSON（可能多行输出，取最后一个有效 JSON）
                 data = None
                 for line in reversed(result.stdout.strip().split('\n')):
                     if line.strip().startswith('{'):
@@ -90,16 +94,45 @@ class AIDispatcher:
                 if data:
                     payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
                     parts = [p.get('text', '') for p in payloads if p.get('text')]
-                    reply = '\n'.join(parts)
-                    agent_id = reply.strip().lower().split()[0] if reply.strip() else 'service'
+                    reply_text = '\n'.join(parts).strip()
+
+                    # 尝试从回复中解析 dispatcher 返回的 JSON
+                    dispatch_data = None
+                    try:
+                        dispatch_data = json.loads(reply_text)
+                    except json.JSONDecodeError:
+                        # 回复中可能包含多余文字，尝试提取 JSON
+                        import re
+                        m = re.search(r'\{[^}]+\}', reply_text)
+                        if m:
+                            try:
+                                dispatch_data = json.loads(m.group())
+                            except json.JSONDecodeError:
+                                pass
+
+                    if dispatch_data and isinstance(dispatch_data, dict):
+                        action = dispatch_data.get('action', '')
+                        if action == 'reply':
+                            direct_msg = dispatch_data.get('message', '')
+                            logger.info("AI 路由结果: dispatcher 直接回复")
+                            return 'dispatcher', None, direct_msg
+                        elif action == 'route':
+                            agent_id = dispatch_data.get('agent', 'service')
+                            if agent_id in AGENT_REGISTRY:
+                                logger.info(f"AI 路由结果: {agent_id}")
+                                return agent_id, AGENT_REGISTRY[agent_id]['url'], None
+
+                    # fallback: 旧格式兼容（纯 agent ID）
+                    agent_id = reply_text.lower().split()[0] if reply_text else 'service'
                     if agent_id in AGENT_REGISTRY:
-                        logger.info(f"AI 路由结果: {agent_id}")
-                        return agent_id, AGENT_REGISTRY[agent_id]['url']
+                        logger.info(f"AI 路由结果（旧格式）: {agent_id}")
+                        return agent_id, AGENT_REGISTRY[agent_id]['url'], None
+
             logger.warning(f"AI 路由失败（CLI 返回: {result.stderr[:100]}），fallback 到 service")
         except Exception as e:
             logger.warning(f"AI 路由异常: {e}，fallback 到 service")
 
-        return 'service', AGENT_REGISTRY['service']['url']
+        return 'service', AGENT_REGISTRY['service']['url'], None
 
 
 _dispatcher = AIDispatcher()
@@ -255,7 +288,7 @@ def update_task_status(task_id, status, result=''):
 # ============= 消息路由 =============
 
 def route_message(content):
-    """AI 路由消息到合适的代理，返回 (agent_id, agent_url)"""
+    """AI 路由消息到合适的代理，返回 (agent_id, agent_url, direct_reply)"""
     return _dispatcher.route(content)
 
 
@@ -361,12 +394,23 @@ def truncate_message(text, max_len=WECOM_MSG_MAX_LEN):
 
 # ============= 异步处理 =============
 
-def process_message_async(user_id, content, agent_id, agent_url, task_id, response_url, crypto, timestamp, nonce):
-    """异步处理消息，用 response_url 主动回复"""
+def process_message_async(user_id, content, task_id, response_url, crypto, timestamp, nonce):
+    """异步处理消息：先路由，再调用 agent 或直接回复，最后用 response_url 主动回复"""
     def worker():
         try:
-            result = call_openclaw_agent(agent_id, content, user_id, task_id, gateway_url=agent_url)
-            reply = result.get('reply', '处理失败，请稍后再试。')
+            agent_id, agent_url, direct_reply = route_message(content)
+            log_task(task_id, user_id, agent_id, content, status='processing')
+
+            if direct_reply:
+                # 调度员直接回复（模糊/闲聊类消息）
+                reply = direct_reply
+                update_task_status(task_id, 'success', reply[:500])
+            else:
+                result = call_openclaw_agent(agent_id, content, user_id, task_id, gateway_url=agent_url)
+                reply = result.get('reply', '处理失败，请稍后再试。')
+                # 添加虚拟员工标识前缀
+                agent_name = AGENT_REGISTRY.get(agent_id, {}).get('name', agent_id)
+                reply = f"【{agent_name}】\n{reply}"
             reply = truncate_message(reply)
             payload = {
                 "msgtype": "markdown",
@@ -465,14 +509,12 @@ def wecom_callback():
                 logger.info(f"消息内容: {content}, from: {from_user}")
 
                 task_id = str(uuid.uuid4())
-                agent_id, agent_url = route_message(content)
-                log_task(task_id, from_user, agent_id, content, status='processing')
 
-                # 先被动回复"处理中"，再异步用 response_url 主动回复
-                processing_msg = json.dumps({"msgtype": "text", "text": {"content": "⏳ 正在处理，请稍候..."}})
+                # 立即被动回复"处理中"，然后异步做路由+调用
+                processing_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": "⏳ 正在处理，请稍候..."}})
                 reply_pkg = crypto.build_reply(processing_msg, int(timestamp), nonce)
 
-                process_message_async(from_user, content, agent_id, agent_url, task_id, response_url, crypto, timestamp, nonce)
+                process_message_async(from_user, content, task_id, response_url, crypto, timestamp, nonce)
 
                 if reply_pkg:
                     return jsonify(reply_pkg), 200
@@ -542,12 +584,15 @@ def test_route():
     content = data.get('content')
     if not content:
         return jsonify({'error': 'content is required'}), 400
-    agent_id, agent_url = route_message(content)
-    return jsonify({
+    agent_id, agent_url, direct_reply = route_message(content)
+    result = {
         'agent_id': agent_id,
         'agent_url': agent_url,
         'timestamp': int(time.time())
-    })
+    }
+    if direct_reply:
+        result['direct_reply'] = direct_reply
+    return jsonify(result)
 
 
 # ============= Telegram Bot 路由 =============
