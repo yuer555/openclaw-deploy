@@ -44,11 +44,7 @@ else
 CONF
 fi
 
-# Model provider config (third-party OpenAI-compatible API)
-API_BASE="${API_BASE_URL:-}"
-API_SECRET="${API_KEY:-}"
-MODEL="${MODEL_NAME:-claude-sonnet-4}"
-
+# Model provider config (anthropic with third-party baseUrl)
 if [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
   cat > /root/.openclaw/agents/main/agent/models.json << CONF
 {
