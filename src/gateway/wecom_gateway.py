@@ -35,7 +35,7 @@ WECOM_ENCODING_AES_KEY = os.getenv('WECOM_ENCODING_AES_KEY', '')
 # OpenClaw Gateway 配置
 OPENCLAW_GATEWAY_URL = os.getenv('OPENCLAW_GATEWAY_URL', 'http://localhost:18789')
 OPENCLAW_API_KEY = os.getenv('OPENCLAW_API_KEY', '')
-OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '30'))
+OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '60'))
 
 # OpenClaw 内部通信 Token
 OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-internal-secret')
@@ -344,6 +344,26 @@ def process_message_async(user_id, content, agent_id, agent_url, task_id, respon
     logger.info(f"✅ 已启动异步处理线程: task_id={task_id}")
 
 
+# ============= 消息去重 =============
+
+_processed_msgs = {}  # msgid -> timestamp
+_MSG_DEDUP_TTL = 600  # 10分钟内同一 msgid 视为重复
+
+
+def is_duplicate_msg(msgid):
+    """检查消息是否重复，返回 True 表示重复应跳过"""
+    now = time.time()
+    # 清理过期记录
+    expired = [k for k, v in _processed_msgs.items() if now - v > _MSG_DEDUP_TTL]
+    for k in expired:
+        del _processed_msgs[k]
+    # 判断重复
+    if msgid in _processed_msgs:
+        return True
+    _processed_msgs[msgid] = now
+    return False
+
+
 # ============= Flask 路由 =============
 
 @app.route('/wecom/callback', methods=['GET', 'POST'])
@@ -389,11 +409,17 @@ def wecom_callback():
             logger.info(f"📩 解密消息: {str(msg)[:200]}")
 
             msg_type = msg.get('msgtype', '')
+            msgid = msg.get('msgid', '')
             from_user = msg.get('from', {}).get('userid', '')
             response_url = msg.get('response_url', '')
 
             # 流式刷新事件：直接返回空包
             if msg_type == 'stream':
+                return jsonify({}), 200
+
+            # 消息去重（企业微信未收到及时响应会重试推送）
+            if msgid and is_duplicate_msg(msgid):
+                logger.info(f"⚠️  重复消息已跳过: {msgid}")
                 return jsonify({}), 200
 
             # 只处理文本消息
