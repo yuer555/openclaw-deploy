@@ -284,21 +284,59 @@ def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
         return {'success': False, 'error': error_msg, 'reply': '系统异常，请联系管理员。'}
 
 
+# ============= 长消息分段 =============
+
+WECOM_MSG_MAX_LEN = 2000  # 企业微信 markdown 消息安全长度（留余量）
+
+
+def split_message(text, max_len=WECOM_MSG_MAX_LEN):
+    """将长消息按段落分割，每段不超过 max_len 字节"""
+    if len(text.encode('utf-8')) <= max_len:
+        return [text]
+
+    chunks = []
+    current = ''
+    for line in text.split('\n'):
+        candidate = current + ('\n' if current else '') + line
+        if len(candidate.encode('utf-8')) > max_len:
+            if current:
+                chunks.append(current)
+            # 单行超长，强制按字符截断
+            if len(line.encode('utf-8')) > max_len:
+                while line:
+                    cut = line
+                    while len(cut.encode('utf-8')) > max_len:
+                        cut = cut[:-1]
+                    chunks.append(cut)
+                    line = line[len(cut):]
+                current = ''
+            else:
+                current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 # ============= 异步处理 =============
 
 def process_message_async(user_id, content, agent_id, agent_url, task_id, response_url, crypto, timestamp, nonce):
-    """异步处理消息，用 response_url 主动回复"""
+    """异步处理消息，用 response_url 主动回复（长消息自动分段）"""
     def worker():
         try:
             result = call_openclaw_agent(agent_id, content, user_id, task_id, gateway_url=agent_url)
             reply = result.get('reply', '处理失败，请稍后再试。')
-            # 用 response_url 主动回复（markdown 格式）
-            payload = {
-                "msgtype": "markdown",
-                "markdown": {"content": reply}
-            }
-            resp = requests.post(response_url, json=payload, timeout=10)
-            logger.info(f"✅ 主动回复结果: {resp.status_code}")
+            chunks = split_message(reply)
+            for i, chunk in enumerate(chunks):
+                if len(chunks) > 1:
+                    chunk = f"【{i+1}/{len(chunks)}】\n{chunk}"
+                payload = {
+                    "msgtype": "markdown",
+                    "markdown": {"content": chunk}
+                }
+                resp = requests.post(response_url, json=payload, timeout=10)
+                logger.info(f"✅ 主动回复 ({i+1}/{len(chunks)}): {resp.status_code}")
         except Exception as e:
             logger.error(f"❌ 异步处理消息失败: {e}")
 
