@@ -242,111 +242,41 @@ def route_message(content):
     return _dispatcher.route(content)
 
 
-# ============= OpenClaw Agent 调用（WebSocket RPC）=============
+# ============= OpenClaw Agent 调用（docker exec + CLI）=============
 
 def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
-    """通过 WebSocket RPC 调用远程 agent 容器的 openclaw"""
-    import websocket as ws_lib
+    """通过 docker exec 在远程 agent 容器内调用 openclaw CLI（与调度员相同模式）"""
+    import subprocess
 
-    base_url = gateway_url or OPENCLAW_GATEWAY_URL
-    ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
-
-    result_text = None
-    error_msg = None
-    done = threading.Event()
-    connected = threading.Event()
-
-    def on_message(ws, raw):
-        nonlocal result_text, error_msg
-        try:
-            msg = json.loads(raw)
-        except Exception:
-            return
-
-        msg_type = msg.get('type')
-        event = msg.get('event', '')
-
-        # Step 1: 收到 challenge，发送 connect
-        if msg_type == 'event' and event == 'connect.challenge':
-            ws.send(json.dumps({
-                'type': 'req', 'id': str(uuid.uuid4()), 'method': 'connect',
-                'params': {
-                    'minProtocol': 3, 'maxProtocol': 3,
-                    'client': {'id': 'openclaw-probe', 'version': 'dev',
-                               'platform': 'python', 'mode': 'backend'},
-                    'auth': {}
-                }
-            }))
-
-        # Step 2: connect 响应，发送 agent 请求
-        elif msg_type == 'res' and not connected.is_set():
-            if msg.get('ok'):
-                connected.set()
-                ws.send(json.dumps({
-                    'type': 'req', 'id': str(uuid.uuid4()), 'method': 'agent',
-                    'params': {
-                        'message': message,
-                        'agentId': 'main',
-                        'timeout': OPENCLAW_TIMEOUT
-                    }
-                }))
-            else:
-                error_msg = msg.get('error', {}).get('message', 'connect failed')
-                done.set()
-
-        # Step 3: agent 响应
-        elif msg_type == 'res' and connected.is_set():
-            if msg.get('ok'):
-                payload = msg.get('payload', msg.get('result', {}))
-                payloads = payload.get('payloads', [])
-                if payloads:
-                    result_text = payloads[0].get('text', '')
-            else:
-                error_msg = msg.get('error', {}).get('message', 'agent failed')
-            done.set()
-
-        # 也监听 chat 事件（某些版本用事件推送结果）
-        elif msg_type == 'event' and event == 'chat':
-            payload = msg.get('payload', {})
-            state = payload.get('state')
-            if state == 'final':
-                msg_obj = payload.get('message')
-                if isinstance(msg_obj, dict):
-                    for block in msg_obj.get('content', []):
-                        if isinstance(block, dict) and block.get('type') == 'text':
-                            result_text = block.get('text', '')
-                            break
-                done.set()
-            elif state in ('error', 'aborted'):
-                error_msg = payload.get('errorMessage', 'agent error')
-                done.set()
-
-    def on_error(ws, err):
-        nonlocal error_msg
-        error_msg = str(err)
-        done.set()
-
-    def on_close(ws, *args):
-        done.set()
-
-    logger.info(f"调用 Agent {agent_id}: {ws_url}")
+    container_name = AGENT_REGISTRY.get(agent_id, {}).get('container', f'openclaw-agent-{agent_id}')
+    logger.info(f"调用 Agent {agent_id}: docker exec {container_name}")
 
     try:
-        ws = ws_lib.WebSocketApp(ws_url, on_message=on_message, on_error=on_error, on_close=on_close)
-        t = threading.Thread(target=ws.run_forever, daemon=True)
-        t.start()
-        done.wait(timeout=OPENCLAW_TIMEOUT + 5)
-        ws.close()
+        result = subprocess.run(
+            ['docker', 'exec', container_name,
+             'npx', 'openclaw', 'agent', '--agent', 'main', '--local',
+             '-m', message, '--json', '--timeout', str(OPENCLAW_TIMEOUT)],
+            capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT + 10,
+            cwd='/workspace'
+        )
 
-        if result_text:
-            update_task_status(task_id, 'success', result_text[:500])
-            return {'success': True, 'reply': result_text, 'agent_id': agent_id}
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout)
+            payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
+            reply = payloads[0].get('text', '') if payloads else ''
+            if reply:
+                update_task_status(task_id, 'success', reply[:500])
+                return {'success': True, 'reply': reply, 'agent_id': agent_id}
 
-        error_msg = error_msg or '无响应'
-        logger.error(f"Agent {agent_id} 调用失败: {error_msg}")
+        error_msg = result.stderr[:200] if result.stderr else '无响应'
+        logger.error(f"Agent {agent_id} CLI 调用失败: {error_msg}")
         update_task_status(task_id, 'failed', error_msg[:500])
         return {'success': False, 'error': error_msg, 'reply': '抱歉，系统处理出现问题，请稍后再试。'}
 
+    except subprocess.TimeoutExpired:
+        logger.error(f"Agent {agent_id} 调用超时")
+        update_task_status(task_id, 'failed', 'timeout')
+        return {'success': False, 'error': 'timeout', 'reply': '处理超时，请稍后再试。'}
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Agent {agent_id} 调用异常: {error_msg}")

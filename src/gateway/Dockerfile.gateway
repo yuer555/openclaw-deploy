@@ -8,7 +8,7 @@ LABEL version="2.0"
 RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null || true
 
-# 安装 Python 和系统依赖
+# 安装 Python、Docker CLI 和系统依赖
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python3 \
@@ -17,6 +17,16 @@ RUN apt-get update && \
         curl \
         git \
         ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 安装最新 Docker CLI（从官方源）
+RUN install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends docker-ce-cli && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

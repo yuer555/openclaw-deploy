@@ -46,6 +46,7 @@ services:
     volumes:
       - ../data/gateway:/data
       - ../logs/gateway:/logs
+      - /var/run/docker.sock:/var/run/docker.sock
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
