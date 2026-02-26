@@ -35,7 +35,7 @@ WECOM_ENCODING_AES_KEY = os.getenv('WECOM_ENCODING_AES_KEY', '')
 # OpenClaw Gateway 配置
 OPENCLAW_GATEWAY_URL = os.getenv('OPENCLAW_GATEWAY_URL', 'http://localhost:18789')
 OPENCLAW_API_KEY = os.getenv('OPENCLAW_API_KEY', '')
-OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '180'))
+OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '2700'))
 
 # OpenClaw 内部通信 Token
 OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-internal-secret')
