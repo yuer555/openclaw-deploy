@@ -242,93 +242,116 @@ def route_message(content):
     return _dispatcher.route(content)
 
 
-# ============= OpenClaw Gateway API 调用 =============
+# ============= OpenClaw Agent 调用（WebSocket RPC）=============
 
 def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
-    """调用 OpenClaw Gateway API"""
+    """通过 WebSocket RPC 调用远程 agent 容器的 openclaw"""
+    import websocket as ws_lib
+
+    base_url = gateway_url or OPENCLAW_GATEWAY_URL
+    ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
+
+    result_text = None
+    error_msg = None
+    done = threading.Event()
+    connected = threading.Event()
+
+    def on_message(ws, raw):
+        nonlocal result_text, error_msg
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+
+        msg_type = msg.get('type')
+        event = msg.get('event', '')
+
+        # Step 1: 收到 challenge，发送 connect
+        if msg_type == 'event' and event == 'connect.challenge':
+            ws.send(json.dumps({
+                'type': 'req', 'id': str(uuid.uuid4()), 'method': 'connect',
+                'params': {
+                    'minProtocol': 3, 'maxProtocol': 3,
+                    'client': {'id': 'openclaw-probe', 'version': 'dev',
+                               'platform': 'python', 'mode': 'backend'},
+                    'auth': {}
+                }
+            }))
+
+        # Step 2: connect 响应，发送 agent 请求
+        elif msg_type == 'res' and not connected.is_set():
+            if msg.get('ok'):
+                connected.set()
+                ws.send(json.dumps({
+                    'type': 'req', 'id': str(uuid.uuid4()), 'method': 'agent',
+                    'params': {
+                        'message': message,
+                        'agentId': 'main',
+                        'timeout': OPENCLAW_TIMEOUT
+                    }
+                }))
+            else:
+                error_msg = msg.get('error', {}).get('message', 'connect failed')
+                done.set()
+
+        # Step 3: agent 响应
+        elif msg_type == 'res' and connected.is_set():
+            if msg.get('ok'):
+                payload = msg.get('payload', msg.get('result', {}))
+                payloads = payload.get('payloads', [])
+                if payloads:
+                    result_text = payloads[0].get('text', '')
+            else:
+                error_msg = msg.get('error', {}).get('message', 'agent failed')
+            done.set()
+
+        # 也监听 chat 事件（某些版本用事件推送结果）
+        elif msg_type == 'event' and event == 'chat':
+            payload = msg.get('payload', {})
+            state = payload.get('state')
+            if state == 'final':
+                msg_obj = payload.get('message')
+                if isinstance(msg_obj, dict):
+                    for block in msg_obj.get('content', []):
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            result_text = block.get('text', '')
+                            break
+                done.set()
+            elif state in ('error', 'aborted'):
+                error_msg = payload.get('errorMessage', 'agent error')
+                done.set()
+
+    def on_error(ws, err):
+        nonlocal error_msg
+        error_msg = str(err)
+        done.set()
+
+    def on_close(ws, *args):
+        done.set()
+
+    logger.info(f"调用 Agent {agent_id}: {ws_url}")
+
     try:
-        # 构造 API 请求
-        base_url = gateway_url or OPENCLAW_GATEWAY_URL
-        url = f"{base_url}/api/v1/sessions/send"
-        
-        headers = {
-            'Content-Type': 'application/json'
-        }
-        
-        # 如果配置了 API Key，添加认证头
-        if OPENCLAW_API_KEY:
-            headers['Authorization'] = f'Bearer {OPENCLAW_API_KEY}'
-        
-        payload = {
-            "message": message,
-            "agentId": agent_id,
-            "label": f"wecom-{user_id}",  # 使用 label 标识会话
-            "timeoutSeconds": OPENCLAW_TIMEOUT
-        }
-        
-        logger.info(f"🚀 调用 OpenClaw Agent: {agent_id}")
-        logger.debug(f"请求: {json.dumps(payload, ensure_ascii=False)}")
-        
-        # 发送请求
-        response = requests.post(
-            url, 
-            json=payload, 
-            headers=headers,
-            timeout=OPENCLAW_TIMEOUT + 5  # 稍微多给5秒
-        )
-        
-        # 检查响应
-        if response.status_code == 200:
-            result = response.json()
-            logger.info(f"✅ OpenClaw Agent 响应成功: {agent_id}")
-            logger.debug(f"响应: {json.dumps(result, ensure_ascii=False)}")
-            
-            # 提取回复内容
-            reply = result.get('reply', result.get('message', ''))
-            
-            if not reply:
-                reply = "抱歉，我暂时无法处理您的请求。"
-            
-            # 更新任务状态
-            update_task_status(task_id, 'success', reply[:500])  # 只存储前500字符
-            
-            return {
-                'success': True,
-                'reply': reply,
-                'agent_id': agent_id
-            }
-        else:
-            error_msg = f"API 返回错误: {response.status_code}"
-            logger.error(f"❌ {error_msg}")
-            update_task_status(task_id, 'failed', error_msg)
-            
-            return {
-                'success': False,
-                'error': error_msg,
-                'reply': "抱歉，系统处理出现问题，请稍后再试。"
-            }
-            
-    except requests.exceptions.Timeout:
-        error_msg = "OpenClaw Gateway 超时"
-        logger.error(f"❌ {error_msg}")
-        update_task_status(task_id, 'timeout', error_msg)
-        
-        return {
-            'success': False,
-            'error': error_msg,
-            'reply': "处理超时，请稍后再试。"
-        }
-        
+        ws = ws_lib.WebSocketApp(ws_url, on_message=on_message, on_error=on_error, on_close=on_close)
+        t = threading.Thread(target=ws.run_forever, daemon=True)
+        t.start()
+        done.wait(timeout=OPENCLAW_TIMEOUT + 5)
+        ws.close()
+
+        if result_text:
+            update_task_status(task_id, 'success', result_text[:500])
+            return {'success': True, 'reply': result_text, 'agent_id': agent_id}
+
+        error_msg = error_msg or '无响应'
+        logger.error(f"Agent {agent_id} 调用失败: {error_msg}")
+        update_task_status(task_id, 'failed', error_msg[:500])
+        return {'success': False, 'error': error_msg, 'reply': '抱歉，系统处理出现问题，请稍后再试。'}
+
     except Exception as e:
-        error_msg = f"调用 OpenClaw API 失败: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        update_task_status(task_id, 'error', str(e)[:500])
-        
-        return {
-            'success': False,
-            'error': error_msg,
-            'reply': "系统异常，请联系管理员。"
-        }
+        error_msg = str(e)
+        logger.error(f"Agent {agent_id} 调用异常: {error_msg}")
+        update_task_status(task_id, 'error', error_msg[:500])
+        return {'success': False, 'error': error_msg, 'reply': '系统异常，请联系管理员。'}
 
 
 # ============= 异步处理 =============

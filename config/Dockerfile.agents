@@ -44,13 +44,13 @@ CMD ["sh", "-c", "\
   [ -f /workspace/CLAUDE.md ] || cp /etc/openclaw/CLAUDE.md /workspace/CLAUDE.md && \
   mkdir -p /root/.openclaw/agents/main/agent && \
   if [ -n \"$OPENAI_API_KEY\" ]; then \
-    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openai/gpt-4o\"},\"models\":{\"openai/gpt-4o\":{}}}}}' > /root/.openclaw/openclaw.json; \
+    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openai/gpt-4o\"},\"models\":{\"openai/gpt-4o\":{}}}},\"gateway\":{\"bind\":\"lan\",\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' > /root/.openclaw/openclaw.json; \
   elif [ -n \"$API_BASE_URL\" ] && [ -n \"$API_KEY\" ]; then \
     MODEL=${MODEL_NAME:-claude-sonnet-4-20250514} && \
     printf '{\"providers\":{\"anthropic\":{\"baseUrl\":\"%s\",\"models\":[]}}}' \"$API_BASE_URL\" > /root/.openclaw/agents/main/agent/models.json && \
     printf '{\"profiles\":{\"anthropic:manual\":{\"provider\":\"anthropic\",\"kind\":\"apiKey\",\"apiKey\":\"%s\",\"label\":\"third-party\"}}}' \"$API_KEY\" > /root/.openclaw/agents/main/agent/auth-profiles.json && \
-    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"anthropic/%s\"},\"models\":{\"anthropic/%s\":{}}}}}' \"$MODEL\" \"$MODEL\" > /root/.openclaw/openclaw.json && \
+    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"anthropic/%s\"},\"models\":{\"anthropic/%s\":{}}}},\"gateway\":{\"bind\":\"lan\",\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' \"$MODEL\" \"$MODEL\" > /root/.openclaw/openclaw.json && \
     export ANTHROPIC_API_KEY=\"$API_KEY\"; \
   fi && \
-  npx openclaw gateway --allow-unconfigured"]
+  npx openclaw gateway --allow-unconfigured --bind lan"]
 
