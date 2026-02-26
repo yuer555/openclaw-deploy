@@ -65,12 +65,15 @@ class AIDispatcher:
 
         try:
             result = subprocess.run(
-                ['npx', 'openclaw', 'agent', '-m', prompt, '--json', '--timeout', '15'],
+                ['npx', 'openclaw', 'agent', '--agent', 'main', '--local', '-m', prompt, '--json', '--timeout', '15'],
                 capture_output=True, text=True, timeout=20, cwd='/workspace'
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
-                reply = data.get('reply', data.get('text', ''))
+                # --local --json 输出: {"payloads": [{"text": "..."}], ...}
+                # gateway --json 输出: {"result": {"payloads": [{"text": "..."}]}, ...}
+                payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
+                reply = payloads[0].get('text', '') if payloads else ''
                 agent_id = reply.strip().lower().split()[0] if reply.strip() else 'service'
                 if agent_id in AGENT_REGISTRY:
                     logger.info(f"AI 路由结果: {agent_id}")
