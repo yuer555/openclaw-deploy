@@ -65,8 +65,8 @@ class AIDispatcher:
 
         try:
             result = subprocess.run(
-                ['npx', 'openclaw', 'agent', '--agent', 'main', '--local', '-m', prompt, '--json', '--timeout', '15'],
-                capture_output=True, text=True, timeout=20, cwd='/workspace'
+                ['npx', 'openclaw', 'agent', '--agent', 'main', '--local', '-m', prompt, '--json', '--timeout', '30'],
+                capture_output=True, text=True, timeout=40, cwd='/workspace'
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
