@@ -17,6 +17,7 @@ services:
     container_name: openclaw-agent-operation
     restart: unless-stopped
     environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
@@ -49,6 +50,7 @@ services:
     container_name: openclaw-agent-product
     restart: unless-stopped
     environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
@@ -81,6 +83,7 @@ services:
     container_name: openclaw-agent-development
     restart: unless-stopped
     environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
@@ -113,6 +116,7 @@ services:
     container_name: openclaw-agent-testing
     restart: unless-stopped
     environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
@@ -145,6 +149,7 @@ services:
     container_name: openclaw-agent-service
     restart: unless-stopped
     environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}

@@ -1,16 +1,45 @@
 #!/bin/sh
 set -e
 
-# Configure openclaw with token auth and third-party API provider
+# Configure openclaw with token auth and API provider
 mkdir -p /root/.openclaw/agents/main/agent
 INTERNAL_TOKEN="${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}"
 
-# Gateway auth + model config
+# API 配置优先级: OPENAI_API_KEY > API_BASE_URL + API_KEY
+OPENAI_KEY="${OPENAI_API_KEY:-}"
 API_BASE="${API_BASE_URL:-}"
 API_SECRET="${API_KEY:-}"
-MODEL="${MODEL_NAME:-claude-sonnet-4}"
+MODEL="${MODEL_NAME:-claude-sonnet-4-20250514}"
 
-if [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
+if [ -n "$OPENAI_KEY" ]; then
+  # 方式一：直接使用 OpenAI API
+  cat > /root/.openclaw/openclaw.json << CONF
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai/gpt-4o"
+      },
+      "models": {
+        "openai/gpt-4o": {}
+      }
+    }
+  },
+  "gateway": {
+    "auth": {
+      "mode": "token",
+      "token": "${INTERNAL_TOKEN}"
+    }
+  }
+}
+CONF
+  echo '{"providers":{}}' > /root/.openclaw/agents/main/agent/models.json
+  echo '{}' > /root/.openclaw/agents/main/agent/auth-profiles.json
+  export ANTHROPIC_API_KEY=""
+  echo "Using OpenAI API (OPENAI_API_KEY), model: openai/gpt-4o"
+
+elif [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
+  # 方式二：第三方 API（通过 anthropic provider 代理）
   cat > /root/.openclaw/openclaw.json << CONF
 {
   "agents": {
@@ -31,21 +60,6 @@ if [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
   }
 }
 CONF
-else
-  cat > /root/.openclaw/openclaw.json << CONF
-{
-  "gateway": {
-    "auth": {
-      "mode": "token",
-      "token": "${INTERNAL_TOKEN}"
-    }
-  }
-}
-CONF
-fi
-
-# Model provider config (anthropic with third-party baseUrl)
-if [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
   cat > /root/.openclaw/agents/main/agent/models.json << CONF
 {
   "providers": {
@@ -68,15 +82,26 @@ CONF
   }
 }
 CONF
-  echo "Configured third-party API: ${API_BASE} model: anthropic/${MODEL}"
+  export ANTHROPIC_API_KEY="${API_SECRET}"
+  echo "Using third-party API: ${API_BASE} model: anthropic/${MODEL}"
+
 else
-  echo "WARNING: API_BASE_URL or API_KEY not set, openclaw may not work"
+  cat > /root/.openclaw/openclaw.json << CONF
+{
+  "gateway": {
+    "auth": {
+      "mode": "token",
+      "token": "${INTERNAL_TOKEN}"
+    }
+  }
+}
+CONF
   echo '{"providers":{}}' > /root/.openclaw/agents/main/agent/models.json
   echo '{}' > /root/.openclaw/agents/main/agent/auth-profiles.json
+  echo "WARNING: No API key configured, openclaw may not work"
 fi
 
 export OPENCLAW_INTERNAL_TOKEN="$INTERNAL_TOKEN"
-export ANTHROPIC_API_KEY="${API_SECRET}"
 
 echo "Starting OpenClaw dispatcher (port 18789)..."
 cd /workspace
