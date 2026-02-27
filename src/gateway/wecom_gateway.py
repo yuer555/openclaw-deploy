@@ -434,6 +434,52 @@ MAX_TEXT_EMBED_SIZE = 10 * 1024  # 10KB
 DISPATCHER_PREVIEW_SIZE = 500
 
 
+def _detect_file_type(local_path, content_type):
+    """当 Content-Type 为 octet-stream 时，通过文件头魔数和内容探测真实类型"""
+    if content_type != 'application/octet-stream':
+        return content_type, mimetypes.guess_extension(content_type) or ''
+
+    # 文件头魔数检测
+    MAGIC_SIGNATURES = [
+        (b'\x89PNG\r\n\x1a\n', 'image/png', '.png'),
+        (b'\xff\xd8\xff', 'image/jpeg', '.jpg'),
+        (b'GIF87a', 'image/gif', '.gif'),
+        (b'GIF89a', 'image/gif', '.gif'),
+        (b'%PDF', 'application/pdf', '.pdf'),
+        (b'PK\x03\x04', 'application/zip', '.zip'),  # zip/docx/xlsx/pptx
+        (b'\x1f\x8b', 'application/gzip', '.gz'),
+        (b'Rar!\x1a\x07', 'application/x-rar', '.rar'),
+    ]
+    try:
+        with open(local_path, 'rb') as f:
+            header = f.read(16)
+        for magic, ct, ext in MAGIC_SIGNATURES:
+            if header.startswith(magic):
+                # zip 进一步判断是否为 Office 文档
+                if magic == b'PK\x03\x04':
+                    name_lower = local_path.lower()
+                    if name_lower.endswith(('.docx', '.doc')):
+                        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'
+                    if name_lower.endswith(('.xlsx', '.xls')):
+                        return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
+                return ct, ext
+    except Exception:
+        pass
+
+    # 尝试 UTF-8 解码判断是否为文本
+    try:
+        file_size = os.path.getsize(local_path)
+        if file_size <= MAX_TEXT_EMBED_SIZE:
+            with open(local_path, 'rb') as f:
+                raw = f.read()
+            raw.decode('utf-8')  # 能解码成功说明是文本
+            return 'text/plain', '.txt'
+    except (UnicodeDecodeError, Exception):
+        pass
+
+    return content_type, ''
+
+
 def download_temp_file(url, prefix='file', user_id='', msg_type=''):
     """下载临时 COS URL 到本地，返回 (local_path, text_content_or_none)"""
     try:
@@ -441,18 +487,24 @@ def download_temp_file(url, prefix='file', user_id='', msg_type=''):
         resp = requests.get(url, timeout=30, stream=True)
         resp.raise_for_status()
 
-        # 从 Content-Type 推断扩展名
-        content_type = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
-        ext = mimetypes.guess_extension(content_type) or ''
+        # 先用临时文件名保存
+        raw_content_type = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
+        tmp_filename = f"{prefix}-{uuid.uuid4().hex[:8]}.tmp"
+        tmp_path = os.path.join(TEMP_FILE_DIR, tmp_filename)
+
+        with open(tmp_path, 'wb') as f:
+            for chunk in resp.iter_content(8192):
+                f.write(chunk)
+
+        # 探测真实文件类型
+        content_type, ext = _detect_file_type(tmp_path, raw_content_type)
         if ext == '.jpe':
             ext = '.jpg'
 
+        # 用正确扩展名重命名
         filename = f"{prefix}-{uuid.uuid4().hex[:8]}{ext}"
         local_path = os.path.join(TEMP_FILE_DIR, filename)
-
-        with open(local_path, 'wb') as f:
-            for chunk in resp.iter_content(8192):
-                f.write(chunk)
+        os.rename(tmp_path, local_path)
 
         file_size = os.path.getsize(local_path)
 
