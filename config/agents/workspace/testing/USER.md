@@ -6,7 +6,7 @@ _Learn about the person you're helping. Update this as you go._
 - **What to call them:** 用户
 - **Pronouns:** _(not specified)_
 - **Timezone:** Asia/Shanghai (UTC+8)
-- **Notes:** 用户通过企业微信或 Telegram 发送消息，由网关转发到此。
+- **Notes:** 用户通过企业微信发送消息，由网关转发到此。
 
 ## Context
 

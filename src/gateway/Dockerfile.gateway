@@ -45,7 +45,6 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # 复制网关源码
 COPY src/gateway/wecom_gateway.py .
-COPY src/gateway/telegram_adapter.py .
 COPY src/gateway/agent_registry.py .
 
 # 预置调度员 workspace 文件到 openclaw workspace 目录

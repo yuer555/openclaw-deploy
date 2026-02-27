@@ -5,14 +5,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-OpenClaw V2.0 是一个基于 AI 的企业微信/Telegram 虚拟员工系统，采用三层 Docker 容器化架构，支持 AI 智能路由和多个独立虚拟员工角色。
+OpenClaw V2.0 是一个基于 AI 的企业微信虚拟员工系统，采用三层 Docker 容器化架构，支持 AI 智能路由和多个独立虚拟员工角色。
 
 ## 核心架构
 
 ### 三层 Docker 架构
 
 1. **Gateway 容器** (`src/gateway/`)
-   - Flask 网关：处理企业微信 + Telegram 消息
+   - Flask 网关：处理企业微信消息
    - openclaw 调度员（:18789）：AI 意图分析，路由到对应员工
    - 角色性格：`config/agents/workspace/dispatcher.md` → `/workspace/CLAUDE.md`
    - 本地端口：8000；生产固定 IP：172.20.0.10
@@ -34,7 +34,6 @@ OpenClaw V2.0 是一个基于 AI 的企业微信/Telegram 虚拟员工系统，�
 - **Gateway 镜像**：`src/gateway/Dockerfile.gateway` + `src/gateway/entrypoint.sh`
 - **Agent 镜像**：`config/Dockerfile.agents`（ARG ROLE 选择角色）
 - **企业微信网关**：`src/gateway/wecom_gateway.py`
-- **Telegram 适配器**：`src/gateway/telegram_adapter.py`
 
 ## 常用命令
 
@@ -114,7 +113,6 @@ openclaw-deploy/
 │   └── docker-compose.agents.yml  # 本地 agent compose
 ├── src/gateway/
 │   ├── wecom_gateway.py           # 企业微信网关 + AIDispatcher
-│   ├── telegram_adapter.py        # Telegram 适配器
 │   ├── agent_registry.py          # Agent URL 注册表
 │   ├── Dockerfile.gateway         # Gateway 镜像
 │   └── entrypoint.sh              # 启动脚本（openclaw → Flask）
@@ -150,7 +148,7 @@ openclaw-deploy/
 
 - 修改 Python 网关代码后需重新构建 Gateway 镜像：`./0-build-images.sh`
 - 修改角色性格（`config/agents/workspace/*.md`）后需重新构建对应 Agent 镜像
-- `agent_registry.py` 是 agent URL 的唯一来源，`wecom_gateway.py` 和 `telegram_adapter.py` 均从此导入
+- `agent_registry.py` 是 agent URL 的唯一来源，`wecom_gateway.py` 从此导入
 - 调度员 openclaw 运行在 Gateway 容器内部（:18789），不对外暴露
 
 

@@ -1,6 +1,5 @@
 ## Context
 
-当前系统（V1.4）所有虚拟员工共用同一个 openclaw 实例（主机端口 18789），消息路由通过 `ROUTING_KEYWORDS` 关键词字典匹配，Flask 网关（wecom_gateway.py + telegram_adapter.py）直接调用该实例。
 
 问题：
 - 关键词路由无法理解语义，误路由率高
@@ -20,7 +19,6 @@
 │  │  ┌──────────────────────┐   ┌─────────────────────────┐  │  │
 │  │  │  Flask Gateway :8000 │   │  openclaw (调度员)       │  │  │
 │  │  │  - wecom_gateway.py  │──▶│  :18789 (container内部) │  │  │
-│  │  │  - telegram_adapter  │   │  workspace: /workspace  │  │  │
 │  │  │  - agent_registry.py │   │  CLAUDE.md: 调度员性格  │  │  │
 │  │  └──────────────────────┘   └─────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────────┘  │
@@ -94,7 +92,6 @@
 
 ### 决策 4：agent_registry.py 集中管理 URL
 
-**选择**：新建 `src/gateway/agent_registry.py`，定义 `AGENT_REGISTRY` 字典，wecom_gateway 和 telegram_adapter 均从此导入。
 
 **理由**：避免两个文件各自硬编码 agent URL，单一来源便于维护。
 

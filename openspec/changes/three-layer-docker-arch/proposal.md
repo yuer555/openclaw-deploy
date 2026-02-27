@@ -4,10 +4,9 @@
 
 ## What Changes
 
-- **新增** Gateway 容器（`openclaw-gateway`）：将 Flask 网关（企业微信 + Telegram）与调度员 openclaw 实例合并到同一个 Docker 容器，调度员通过 WebSocket RPC 调用本容器内的 openclaw 做意图分析
 - **新增** 5 个虚拟员工独立容器（`openclaw-agent-*`）：每个角色运行独立的 openclaw 实例，通过 openclaw 原生 workspace 配置初始性格，端口 18791-18795
 - **替换** 关键词路由 → AI 意图路由：删除 `ROUTING_KEYWORDS`，改为调用 Gateway 容器内的调度员 openclaw 分析意图并返回目标 agent
-- **新增** `agent_registry.py`：集中管理各虚拟员工容器 URL，供 wecom_gateway 和 telegram_adapter 共用
+- **新增** `agent_registry.py`：集中管理各虚拟员工容器 URL，供 wecom_gateway 和 wecom_gateway 共用
 - **重写** `config/docker-compose.agents.yml`：5 个虚拟员工服务，使用 `Dockerfile.agents` 预构建镜像
 - **新增** Gateway 容器 Dockerfile（`src/gateway/Dockerfile.gateway`）：包含 Flask 网关 + openclaw 调度员
 - **新增** 本地 Docker 化完整部署方案：更新 `local/` 目录脚本和 `docker-compose.local.yml`，支持一键启动全部容器
@@ -30,7 +29,7 @@
 ## Impact
 
 - `src/gateway/wecom_gateway.py`：删除 `ROUTING_KEYWORDS`，新增 `AIDispatcher` 类，修改 `route_message()` 和 `call_openclaw_agent()`
-- `src/gateway/telegram_adapter.py`：移除硬编码 `AGENTS` 字典，改用 `AGENT_REGISTRY`，支持 AI 路由
+- `src/gateway/wecom_gateway.py`：移除硬编码 `AGENTS` 字典，改用 `AGENT_REGISTRY`，支持 AI 路由
 - `src/gateway/agent_registry.py`：新文件，集中管理 agent URL 注册表
 - `config/docker-compose.agents.yml`：重写为 5 个服务，使用预构建镜像
 - `config/agents/workspace/`：新目录，存放各角色 openclaw workspace 初始文件（CLAUDE.md）

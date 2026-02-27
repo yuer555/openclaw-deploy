@@ -23,7 +23,6 @@
 - **THEN** 系统仍能通过 AI 意图分析路由到合适的 agent（如 operation）
 
 ### Requirement: agent_registry.py 集中管理 agent URL
-系统 SHALL 提供 `src/gateway/agent_registry.py`，定义 `AGENT_REGISTRY` 字典（从环境变量读取各 agent URL）和 `DISPATCHER_URL`，wecom_gateway 和 telegram_adapter 均从此模块导入。
 
 #### Scenario: 环境变量覆盖默认 URL
 - **WHEN** 设置环境变量 `AGENT_OPERATION_URL=http://openclaw-agent-operation:18789`

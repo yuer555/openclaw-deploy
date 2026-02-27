@@ -19,8 +19,6 @@
 - [x] 3.1 创建 `src/gateway/agent_registry.py`：定义 `AGENT_REGISTRY`（从环境变量读取各 agent URL，默认 localhost:18791-18795）和 `DISPATCHER_URL`
 - [x] 3.2 修改 `src/gateway/wecom_gateway.py`：删除 `ROUTING_KEYWORDS`，新增 `AIDispatcher` 类（WebSocket RPC 调用 localhost:18789，5s 超时，fallback service）
 - [x] 3.3 修改 `src/gateway/wecom_gateway.py`：更新 `route_message()` 调用 `AIDispatcher.route()`，更新 `call_openclaw_agent()` 接受 `gateway_url` 参数
-- [x] 3.4 修改 `src/gateway/telegram_adapter.py`：移除硬编码 `AGENTS` 字典，改从 `agent_registry` 导入 `AGENT_REGISTRY`，`_call_agent()` 接受 `openclaw_url` 参数
-- [x] 3.5 修改 `src/gateway/telegram_adapter.py`：`_handle_message()` 中若用户未手动选择 agent，调用 `AIDispatcher.route()` 获取目标 URL；`/agents` 命令从 `AGENT_REGISTRY` 动态生成列表
 
 ## 4. Docker Compose 配置
 
@@ -54,6 +52,5 @@
 ## 8. 验证
 
 - [ ] 8.1 本地验证：启动全部容器，发送"帮我写个测试用例"，确认路由到 testing agent
-- [ ] 8.2 本地验证：Telegram 发送 `/operation` 手动切换，再发消息确认路由到 operation agent
 - [ ] 8.3 本地验证：停止单个 agent 容器，确认其他 agent 和 gateway 正常运行
 - [ ] 8.4 本地验证：检查各 agent 容器内 `/workspace/CLAUDE.md` 内容正确

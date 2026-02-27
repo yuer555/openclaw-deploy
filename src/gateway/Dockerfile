@@ -13,7 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用代码
 COPY wecom_gateway.py .
-COPY telegram_adapter.py .
 
 # 创建数据和日志目录
 RUN mkdir -p /data /logs
