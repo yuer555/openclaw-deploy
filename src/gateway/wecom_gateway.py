@@ -57,7 +57,22 @@ class AIDispatcher:
         """
         import subprocess
 
-        prompt = f"用户消息：{message}"
+        # 注入上次路由结果和 agent 回复，帮助调度员理解上下文
+        last = _get_last_route(user_id)
+        if last:
+            last_agent_id, last_reply = last
+            agent_name = AGENT_REGISTRY.get(last_agent_id, {}).get('name', last_agent_id)
+            context = f"[上下文：该用户上一轮对话已路由到{agent_name}（{last_agent_id}）"
+            if last_reply:
+                # 截取前 300 字，避免 prompt 过长
+                reply_preview = last_reply[:300]
+                if len(last_reply) > 300:
+                    reply_preview += '...'
+                context += f"，{agent_name}回复了：{reply_preview}"
+            context += f"。如果当前消息是延续上一轮话题（如发送文件、补充说明、追问），请继续路由到{last_agent_id}]\n"
+            prompt = f"{context}用户消息：{message}"
+        else:
+            prompt = f"用户消息：{message}"
 
         try:
             route_session = f"dispatcher-{user_id}"
@@ -305,6 +320,27 @@ def log_file_record(user_id, file_path, file_name, file_type, content_type, file
         logger.error(f"❌ 记录文件存档失败: {e}")
 
 
+# ============= 路由上下文（记录上次路由结果） =============
+
+_last_route = {}  # user_id -> (agent_id, agent_reply, timestamp)
+
+
+def _record_route(user_id, agent_id, agent_reply=''):
+    """记录用户的路由结果和 agent 回复"""
+    _last_route[user_id] = (agent_id, agent_reply, time.time())
+
+
+def _get_last_route(user_id):
+    """获取上次路由结果，30分钟过期"""
+    if user_id not in _last_route:
+        return None
+    agent_id, agent_reply, ts = _last_route[user_id]
+    if time.time() - ts > 1800:
+        del _last_route[user_id]
+        return None
+    return agent_id, agent_reply
+
+
 # ============= 消息路由 =============
 
 def route_message(content, user_id='anonymous'):
@@ -478,16 +514,42 @@ def _detect_file_type(local_path, content_type):
     except Exception:
         pass
 
-    # 尝试 UTF-8 解码判断是否为文本（只读前 4KB 探测）
+    # 尝试文本解码判断是否为文本（只读前 4KB 探测）
     try:
         with open(local_path, 'rb') as f:
             sample = f.read(4096)
-        sample.decode('utf-8')  # 能解码成功说明是文本
+        sample.decode('utf-8')  # 能解码成功说明是 UTF-8 文本
+        return 'text/plain', '.txt'
+    except (UnicodeDecodeError, Exception):
+        pass
+
+    # 尝试 GBK 解码（中文 Windows 常见编码）
+    try:
+        with open(local_path, 'rb') as f:
+            sample = f.read(4096)
+        sample.decode('gbk')
         return 'text/plain', '.txt'
     except (UnicodeDecodeError, Exception):
         pass
 
     return content_type, ''
+
+
+def _decrypt_file(encrypted_data):
+    """解密企业微信文件内容（AES-256-CBC，PKCS#7 填充）"""
+    try:
+        aes_key = base64.b64decode(WECOM_ENCODING_AES_KEY + "=")
+        iv = aes_key[:16]
+        cipher = AES.new(aes_key, AES.MODE_CBC, iv)
+        decrypted = cipher.decrypt(encrypted_data)
+        # PKCS#7 去填充
+        pad = decrypted[-1]
+        if pad < 1 or pad > 32:
+            return decrypted
+        return decrypted[:-pad]
+    except Exception as e:
+        logger.warning(f"文件解密失败: {e}")
+        return None
 
 
 def download_temp_file(url, prefix='file', user_id='', msg_type=''):
@@ -497,16 +559,23 @@ def download_temp_file(url, prefix='file', user_id='', msg_type=''):
         resp = requests.get(url, timeout=30, stream=True)
         resp.raise_for_status()
 
-        # 先用临时文件名保存
-        raw_content_type = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
+        # 下载加密内容
+        encrypted_data = resp.content
+
+        # 解密文件内容
+        decrypted = _decrypt_file(encrypted_data)
+        if decrypted is None:
+            logger.warning("文件解密失败，使用原始数据")
+            decrypted = encrypted_data
+
+        # 保存解密后的文件
         tmp_filename = f"{prefix}-{uuid.uuid4().hex[:8]}.tmp"
         tmp_path = os.path.join(today_dir, tmp_filename)
-
         with open(tmp_path, 'wb') as f:
-            for chunk in resp.iter_content(8192):
-                f.write(chunk)
+            f.write(decrypted)
 
         # 探测真实文件类型
+        raw_content_type = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
         content_type, ext = _detect_file_type(tmp_path, raw_content_type)
         if ext == '.jpe':
             ext = '.jpg'
@@ -524,8 +593,16 @@ def download_temp_file(url, prefix='file', user_id='', msg_type=''):
         if is_text:
             try:
                 if file_size <= MAX_TEXT_EMBED_SIZE:
-                    with open(local_path, 'r', encoding='utf-8', errors='replace') as f:
-                        text_content = f.read()
+                    with open(local_path, 'rb') as f:
+                        raw = f.read()
+                    # 尝试 UTF-8，失败则尝试 GBK
+                    try:
+                        text_content = raw.decode('utf-8')
+                    except UnicodeDecodeError:
+                        try:
+                            text_content = raw.decode('gbk')
+                        except UnicodeDecodeError:
+                            text_content = raw.decode('utf-8', errors='replace')
             except Exception as e:
                 logger.warning(f"读取文本文件内容失败: {e}")
 
@@ -634,6 +711,8 @@ def process_message_async(user_id, dispatcher_content, full_content, task_id, re
             else:
                 result = call_openclaw_agent(agent_id, full_content, user_id, task_id, gateway_url=agent_url)
                 reply = result.get('reply', '处理失败，请稍后再试。')
+                # 记录 agent 回复到路由上下文，供下次调度员参考
+                _record_route(user_id, agent_id, reply[:500])
                 # 添加虚拟员工标识前缀
                 agent_name = AGENT_REGISTRY.get(agent_id, {}).get('name', agent_id)
                 reply = f"【{agent_name}】\n{reply}"
