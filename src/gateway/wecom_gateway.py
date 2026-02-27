@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ============= 配置（从环境变量读取）=============
 
 # 数据库配置
-DB_PATH = os.getenv('DB_PATH', '/data/user_roles.db')
+DB_PATH = os.getenv('DB_PATH', '/opt/openclaw/data/gateway/gateway.db')
 
 # 企业微信智能机器人配置
 WECOM_TOKEN = os.getenv('WECOM_TOKEN', '')
@@ -57,26 +57,16 @@ class AIDispatcher:
         """
         import subprocess
 
-        agents_desc = '\n'.join(
-            f"- {aid}: {info['name']}（{info['desc']}）"
-            for aid, info in AGENT_REGISTRY.items()
-        )
-        prompt = (
-            f"根据以下用户消息，判断应该路由到哪个员工，或者直接回复。只返回 JSON。\n"
-            f"路由格式：{{\"action\":\"route\",\"agent\":\"agent_id\"}}\n"
-            f"直接回复格式：{{\"action\":\"reply\",\"message\":\"回复内容\"}}\n"
-            f"如果消息含义模糊、没有具体工作意图（如打招呼、闲聊），直接回复。\n\n"
-            f"可用员工：\n{agents_desc}\n\n"
-            f"用户消息：{message}"
-        )
+        prompt = f"用户消息：{message}"
 
         try:
             route_session = f"dispatcher-{user_id}"
             result = subprocess.run(
-                ['npx', 'openclaw', 'agent', '--agent', 'main', '--local',
+                ['docker', 'exec', 'openclaw-dispatcher',
+                 'npx', 'openclaw', 'agent', '--agent', 'main', '--local',
                  '--session-id', route_session,
                  '-m', prompt, '--json', '--timeout', '30'],
-                capture_output=True, text=True, timeout=40, cwd='/root/.openclaw/workspace'
+                capture_output=True, text=True, timeout=40
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = None
@@ -130,11 +120,11 @@ class AIDispatcher:
                         logger.info(f"AI 路由结果（旧格式）: {agent_id}")
                         return agent_id, AGENT_REGISTRY[agent_id]['url'], None
 
-            logger.warning(f"AI 路由失败（CLI 返回: {result.stderr[:100]}），fallback 到 service")
+            logger.warning(f"AI 路由失败（CLI 返回: {result.stderr[:100]}），直接回复")
         except Exception as e:
-            logger.warning(f"AI 路由异常: {e}，fallback 到 service")
+            logger.warning(f"AI 路由异常: {e}，直接回复")
 
-        return 'service', AGENT_REGISTRY['service']['url'], None
+        return 'dispatcher', None, '抱歉，我暂时无法处理这个请求，请稍后再试。'
 
 
 _dispatcher = AIDispatcher()
@@ -338,8 +328,7 @@ def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
              'npx', 'openclaw', 'agent', '--agent', 'main', '--local',
              '--session-id', session_id,
              '-m', message, '--json', '--timeout', str(OPENCLAW_TIMEOUT)],
-            capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT + 10,
-            cwd='/root/.openclaw/workspace'
+            capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT + 10
         )
 
         logger.info(f"Agent {agent_id} CLI 返回码: {result.returncode}, stdout长度: {len(result.stdout)}, stderr长度: {len(result.stderr)}")
@@ -422,15 +411,38 @@ def truncate_message(text, max_len=WECOM_MSG_MAX_LEN):
     return result + suffix
 
 
+# ============= 共享文件目录配置 =============
+
+SHARED_FILES_BASE = os.getenv('SHARED_FILES_BASE', '/opt/openclaw/shared-files')
+CONTAINER_FILES_BASE = os.getenv('CONTAINER_FILES_BASE', '/shared-files')
+
+
+def _get_today_dir():
+    """获取当日共享文件目录（宿主机路径），自动创建"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    path = os.path.join(SHARED_FILES_BASE, today)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def host_path_to_container_path(host_path):
+    """将宿主机文件路径转换为容器内路径
+    /opt/openclaw/shared-files/2026-02-27/file.md → /shared-files/2026-02-27/file.md
+    """
+    if host_path and host_path.startswith(SHARED_FILES_BASE):
+        return CONTAINER_FILES_BASE + host_path[len(SHARED_FILES_BASE):]
+    return host_path
+
+
 # ============= 多类型消息处理 =============
 
-TEMP_FILE_DIR = '/tmp/openclaw-files'
+TEMP_FILE_DIR = None  # 不再使用固定目录，改用 _get_today_dir()
 TEXT_EXTENSIONS = {'.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml', '.py', '.js', '.ts',
                    '.java', '.go', '.rs', '.rb', '.php', '.sh', '.bash', '.sql', '.html', '.css',
                    '.conf', '.cfg', '.ini', '.toml', '.log', '.env', '.properties'}
 TEXT_CONTENT_TYPES = {'text/', 'application/json', 'application/xml', 'application/yaml',
                       'application/x-yaml', 'application/toml', 'application/sql'}
-MAX_TEXT_EMBED_SIZE = 10 * 1024  # 10KB
+MAX_TEXT_EMBED_SIZE = 50 * 1024  # 50KB
 DISPATCHER_PREVIEW_SIZE = 500
 
 
@@ -466,14 +478,12 @@ def _detect_file_type(local_path, content_type):
     except Exception:
         pass
 
-    # 尝试 UTF-8 解码判断是否为文本
+    # 尝试 UTF-8 解码判断是否为文本（只读前 4KB 探测）
     try:
-        file_size = os.path.getsize(local_path)
-        if file_size <= MAX_TEXT_EMBED_SIZE:
-            with open(local_path, 'rb') as f:
-                raw = f.read()
-            raw.decode('utf-8')  # 能解码成功说明是文本
-            return 'text/plain', '.txt'
+        with open(local_path, 'rb') as f:
+            sample = f.read(4096)
+        sample.decode('utf-8')  # 能解码成功说明是文本
+        return 'text/plain', '.txt'
     except (UnicodeDecodeError, Exception):
         pass
 
@@ -481,16 +491,16 @@ def _detect_file_type(local_path, content_type):
 
 
 def download_temp_file(url, prefix='file', user_id='', msg_type=''):
-    """下载临时 COS URL 到本地，返回 (local_path, text_content_or_none)"""
+    """下载临时 COS URL 到共享文件目录（按日期分区），返回 (local_path, text_content_or_none)"""
     try:
-        os.makedirs(TEMP_FILE_DIR, exist_ok=True)
+        today_dir = _get_today_dir()
         resp = requests.get(url, timeout=30, stream=True)
         resp.raise_for_status()
 
         # 先用临时文件名保存
         raw_content_type = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
         tmp_filename = f"{prefix}-{uuid.uuid4().hex[:8]}.tmp"
-        tmp_path = os.path.join(TEMP_FILE_DIR, tmp_filename)
+        tmp_path = os.path.join(today_dir, tmp_filename)
 
         with open(tmp_path, 'wb') as f:
             for chunk in resp.iter_content(8192):
@@ -503,7 +513,7 @@ def download_temp_file(url, prefix='file', user_id='', msg_type=''):
 
         # 用正确扩展名重命名
         filename = f"{prefix}-{uuid.uuid4().hex[:8]}{ext}"
-        local_path = os.path.join(TEMP_FILE_DIR, filename)
+        local_path = os.path.join(today_dir, filename)
         os.rename(tmp_path, local_path)
 
         file_size = os.path.getsize(local_path)
@@ -546,7 +556,8 @@ def extract_single_content(item, for_dispatcher=False, user_id=''):
             return '[用户发送了一张图片，但无法获取]'
         path, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image')
         if path:
-            return f'[用户发送了一张图片，已保存到 {path}]'
+            container_path = host_path_to_container_path(path)
+            return f'[用户发送了一张图片，已保存到 {container_path}]'
         return '[用户发送了一张图片，下载失败]'
 
     elif msg_type == 'file':
@@ -556,15 +567,16 @@ def extract_single_content(item, for_dispatcher=False, user_id=''):
         path, text_content = download_temp_file(url, prefix='file', user_id=user_id, msg_type='file')
         if not path:
             return '[用户发送了一个文件，下载失败]'
+        container_path = host_path_to_container_path(path)
         if text_content is not None:
             if for_dispatcher:
                 preview = text_content[:DISPATCHER_PREVIEW_SIZE]
                 if len(text_content) > DISPATCHER_PREVIEW_SIZE:
                     preview += '...(内容已截断)'
-                return f'[用户发送了一个文本文件 {path}]\n内容摘要：\n{preview}'
+                return f'[用户发送了一个文本文件 {container_path}]\n内容摘要：\n{preview}'
             else:
-                return f'[用户发送了一个文本文件 {path}]\n文件内容：\n{text_content}'
-        return f'[用户发送了一个文件，已保存到 {path}]'
+                return f'[用户发送了一个文本文件 {container_path}]\n文件内容：\n{text_content}'
+        return f'[用户发送了一个文件，已保存到 {container_path}]'
 
     elif msg_type == 'mixed':
         parts = []
@@ -617,7 +629,7 @@ def process_message_async(user_id, dispatcher_content, full_content, task_id, re
 
             if direct_reply:
                 # 调度员直接回复（模糊/闲聊类消息）
-                reply = direct_reply
+                reply = f"【调度员】\n{direct_reply}"
                 update_task_status(task_id, 'success', reply[:500])
             else:
                 result = call_openclaw_agent(agent_id, full_content, user_id, task_id, gateway_url=agent_url)

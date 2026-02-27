@@ -1,9 +1,9 @@
 #==============================================================================
 # OpenClaw 生产环境 - Docker Compose 配置
 # 版本: V2.0（三层架构）
-# 用途: 生产部署，Docker 固定 IP，无 Nginx
+# 用途: 生产部署，Docker 固定 IP，Gateway 运行在宿主机
 # 子网: 172.20.0.0/16
-#   gateway:     172.20.0.10:8000
+#   gateway:     宿主机直接运行（:8000 + dispatcher :18789）
 #   operation:   172.20.0.11:18789
 #   product:     172.20.0.12:18789
 #   development: 172.20.0.13:18789
@@ -13,55 +13,39 @@
 
 services:
   #----------------------------------------------------------------------------
-  # Gateway 容器（Flask + openclaw 调度员）
+  # Dispatcher 容器（AI 路由调度员）
   #----------------------------------------------------------------------------
-  openclaw-gateway:
+  openclaw-dispatcher:
     build:
       context: ..
-      dockerfile: src/gateway/Dockerfile.gateway
-    image: openclaw-gateway:prod
-    container_name: openclaw-gateway
+      dockerfile: config/Dockerfile.agents
+      args:
+        ROLE: dispatcher
+    image: openclaw-dispatcher:prod
+    container_name: openclaw-dispatcher
     restart: always
-
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
-      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
-      - DB_PATH=/data/gateway.db
-      - WECOM_TOKEN=${WECOM_TOKEN:-}
-      - WECOM_ENCODING_AES_KEY=${WECOM_ENCODING_AES_KEY:-}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
-      - TELEGRAM_MODE=${TELEGRAM_MODE:-polling}
-      - AGENT_OPERATION_URL=${AGENT_OPERATION_URL}
-      - AGENT_PRODUCT_URL=${AGENT_PRODUCT_URL}
-      - AGENT_DEVELOPMENT_URL=${AGENT_DEVELOPMENT_URL}
-      - AGENT_TESTING_URL=${AGENT_TESTING_URL}
-      - AGENT_SERVICE_URL=${AGENT_SERVICE_URL}
-
+      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-6}
     ports:
-      - "8000:8000"
-
+      - "18789:18789"
     volumes:
-      - /opt/openclaw/data/gateway:/data
-      - /opt/openclaw/logs/gateway:/logs
-      - /var/run/docker.sock:/var/run/docker.sock
-
+      - /opt/openclaw/data/dispatcher:/workspace
+      - /opt/openclaw/shared-files:/shared-files:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
       timeout: 10s
-      retries: 5
+      retries: 3
       start_period: 60s
-
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "10"
-
     networks:
       openclaw-network:
         ipv4_address: 172.20.0.10
@@ -88,6 +72,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/operation:/workspace
+      - /opt/openclaw/shared-files:/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -122,6 +107,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/product:/workspace
+      - /opt/openclaw/shared-files:/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -156,6 +142,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/development:/workspace
+      - /opt/openclaw/shared-files:/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -190,6 +177,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/testing:/workspace
+      - /opt/openclaw/shared-files:/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -224,6 +212,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/service:/workspace
+      - /opt/openclaw/shared-files:/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s

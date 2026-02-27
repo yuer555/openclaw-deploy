@@ -1,67 +1,16 @@
 #==============================================================================
 # OpenClaw 本地测试环境 - Docker Compose 配置
 # 版本: V2.0（三层架构）
-# 用途: 本地开发和测试
+# 用途: 本地开发和测试（仅 agent 容器，Gateway 运行在宿主机）
 #==============================================================================
 
-services:
-  #----------------------------------------------------------------------------
-  # Gateway 容器（Flask + openclaw 调度员）
-  #----------------------------------------------------------------------------
-  openclaw-gateway:
-    build:
-      context: ..
-      dockerfile: src/gateway/Dockerfile.gateway
-    image: openclaw-gateway:local
-    container_name: openclaw-gateway
-    restart: unless-stopped
-
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${API_KEY:-}
-      - API_BASE_URL=${API_BASE_URL:-}
-      - API_KEY=${API_KEY:-}
-      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
-      - DB_PATH=/data/gateway.db
-      - WECOM_TOKEN=${WECOM_TOKEN:-}
-      - WECOM_ENCODING_AES_KEY=${WECOM_ENCODING_AES_KEY:-}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
-      - TELEGRAM_MODE=${TELEGRAM_MODE:-polling}
-      - AGENT_OPERATION_URL=${AGENT_OPERATION_URL:-http://openclaw-agent-operation:18789}
-      - AGENT_PRODUCT_URL=${AGENT_PRODUCT_URL:-http://openclaw-agent-product:18789}
-      - AGENT_DEVELOPMENT_URL=${AGENT_DEVELOPMENT_URL:-http://openclaw-agent-development:18789}
-      - AGENT_TESTING_URL=${AGENT_TESTING_URL:-http://openclaw-agent-testing:18789}
-      - AGENT_SERVICE_URL=${AGENT_SERVICE_URL:-http://openclaw-agent-service:18789}
-
-    ports:
-      - "8000:8000"
-
-    volumes:
-      - ../data/gateway:/data
-      - ../logs/gateway:/logs
-      - /var/run/docker.sock:/var/run/docker.sock
-
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-    networks:
-      - openclaw-network
+# Gateway 已迁移到宿主机运行，此文件仅保留网络定义供 agent 容器使用。
+# 启动 agent 容器请使用 config/docker-compose.agents.yml
 
 #------------------------------------------------------------------------------
 # 网络配置
 #------------------------------------------------------------------------------
 networks:
   openclaw-network:
-    external: true
+    driver: bridge
     name: openclaw-network
