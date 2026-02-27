@@ -13,6 +13,8 @@ import struct
 import requests
 from datetime import datetime, timedelta
 import threading
+import mimetypes
+import re as _re
 
 app = Flask(__name__)
 
@@ -227,6 +229,18 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS file_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            file_path TEXT,
+            file_name TEXT,
+            file_type TEXT,
+            content_type TEXT,
+            file_size INTEGER,
+            source_url TEXT,
+            msg_type TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
         conn.commit()
         conn.close()
         logger.info("✅ 数据库初始化完成")
@@ -283,6 +297,22 @@ def update_task_status(task_id, status, result=''):
         logger.info(f"✅ 任务状态已更新: {task_id} -> {status}")
     except Exception as e:
         logger.error(f"❌ 更新任务状态失败: {e}")
+
+
+def log_file_record(user_id, file_path, file_name, file_type, content_type, file_size, source_url, msg_type):
+    """记录文件存档信息"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO file_records (user_id, file_path, file_name, file_type, content_type, file_size, source_url, msg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, file_path, file_name, file_type, content_type, file_size, source_url, msg_type)
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ 文件存档已记录: {file_name} (user={user_id})")
+    except Exception as e:
+        logger.error(f"❌ 记录文件存档失败: {e}")
 
 
 # ============= 消息路由 =============
@@ -392,21 +422,153 @@ def truncate_message(text, max_len=WECOM_MSG_MAX_LEN):
     return result + suffix
 
 
+# ============= 多类型消息处理 =============
+
+TEMP_FILE_DIR = '/tmp/openclaw-files'
+TEXT_EXTENSIONS = {'.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml', '.py', '.js', '.ts',
+                   '.java', '.go', '.rs', '.rb', '.php', '.sh', '.bash', '.sql', '.html', '.css',
+                   '.conf', '.cfg', '.ini', '.toml', '.log', '.env', '.properties'}
+TEXT_CONTENT_TYPES = {'text/', 'application/json', 'application/xml', 'application/yaml',
+                      'application/x-yaml', 'application/toml', 'application/sql'}
+MAX_TEXT_EMBED_SIZE = 10 * 1024  # 10KB
+DISPATCHER_PREVIEW_SIZE = 500
+
+
+def download_temp_file(url, prefix='file', user_id='', msg_type=''):
+    """下载临时 COS URL 到本地，返回 (local_path, text_content_or_none)"""
+    try:
+        os.makedirs(TEMP_FILE_DIR, exist_ok=True)
+        resp = requests.get(url, timeout=30, stream=True)
+        resp.raise_for_status()
+
+        # 从 Content-Type 推断扩展名
+        content_type = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
+        ext = mimetypes.guess_extension(content_type) or ''
+        if ext == '.jpe':
+            ext = '.jpg'
+
+        filename = f"{prefix}-{uuid.uuid4().hex[:8]}{ext}"
+        local_path = os.path.join(TEMP_FILE_DIR, filename)
+
+        with open(local_path, 'wb') as f:
+            for chunk in resp.iter_content(8192):
+                f.write(chunk)
+
+        file_size = os.path.getsize(local_path)
+
+        # 判断是否为文本文件
+        is_text = any(content_type.startswith(ct) for ct in TEXT_CONTENT_TYPES) or ext in TEXT_EXTENSIONS
+        text_content = None
+        if is_text:
+            try:
+                if file_size <= MAX_TEXT_EMBED_SIZE:
+                    with open(local_path, 'r', encoding='utf-8', errors='replace') as f:
+                        text_content = f.read()
+            except Exception as e:
+                logger.warning(f"读取文本文件内容失败: {e}")
+
+        # 存档到数据库
+        file_type = 'text' if is_text else content_type.split('/')[0]
+        log_file_record(user_id, local_path, filename, file_type, content_type, file_size, url, msg_type)
+
+        logger.info(f"文件已下载: {local_path} (type={content_type}, text={text_content is not None})")
+        return local_path, text_content
+    except Exception as e:
+        logger.error(f"下载文件失败: {e}")
+        return None, None
+
+
+def extract_single_content(item, for_dispatcher=False, user_id=''):
+    """提取单条消息内容（主消息或 quote 内的消息），返回文本描述"""
+    msg_type = item.get('msgtype', '')
+
+    if msg_type == 'text':
+        return item.get('text', {}).get('content', '')
+
+    elif msg_type == 'voice':
+        return item.get('voice', {}).get('content', '')
+
+    elif msg_type == 'image':
+        url = item.get('image', {}).get('url', '')
+        if not url:
+            return '[用户发送了一张图片，但无法获取]'
+        path, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image')
+        if path:
+            return f'[用户发送了一张图片，已保存到 {path}]'
+        return '[用户发送了一张图片，下载失败]'
+
+    elif msg_type == 'file':
+        url = item.get('file', {}).get('url', '')
+        if not url:
+            return '[用户发送了一个文件，但无法获取]'
+        path, text_content = download_temp_file(url, prefix='file', user_id=user_id, msg_type='file')
+        if not path:
+            return '[用户发送了一个文件，下载失败]'
+        if text_content is not None:
+            if for_dispatcher:
+                preview = text_content[:DISPATCHER_PREVIEW_SIZE]
+                if len(text_content) > DISPATCHER_PREVIEW_SIZE:
+                    preview += '...(内容已截断)'
+                return f'[用户发送了一个文本文件 {path}]\n内容摘要：\n{preview}'
+            else:
+                return f'[用户发送了一个文本文件 {path}]\n文件内容：\n{text_content}'
+        return f'[用户发送了一个文件，已保存到 {path}]'
+
+    elif msg_type == 'mixed':
+        parts = []
+        for sub_item in item.get('mixed', {}).get('msg_item', []):
+            parts.append(extract_single_content(sub_item, for_dispatcher=for_dispatcher, user_id=user_id))
+        return '\n'.join(parts)
+
+    return f'[不支持的消息类型: {msg_type}]'
+
+
+def _to_dispatcher_content(full_text):
+    """将 full_content 转为 dispatcher 版本（截断文件内容摘要）"""
+    marker = '文件内容：\n'
+    if marker not in full_text:
+        return full_text
+    # 替换每段完整文件内容为摘要
+    parts = full_text.split(marker)
+    result = parts[0]
+    for part in parts[1:]:
+        preview = part[:DISPATCHER_PREVIEW_SIZE]
+        if len(part) > DISPATCHER_PREVIEW_SIZE:
+            preview += '...(内容已截断)'
+        result += f'内容摘要：\n{preview}'
+    return result
+
+
+def extract_message_content(msg, user_id=''):
+    """提取完整消息内容，返回 (dispatcher_content, full_content)。只下载一次文件。"""
+    full_main = extract_single_content(msg, for_dispatcher=False, user_id=user_id)
+    dispatcher_main = _to_dispatcher_content(full_main)
+
+    quote = msg.get('quote')
+    if quote:
+        full_quote = extract_single_content(quote, for_dispatcher=False, user_id=user_id)
+        dispatcher_quote = _to_dispatcher_content(full_quote)
+        dispatcher_main = f"{dispatcher_main}\n\n[引用消息] {dispatcher_quote}"
+        full_main = f"{full_main}\n\n[引用消息] {full_quote}"
+
+    return dispatcher_main, full_main
+
+
 # ============= 异步处理 =============
 
-def process_message_async(user_id, content, task_id, response_url, crypto, timestamp, nonce):
+def process_message_async(user_id, dispatcher_content, full_content, task_id, response_url, crypto, timestamp, nonce):
     """异步处理消息：先路由，再调用 agent 或直接回复，最后用 response_url 主动回复"""
     def worker():
         try:
-            agent_id, agent_url, direct_reply = route_message(content, user_id)
-            log_task(task_id, user_id, agent_id, content, status='processing')
+            agent_id, agent_url, direct_reply = route_message(dispatcher_content, user_id)
+            log_task(task_id, user_id, agent_id, dispatcher_content, status='processing')
 
             if direct_reply:
                 # 调度员直接回复（模糊/闲聊类消息）
                 reply = direct_reply
                 update_task_status(task_id, 'success', reply[:500])
             else:
-                result = call_openclaw_agent(agent_id, content, user_id, task_id, gateway_url=agent_url)
+                result = call_openclaw_agent(agent_id, full_content, user_id, task_id, gateway_url=agent_url)
                 reply = result.get('reply', '处理失败，请稍后再试。')
                 # 添加虚拟员工标识前缀
                 agent_name = AGENT_REGISTRY.get(agent_id, {}).get('name', agent_id)
@@ -503,10 +665,10 @@ def wecom_callback():
                 logger.info(f"⚠️  重复消息已跳过: {msgid}")
                 return jsonify({}), 200
 
-            # 只处理文本消息
-            if msg_type == 'text':
-                content = msg.get('text', {}).get('content', '')
-                logger.info(f"消息内容: {content}, from: {from_user}")
+            # 处理支持的消息类型
+            if msg_type in ('text', 'image', 'file', 'voice', 'mixed'):
+                dispatcher_content, full_content = extract_message_content(msg, user_id=from_user)
+                logger.info(f"消息内容(dispatcher): {dispatcher_content[:200]}, from: {from_user}")
 
                 task_id = str(uuid.uuid4())
 
@@ -514,7 +676,7 @@ def wecom_callback():
                 processing_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": "⏳ 正在处理，请稍候..."}})
                 reply_pkg = crypto.build_reply(processing_msg, int(timestamp), nonce)
 
-                process_message_async(from_user, content, task_id, response_url, crypto, timestamp, nonce)
+                process_message_async(from_user, dispatcher_content, full_content, task_id, response_url, crypto, timestamp, nonce)
 
                 if reply_pkg:
                     return jsonify(reply_pkg), 200
