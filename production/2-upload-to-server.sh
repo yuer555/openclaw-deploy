@@ -99,6 +99,7 @@ print_info "复制必要文件..."
 # 复制生产部署文件
 cp -r production ${TEMP_DIR}/openclaw-deploy/
 cp -r config ${TEMP_DIR}/openclaw-deploy/
+cp -r src ${TEMP_DIR}/openclaw-deploy/
 cp -r scripts ${TEMP_DIR}/openclaw-deploy/
 cp README.md ${TEMP_DIR}/openclaw-deploy/ 2>/dev/null || true
 cp QUICK_START.md ${TEMP_DIR}/openclaw-deploy/ 2>/dev/null || true
@@ -138,10 +139,14 @@ print_step "步骤 5/5: 解压文件"
 print_info "在服务器上解压文件..."
 ssh ${SERVER_USER}@${SERVER_IP} << ENDSSH
 cd ${REMOTE_DIR}
+# 清除旧的代码文件（保留运行时数据和 .env.prod 配置）
+if [ -f production/.env.prod ]; then cp production/.env.prod /tmp/.env.prod.bak; fi
+rm -rf config src production scripts docs README.md QUICK_START.md openclaw-deploy 2>/dev/null || true
 tar -xzf ${PACKAGE_NAME}
 mv openclaw-deploy/* . 2>/dev/null || true
 rmdir openclaw-deploy 2>/dev/null || true
 rm ${PACKAGE_NAME}
+if [ -f /tmp/.env.prod.bak ]; then mv /tmp/.env.prod.bak production/.env.prod; fi
 chmod +x production/*.sh 2>/dev/null || true
 chmod +x scripts/*.sh 2>/dev/null || true
 ls -la
