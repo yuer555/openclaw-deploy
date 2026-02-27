@@ -55,8 +55,8 @@ fi
 print_success ".env.prod 已存在"
 
 source .env.prod
-if [ -z "$GITHUB_TOKEN" ] && [ -z "$OPENAI_API_KEY" ]; then
-    print_error "必须配置 GITHUB_TOKEN 或 OPENAI_API_KEY"
+if [ -z "$OPENAI_API_KEY" ] && [ -z "$API_KEY" ]; then
+    print_error "必须配置 OPENAI_API_KEY 或 API_KEY + API_BASE_URL"
     exit 1
 fi
 print_success "配置验证通过"
