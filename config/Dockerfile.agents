@@ -33,6 +33,10 @@ RUN npm install -g openclaw@latest
 RUN mkdir -p /root/.openclaw/workspace
 COPY config/agents/workspace/${ROLE}/ /root/.openclaw/workspace/
 
+# 将 IDENTITY.md 设为只读，防止 AI 修改安全约束
+# 配合 prompt 中"禁止修改此文件"的约束，形成双重防护
+RUN chmod 444 /root/.openclaw/workspace/IDENTITY.md
+
 # 设置工作目录
 WORKDIR /root/.openclaw/workspace
 
