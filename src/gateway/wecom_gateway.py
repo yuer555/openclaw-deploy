@@ -487,7 +487,7 @@ def wecom_callback():
                 return jsonify({}), 500
 
             msg = json.loads(decrypted)
-            logger.info(f"📩 解密消息: {str(msg)[:200]}")
+            logger.info(f"📩 解密消息: {json.dumps(msg, ensure_ascii=False)}")
 
             msg_type = msg.get('msgtype', '')
             msgid = msg.get('msgid', '')
