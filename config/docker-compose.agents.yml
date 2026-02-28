@@ -25,7 +25,7 @@ services:
       - "18789:18789"
     volumes:
       - ../data/dispatcher:/workspace
-      - ../shared-files:/shared-files:ro
+      - ../shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -60,7 +60,7 @@ services:
       - "18791:18789"
     volumes:
       - ../data/agents/operation:/workspace
-      - ../shared-files:/shared-files:ro
+      - ../shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -95,7 +95,7 @@ services:
       - "18792:18789"
     volumes:
       - ../data/agents/product:/workspace
-      - ../shared-files:/shared-files:ro
+      - ../shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -130,7 +130,7 @@ services:
       - "18793:18789"
     volumes:
       - ../data/agents/development:/workspace
-      - ../shared-files:/shared-files:ro
+      - ../shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -165,7 +165,7 @@ services:
       - "18794:18789"
     volumes:
       - ../data/agents/testing:/workspace
-      - ../shared-files:/shared-files:ro
+      - ../shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -200,7 +200,7 @@ services:
       - "18795:18789"
     volumes:
       - ../data/agents/service:/workspace
-      - ../shared-files:/shared-files:ro
+      - ../shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s

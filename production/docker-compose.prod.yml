@@ -35,7 +35,7 @@ services:
       - "18789:18789"
     volumes:
       - /opt/openclaw/data/dispatcher:/workspace
-      - /opt/openclaw/shared-files:/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -50,8 +50,6 @@ services:
     networks:
       openclaw-network:
         ipv4_address: 172.20.0.10
-
-  #----------------------------------------------------------------------------
   # 虚拟员工容器
   #----------------------------------------------------------------------------
   openclaw-agent-operation:
@@ -74,7 +72,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/operation:/workspace
-      - /opt/openclaw/shared-files:/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -110,7 +108,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/product:/workspace
-      - /opt/openclaw/shared-files:/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -146,7 +144,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/development:/workspace
-      - /opt/openclaw/shared-files:/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -182,7 +180,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/testing:/workspace
-      - /opt/openclaw/shared-files:/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
@@ -218,7 +216,7 @@ services:
       - "18789"
     volumes:
       - /opt/openclaw/data/agents/service:/workspace
-      - /opt/openclaw/shared-files:/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s

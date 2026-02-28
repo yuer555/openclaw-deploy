@@ -453,7 +453,7 @@ def _default_shared_files_base():
     return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'shared-files')
 
 SHARED_FILES_BASE = os.getenv('SHARED_FILES_BASE', _default_shared_files_base())
-CONTAINER_FILES_BASE = os.getenv('CONTAINER_FILES_BASE', '/shared-files')
+CONTAINER_FILES_BASE = os.getenv('CONTAINER_FILES_BASE', 'shared-files')
 
 
 def _get_today_dir():
