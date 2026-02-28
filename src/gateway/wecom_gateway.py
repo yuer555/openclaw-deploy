@@ -45,7 +45,7 @@ OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '2700'))
 OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-internal-secret')
 
 # 通信协议：http / sse / ws / exec（默认 sse）
-OPENCLAW_PROTOCOL = os.getenv('OPENCLAW_PROTOCOL', 'sse')
+OPENCLAW_PROTOCOL = os.getenv('OPENCLAW_PROTOCOL', 'ws')
 
 # Docker Exec 调度员容器名
 DISPATCHER_CONTAINER = os.getenv('DISPATCHER_CONTAINER', 'openclaw-dispatcher')
