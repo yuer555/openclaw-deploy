@@ -59,11 +59,8 @@ def _extract_reply_text(data):
     return '\n'.join(texts).strip()
 
 
-def _call_openclaw(url, message, session_key, timeout=2700):
-    """通过 HTTP SSE 流式调用 openclaw gateway，避免长任务超时。
-    使用 stream=true 参数，持续接收 SSE 事件直到 response.completed。
-    连接保持活跃期间不会触发 requests 超时。
-    """
+def _call_openclaw_sse(url, message, session_key, timeout=2700):
+    """单次 HTTP SSE 流式调用，返回回复文本。连接异常时抛出异常。"""
     resp = requests.post(
         f"{url}/v1/responses",
         headers={
@@ -72,12 +69,11 @@ def _call_openclaw(url, message, session_key, timeout=2700):
             'x-openclaw-agent-id': 'main',
         },
         json={'model': 'openclaw', 'input': message, 'stream': True, 'user': session_key},
-        timeout=(10, timeout),  # (connect_timeout, read_timeout)
+        timeout=(10, timeout),
         stream=True,
     )
     resp.raise_for_status()
 
-    # 解析 SSE 事件流，提取最终完整回复
     final_data = None
     for line in resp.iter_lines(decode_unicode=True):
         if not line or not line.startswith('data: '):
@@ -95,6 +91,18 @@ def _call_openclaw(url, message, session_key, timeout=2700):
     if final_data:
         return _extract_reply_text(final_data)
     return ''
+
+
+def _call_openclaw(url, message, session_key, timeout=2700):
+    """通过 HTTP SSE 流式调用 openclaw gateway。
+    SSE 断开时自动重试一次（同一 session，请 agent 重复上次回复）。
+    """
+    try:
+        return _call_openclaw_sse(url, message, session_key, timeout)
+    except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+        logger.warning(f"SSE 连接断开: {e}，尝试重试")
+        retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
+        return _call_openclaw_sse(url, retry_msg, session_key, timeout)
 
 
 # ============= AI 调度员 =============
