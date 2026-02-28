@@ -220,6 +220,9 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700):
             evt = json.loads(raw)
             if evt.get('type') == 'event' and evt.get('event') == 'chat':
                 payload = evt.get('payload', {})
+                # 校验 sessionKey，忽略其他用户的 broadcast 事件
+                if payload.get('sessionKey') and payload.get('sessionKey') != session_key:
+                    continue
                 if payload.get('state') == 'final':
                     msg = payload.get('message', {})
                     texts = []
