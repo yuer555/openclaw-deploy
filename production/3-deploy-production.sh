@@ -82,7 +82,7 @@ print_step "步骤 4/4: 构建 Agent 镜像"
 
 for ROLE in dispatcher operation product development testing service; do
     print_info "构建 openclaw-agent-${ROLE}:prod ..."
-    docker build \
+    docker build --no-cache \
         -f ../config/Dockerfile.agents \
         --build-arg ROLE=${ROLE} \
         -t openclaw-agent-${ROLE}:prod \
