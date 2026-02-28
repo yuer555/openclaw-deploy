@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import threading
 import mimetypes
 import re as _re
+import subprocess
 
 app = Flask(__name__)
 
@@ -41,6 +42,12 @@ OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '2700'))
 
 # OpenClaw 内部通信 Token
 OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-internal-secret')
+
+# 通信协议：http / sse / exec（默认 sse）
+OPENCLAW_PROTOCOL = os.getenv('OPENCLAW_PROTOCOL', 'sse')
+
+# Docker Exec 调度员容器名
+DISPATCHER_CONTAINER = os.getenv('DISPATCHER_CONTAINER', 'openclaw-dispatcher')
 
 # Agent 注册表
 from agent_registry import AGENT_REGISTRY
@@ -93,16 +100,104 @@ def _call_openclaw_sse(url, message, session_key, timeout=2700):
     return ''
 
 
-def _call_openclaw(url, message, session_key, timeout=2700):
-    """通过 HTTP SSE 流式调用 openclaw gateway。
-    SSE 断开时自动重试一次（同一 session，请 agent 重复上次回复）。
-    """
+def _call_openclaw_http(url, message, session_key, timeout=2700):
+    """同步 HTTP POST 调用，不使用流式，直接拿完整 JSON 响应"""
+    resp = requests.post(
+        f"{url}/v1/responses",
+        headers={
+            'Authorization': f'Bearer {OPENCLAW_INTERNAL_TOKEN}',
+            'Content-Type': 'application/json',
+            'x-openclaw-agent-id': 'main',
+        },
+        json={'model': 'openclaw', 'input': message, 'user': session_key},
+        timeout=(10, timeout),
+    )
+    resp.raise_for_status()
+    return _extract_reply_text(resp.json())
+
+
+def _resolve_container(url):
+    """根据 URL 反查 agent 容器名。dispatcher URL 返回 DISPATCHER_CONTAINER。"""
+    if url == OPENCLAW_GATEWAY_URL:
+        return DISPATCHER_CONTAINER
+    for info in AGENT_REGISTRY.values():
+        if info.get('url') == url:
+            return info.get('container', '')
+    return ''
+
+
+def _extract_exec_reply(data):
+    """从 docker exec --json 输出中提取文本（格式: {payloads: [{text: ...}]})"""
+    texts = []
+    for p in data.get('payloads', []):
+        if p.get('text'):
+            texts.append(p['text'])
+    return '\n'.join(texts).strip()
+
+
+def _call_openclaw_exec(url, message, session_key, timeout=2700):
+    """通过 docker exec 调用容器内 openclaw CLI，解析 JSON 输出"""
+    container = _resolve_container(url)
+    if not container:
+        raise Exception(f"exec 协议找不到 URL 对应的容器: {url}")
+
+    cmd = [
+        'docker', 'exec', container,
+        'npx', 'openclaw', 'agent', '--agent', 'main', '--local',
+        '--session-id', session_key,
+        '-m', message, '--json', '--timeout', str(timeout),
+    ]
+    logger.info(f"exec 调用: docker exec {container} ...")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 30)
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        logger.error(f"exec 调用失败 (rc={result.returncode}): {stderr[:500]}")
+        raise Exception(f"docker exec 失败: {stderr[:200]}")
+
+    # docker exec --json 输出为单个 JSON 对象（{payloads: [{text: ...}]}）
+    stdout = result.stdout.strip()
+    if not stdout:
+        return ''
     try:
-        return _call_openclaw_sse(url, message, session_key, timeout)
-    except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
-        logger.warning(f"SSE 连接断开: {e}，尝试重试")
-        retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
-        return _call_openclaw_sse(url, retry_msg, session_key, timeout)
+        data = json.loads(stdout)
+        return _extract_exec_reply(data)
+    except json.JSONDecodeError:
+        # 可能有非 JSON 前缀行，尝试逐行找最后一个有效 JSON
+        reply_text = ''
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                text = _extract_exec_reply(data)
+                if text:
+                    reply_text = text
+            except json.JSONDecodeError:
+                continue
+        return reply_text
+
+
+def _call_openclaw(url, message, session_key, timeout=2700):
+    """统一调用入口，根据 OPENCLAW_PROTOCOL 选择协议"""
+    protocol = OPENCLAW_PROTOCOL.lower()
+
+    if protocol == 'http':
+        return _call_openclaw_http(url, message, session_key, timeout)
+
+    elif protocol == 'exec':
+        return _call_openclaw_exec(url, message, session_key, timeout)
+
+    else:  # 默认 sse
+        try:
+            return _call_openclaw_sse(url, message, session_key, timeout)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ReadTimeout) as e:
+            logger.warning(f"SSE 连接断开: {e}，尝试重试")
+            retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
+            return _call_openclaw_sse(url, retry_msg, session_key, timeout)
 
 
 # ============= AI 调度员 =============
@@ -918,6 +1013,7 @@ if __name__ == '__main__':
 
     logger.info(f"✅ 数据库路径: {DB_PATH}")
     logger.info(f"✅ OpenClaw Gateway: {OPENCLAW_GATEWAY_URL}")
+    logger.info(f"✅ 通信协议: {OPENCLAW_PROTOCOL}")
     logger.info("=" * 60)
 
     app.run(host='0.0.0.0', port=8000, debug=False)
