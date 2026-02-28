@@ -81,7 +81,7 @@ if command -v openclaw &> /dev/null || npx openclaw --version &> /dev/null 2>&1;
     print_success "openclaw 已安装"
 else
     print_info "安装 openclaw..."
-    npm install -g openclaw@latest
+    npm install -g openclaw@2026.2.26
     print_success "openclaw 安装完成"
 fi
 

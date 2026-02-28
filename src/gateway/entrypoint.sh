@@ -29,6 +29,11 @@ if [ -n "$OPENAI_KEY" ]; then
     "auth": {
       "mode": "token",
       "token": "${INTERNAL_TOKEN}"
+    },
+    "http": {
+      "endpoints": {
+        "responses": { "enabled": true }
+      }
     }
   }
 }
@@ -56,6 +61,11 @@ elif [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
     "auth": {
       "mode": "token",
       "token": "${INTERNAL_TOKEN}"
+    },
+    "http": {
+      "endpoints": {
+        "responses": { "enabled": true }
+      }
     }
   }
 }
@@ -92,6 +102,11 @@ else
     "auth": {
       "mode": "token",
       "token": "${INTERNAL_TOKEN}"
+    },
+    "http": {
+      "endpoints": {
+        "responses": { "enabled": true }
+      }
     }
   }
 }

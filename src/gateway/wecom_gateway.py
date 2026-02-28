@@ -46,17 +46,66 @@ OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-interna
 from agent_registry import AGENT_REGISTRY
 
 
+# ============= OpenClaw API 通用调用 =============
+
+def _extract_reply_text(data):
+    """从 /v1/responses 返回数据中提取文本"""
+    texts = []
+    for item in data.get('output', []):
+        if item.get('type') == 'message':
+            for c in item.get('content', []):
+                if c.get('type') == 'output_text' and c.get('text'):
+                    texts.append(c['text'])
+    return '\n'.join(texts).strip()
+
+
+def _call_openclaw(url, message, session_key, timeout=2700):
+    """通过 HTTP SSE 流式调用 openclaw gateway，避免长任务超时。
+    使用 stream=true 参数，持续接收 SSE 事件直到 response.completed。
+    连接保持活跃期间不会触发 requests 超时。
+    """
+    resp = requests.post(
+        f"{url}/v1/responses",
+        headers={
+            'Authorization': f'Bearer {OPENCLAW_INTERNAL_TOKEN}',
+            'Content-Type': 'application/json',
+            'x-openclaw-agent-id': 'main',
+        },
+        json={'model': 'openclaw', 'input': message, 'stream': True, 'user': session_key},
+        timeout=(10, timeout),  # (connect_timeout, read_timeout)
+        stream=True,
+    )
+    resp.raise_for_status()
+
+    # 解析 SSE 事件流，提取最终完整回复
+    final_data = None
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith('data: '):
+            continue
+        payload = line[6:]
+        if payload == '[DONE]':
+            break
+        try:
+            evt = json.loads(payload)
+            if evt.get('type') == 'response.completed':
+                final_data = evt.get('response', {})
+        except json.JSONDecodeError:
+            continue
+
+    if final_data:
+        return _extract_reply_text(final_data)
+    return ''
+
+
 # ============= AI 调度员 =============
 
 class AIDispatcher:
-    """通过 openclaw CLI 调用调度员分析意图，返回目标 agent"""
+    """通过 openclaw API 调用调度员分析意图，返回目标 agent"""
 
     def route(self, message: str, user_id: str = 'anonymous') -> tuple:
         """分析消息意图，返回 (agent_id, agent_url, direct_reply)
         当 direct_reply 不为 None 时，表示调度员直接回答，不路由到员工
         """
-        import subprocess
-
         # 注入上次路由结果和 agent 回复，帮助调度员理解上下文
         last = _get_last_route(user_id)
         if last:
@@ -64,7 +113,6 @@ class AIDispatcher:
             agent_name = AGENT_REGISTRY.get(last_agent_id, {}).get('name', last_agent_id)
             context = f"[上下文：该用户上一轮对话已路由到{agent_name}（{last_agent_id}）"
             if last_reply:
-                # 截取前 300 字，避免 prompt 过长
                 reply_preview = last_reply[:300]
                 if len(last_reply) > 300:
                     reply_preview += '...'
@@ -75,67 +123,45 @@ class AIDispatcher:
             prompt = f"用户消息：{message}"
 
         try:
-            route_session = f"dispatcher-{user_id}"
-            result = subprocess.run(
-                ['docker', 'exec', 'openclaw-dispatcher',
-                 'npx', 'openclaw', 'agent', '--agent', 'main', '--local',
-                 '--session-id', route_session,
-                 '-m', prompt, '--json', '--timeout', '30'],
-                capture_output=True, text=True, timeout=40
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                data = None
-                for line in reversed(result.stdout.strip().split('\n')):
-                    if line.strip().startswith('{'):
+            session_key = f"dispatcher-{user_id}"
+            reply_text = _call_openclaw(OPENCLAW_GATEWAY_URL, prompt, session_key, timeout=40)
+            logger.info(f"Dispatcher 回复: {reply_text[:200]}")
+
+            if reply_text:
+                # 尝试从回复中解析 dispatcher 返回的 JSON
+                dispatch_data = None
+                try:
+                    dispatch_data = json.loads(reply_text)
+                except json.JSONDecodeError:
+                    # 尝试从 markdown 代码块中提取 JSON（dispatcher 有时会用 ```json ... ``` 包裹）
+                    m = _re.search(r'```(?:json)?\s*(\{[^`]+\})\s*```', reply_text, _re.DOTALL)
+                    if not m:
+                        m = _re.search(r'\{[^}]+\}', reply_text)
+                    if m:
                         try:
-                            data = json.loads(line.strip())
-                            break
+                            dispatch_data = json.loads(m.group(1) if m.lastindex else m.group())
                         except json.JSONDecodeError:
-                            continue
-                if not data:
-                    try:
-                        data = json.loads(result.stdout)
-                    except json.JSONDecodeError:
-                        data = None
+                            pass
 
-                if data:
-                    payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
-                    parts = [p.get('text', '') for p in payloads if p.get('text')]
-                    reply_text = '\n'.join(parts).strip()
+                if dispatch_data and isinstance(dispatch_data, dict):
+                    action = dispatch_data.get('action', '')
+                    if action == 'reply':
+                        direct_msg = dispatch_data.get('message', '')
+                        logger.info("AI 路由结果: dispatcher 直接回复")
+                        return 'dispatcher', None, direct_msg
+                    elif action == 'route':
+                        agent_id = dispatch_data.get('agent', 'service')
+                        if agent_id in AGENT_REGISTRY:
+                            logger.info(f"AI 路由结果: {agent_id}")
+                            return agent_id, AGENT_REGISTRY[agent_id]['url'], None
 
-                    # 尝试从回复中解析 dispatcher 返回的 JSON
-                    dispatch_data = None
-                    try:
-                        dispatch_data = json.loads(reply_text)
-                    except json.JSONDecodeError:
-                        # 回复中可能包含多余文字，尝试提取 JSON
-                        import re
-                        m = re.search(r'\{[^}]+\}', reply_text)
-                        if m:
-                            try:
-                                dispatch_data = json.loads(m.group())
-                            except json.JSONDecodeError:
-                                pass
+                # fallback: 旧格式兼容（纯 agent ID）
+                agent_id = reply_text.lower().split()[0] if reply_text else 'service'
+                if agent_id in AGENT_REGISTRY:
+                    logger.info(f"AI 路由结果（旧格式）: {agent_id}")
+                    return agent_id, AGENT_REGISTRY[agent_id]['url'], None
 
-                    if dispatch_data and isinstance(dispatch_data, dict):
-                        action = dispatch_data.get('action', '')
-                        if action == 'reply':
-                            direct_msg = dispatch_data.get('message', '')
-                            logger.info("AI 路由结果: dispatcher 直接回复")
-                            return 'dispatcher', None, direct_msg
-                        elif action == 'route':
-                            agent_id = dispatch_data.get('agent', 'service')
-                            if agent_id in AGENT_REGISTRY:
-                                logger.info(f"AI 路由结果: {agent_id}")
-                                return agent_id, AGENT_REGISTRY[agent_id]['url'], None
-
-                    # fallback: 旧格式兼容（纯 agent ID）
-                    agent_id = reply_text.lower().split()[0] if reply_text else 'service'
-                    if agent_id in AGENT_REGISTRY:
-                        logger.info(f"AI 路由结果（旧格式）: {agent_id}")
-                        return agent_id, AGENT_REGISTRY[agent_id]['url'], None
-
-            logger.warning(f"AI 路由失败（CLI 返回: {result.stderr[:100]}），直接回复")
+            logger.warning("AI 路由失败：dispatcher 无有效回复")
         except Exception as e:
             logger.warning(f"AI 路由异常: {e}，直接回复")
 
@@ -348,65 +374,27 @@ def route_message(content, user_id='anonymous'):
     return _dispatcher.route(content, user_id)
 
 
-# ============= OpenClaw Agent 调用（docker exec + CLI）=============
+# ============= OpenClaw Agent 调用（HTTP/WS API）=============
 
 def call_openclaw_agent(agent_id, message, user_id, task_id, gateway_url=None):
-    """通过 docker exec 在远程 agent 容器内调用 openclaw CLI（与调度员相同模式）"""
-    import subprocess
-
-    container_name = AGENT_REGISTRY.get(agent_id, {}).get('container', f'openclaw-agent-{agent_id}')
-    logger.info(f"调用 Agent {agent_id}: docker exec {container_name}")
+    """通过 HTTP/WS API 调用远程 agent 容器内的 openclaw"""
+    agent_url = gateway_url or AGENT_REGISTRY.get(agent_id, {}).get('url')
+    logger.info(f"调用 Agent {agent_id} via HTTP SSE: {agent_url}")
 
     try:
-        session_id = f"{agent_id}-{user_id}"
-        result = subprocess.run(
-            ['docker', 'exec', container_name,
-             'npx', 'openclaw', 'agent', '--agent', 'main', '--local',
-             '--session-id', session_id,
-             '-m', message, '--json', '--timeout', str(OPENCLAW_TIMEOUT)],
-            capture_output=True, text=True, timeout=OPENCLAW_TIMEOUT + 10
-        )
+        session_key = f"{agent_id}-{user_id}"
+        reply = _call_openclaw(agent_url, message, session_key, timeout=OPENCLAW_TIMEOUT)
+        logger.info(f"Agent {agent_id} 回复长度: {len(reply)}, 前200字: {reply[:200]}")
 
-        logger.info(f"Agent {agent_id} CLI 返回码: {result.returncode}, stdout长度: {len(result.stdout)}, stderr长度: {len(result.stderr)}")
+        if reply:
+            update_task_status(task_id, 'success', reply[:500])
+            return {'success': True, 'reply': reply, 'agent_id': agent_id}
 
-        if result.returncode == 0 and result.stdout.strip():
-            # stdout 可能包含多个 JSON 对象（每行一个），取最后一个完整的
-            lines = result.stdout.strip().split('\n')
-            logger.info(f"Agent {agent_id} stdout 行数: {len(lines)}")
-            data = None
-            for line in reversed(lines):
-                line = line.strip()
-                if line.startswith('{'):
-                    try:
-                        data = json.loads(line)
-                        break
-                    except json.JSONDecodeError:
-                        continue
-            if not data:
-                try:
-                    data = json.loads(result.stdout)
-                except json.JSONDecodeError:
-                    data = None
+        logger.error(f"Agent {agent_id} 无有效回复")
+        update_task_status(task_id, 'failed', '无响应')
+        return {'success': False, 'error': '无响应', 'reply': '抱歉，系统处理出现问题，请稍后再试。'}
 
-            if data:
-                payloads = data.get('payloads') or data.get('result', {}).get('payloads', [])
-                logger.info(f"Agent {agent_id} payloads 数量: {len(payloads)}")
-                # 合并所有 payload 的 text
-                parts = [p.get('text', '') for p in payloads if p.get('text')]
-                reply = '\n'.join(parts)
-                logger.info(f"Agent {agent_id} 回复长度: {len(reply)}, 前200字: {reply[:200]}")
-                if reply:
-                    update_task_status(task_id, 'success', reply[:500])
-                    return {'success': True, 'reply': reply, 'agent_id': agent_id}
-            else:
-                logger.error(f"Agent {agent_id} JSON 解析失败, stdout前500字: {result.stdout[:500]}")
-
-        error_msg = result.stderr[:200] if result.stderr else '无响应'
-        logger.error(f"Agent {agent_id} CLI 调用失败: {error_msg}")
-        update_task_status(task_id, 'failed', error_msg[:500])
-        return {'success': False, 'error': error_msg, 'reply': '抱歉，系统处理出现问题，请稍后再试。'}
-
-    except subprocess.TimeoutExpired:
+    except requests.exceptions.Timeout:
         logger.error(f"Agent {agent_id} 调用超时")
         update_task_status(task_id, 'failed', 'timeout')
         return {'success': False, 'error': 'timeout', 'reply': '处理超时，请稍后再试。'}
@@ -449,7 +437,14 @@ def truncate_message(text, max_len=WECOM_MSG_MAX_LEN):
 
 # ============= 共享文件目录配置 =============
 
-SHARED_FILES_BASE = os.getenv('SHARED_FILES_BASE', '/opt/openclaw/shared-files')
+def _default_shared_files_base():
+    """本地开发时 /opt/openclaw/shared-files 不存在，自动 fallback 到 ./shared-files"""
+    prod_path = '/opt/openclaw/shared-files'
+    if os.path.isdir(prod_path):
+        return prod_path
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'shared-files')
+
+SHARED_FILES_BASE = os.getenv('SHARED_FILES_BASE', _default_shared_files_base())
 CONTAINER_FILES_BASE = os.getenv('CONTAINER_FILES_BASE', '/shared-files')
 
 

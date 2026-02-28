@@ -36,7 +36,7 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python && \
 
 # 配置 npm 国内镜像并安装 openclaw
 RUN npm config set registry https://registry.npmmirror.com && \
-    npm install -g openclaw@latest
+    npm install -g openclaw@2026.2.26
 
 # 安装 Python 依赖
 WORKDIR /app

@@ -27,7 +27,7 @@ RUN git config --global url.'https://github.com/'.insteadOf 'ssh://git@github.co
 RUN npm config set registry https://registry.npmmirror.com
 
 # 安装 OpenClaw
-RUN npm install -g openclaw@latest
+RUN npm install -g openclaw@2026.2.26
 
 # 预置角色 workspace 文件到 openclaw workspace 目录
 RUN mkdir -p /root/.openclaw/workspace
@@ -46,13 +46,14 @@ EXPOSE 18789
 # 启动时：配置 API（OPENAI_API_KEY 优先）、启动 gateway
 CMD ["sh", "-c", "\
   mkdir -p /root/.openclaw/agents/main/agent && \
+  INTERNAL_TOKEN=\"${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}\" && \
   if [ -n \"$OPENAI_API_KEY\" ]; then \
-    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openai/gpt-4o\"},\"models\":{\"openai/gpt-4o\":{}}}},\"gateway\":{\"bind\":\"lan\",\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' > /root/.openclaw/openclaw.json; \
+    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openai/gpt-4o\"},\"models\":{\"openai/gpt-4o\":{}}}},\"gateway\":{\"bind\":\"lan\",\"auth\":{\"mode\":\"token\",\"token\":\"%s\"},\"http\":{\"endpoints\":{\"responses\":{\"enabled\":true}}},\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' \"$INTERNAL_TOKEN\" > /root/.openclaw/openclaw.json; \
   elif [ -n \"$API_BASE_URL\" ] && [ -n \"$API_KEY\" ]; then \
     MODEL=${MODEL_NAME:-claude-sonnet-4-20250514} && \
     printf '{\"providers\":{\"anthropic\":{\"baseUrl\":\"%s\",\"models\":[]}}}' \"$API_BASE_URL\" > /root/.openclaw/agents/main/agent/models.json && \
     printf '{\"profiles\":{\"anthropic:manual\":{\"provider\":\"anthropic\",\"kind\":\"apiKey\",\"apiKey\":\"%s\",\"label\":\"third-party\"}}}' \"$API_KEY\" > /root/.openclaw/agents/main/agent/auth-profiles.json && \
-    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"anthropic/%s\"},\"models\":{\"anthropic/%s\":{}}}},\"gateway\":{\"bind\":\"lan\",\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' \"$MODEL\" \"$MODEL\" > /root/.openclaw/openclaw.json && \
+    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"anthropic/%s\"},\"models\":{\"anthropic/%s\":{}}}},\"gateway\":{\"bind\":\"lan\",\"auth\":{\"mode\":\"token\",\"token\":\"%s\"},\"http\":{\"endpoints\":{\"responses\":{\"enabled\":true}}},\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' \"$MODEL\" \"$MODEL\" \"$INTERNAL_TOKEN\" > /root/.openclaw/openclaw.json && \
     export ANTHROPIC_API_KEY=\"$API_KEY\"; \
   fi && \
   cd /root/.openclaw/workspace && \
