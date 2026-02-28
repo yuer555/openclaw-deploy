@@ -76,9 +76,16 @@ chmod -R 755 /opt/openclaw
 print_success "数据目录创建完成（含 shared-files）"
 
 #------------------------------------------------------------------------------
-# 步骤 4: 构建 Docker 镜像（仅 Agent）
+# 步骤 4: 构建 Docker 镜像（base + agents）
 #------------------------------------------------------------------------------
-print_step "步骤 4/4: 构建 Agent 镜像"
+print_step "步骤 4/4: 构建 Docker 镜像"
+
+print_info "构建 openclaw-base:latest（含 openclaw 依赖，可缓存）..."
+docker build \
+    -f ../config/Dockerfile.base \
+    -t openclaw-base:latest \
+    ..
+print_success "openclaw-base:latest 构建完成"
 
 for ROLE in dispatcher operation product development testing service; do
     print_info "构建 openclaw-agent-${ROLE}:prod ..."

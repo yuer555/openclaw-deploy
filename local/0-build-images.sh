@@ -24,6 +24,13 @@ print_step()    { echo -e "\n${BLUE}━━━━━━━━━━━━━━�
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
+print_step "构建 Base 镜像（openclaw-base:latest）"
+docker build \
+    -f config/Dockerfile.base \
+    -t openclaw-base:latest \
+    .
+print_success "openclaw-base:latest 构建完成"
+
 print_step "构建 Gateway 镜像（openclaw-gateway:local）"
 docker build \
     -f src/gateway/Dockerfile.gateway \
@@ -35,7 +42,7 @@ print_step "构建 Agent 镜像（5 个角色）"
 
 for ROLE in operation product development testing service; do
     print_info "构建 openclaw-agent-${ROLE}:local ..."
-    docker build \
+    docker build --no-cache \
         -f config/Dockerfile.agents \
         --build-arg ROLE=${ROLE} \
         -t openclaw-agent-${ROLE}:local \
