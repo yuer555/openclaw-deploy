@@ -269,8 +269,9 @@ class AIDispatcher:
     """通过 openclaw API 调用调度员分析意图，返回目标 agent"""
 
     def route(self, message: str, user_id: str = 'anonymous') -> tuple:
-        """分析消息意图，返回 (agent_id, agent_url, direct_reply)
+        """分析消息意图，返回 (agent_id, agent_url, direct_reply, context)
         当 direct_reply 不为 None 时，表示调度员直接回答，不路由到员工
+        context: 调度员压缩的上下文摘要，路由时传递给下游 agent
         """
         # 注入上次路由结果和 agent 回复，帮助调度员理解上下文
         last = _get_last_route(user_id)
@@ -309,29 +310,48 @@ class AIDispatcher:
                         except json.JSONDecodeError:
                             pass
 
+                    # 截断 JSON 恢复：dispatcher 回复过长被截断时，尝试提取已有字段
+                    if not dispatch_data:
+                        # 匹配 {"action":"reply","message":"...（被截断）
+                        m_reply = _re.search(r'\{"action"\s*:\s*"reply"\s*,\s*"message"\s*:\s*"', reply_text)
+                        if m_reply:
+                            msg_start = m_reply.end()
+                            # 取截断的 message 内容，去掉末尾不完整的字符
+                            truncated_msg = reply_text[msg_start:].rstrip('"}\n\r ')
+                            if truncated_msg:
+                                logger.warning(f"截断 JSON 恢复(reply): 提取到 {len(truncated_msg)} 字")
+                                dispatch_data = {'action': 'reply', 'message': truncated_msg + '...'}
+                        # 匹配 {"action":"route","agent":"xxx"...（被截断）
+                        if not dispatch_data:
+                            m_route = _re.search(r'\{"action"\s*:\s*"route"\s*,\s*"agent"\s*:\s*"(\w+)"', reply_text)
+                            if m_route:
+                                logger.warning(f"截断 JSON 恢复(route): agent={m_route.group(1)}")
+                                dispatch_data = {'action': 'route', 'agent': m_route.group(1)}
+
                 if dispatch_data and isinstance(dispatch_data, dict):
                     action = dispatch_data.get('action', '')
+                    route_context = dispatch_data.get('context', '')
                     if action == 'reply':
                         direct_msg = dispatch_data.get('message', '')
                         logger.info("AI 路由结果: dispatcher 直接回复")
-                        return 'dispatcher', None, direct_msg
+                        return 'dispatcher', None, direct_msg, None
                     elif action == 'route':
                         agent_id = dispatch_data.get('agent', 'service')
                         if agent_id in AGENT_REGISTRY:
-                            logger.info(f"AI 路由结果: {agent_id}")
-                            return agent_id, AGENT_REGISTRY[agent_id]['url'], None
+                            logger.info(f"AI 路由结果: {agent_id}" + (f"，上下文: {route_context[:100]}" if route_context else ""))
+                            return agent_id, AGENT_REGISTRY[agent_id]['url'], None, route_context
 
                 # fallback: 旧格式兼容（纯 agent ID）
                 agent_id = reply_text.lower().split()[0] if reply_text else 'service'
                 if agent_id in AGENT_REGISTRY:
                     logger.info(f"AI 路由结果（旧格式）: {agent_id}")
-                    return agent_id, AGENT_REGISTRY[agent_id]['url'], None
+                    return agent_id, AGENT_REGISTRY[agent_id]['url'], None, None
 
             logger.warning("AI 路由失败：dispatcher 无有效回复")
         except Exception as e:
             logger.warning(f"AI 路由异常: {e}，直接回复")
 
-        return 'dispatcher', None, '抱歉，我暂时无法处理这个请求，请稍后再试。'
+        return 'dispatcher', None, '抱歉，我暂时无法处理这个请求，请稍后再试。', None
 
 
 _dispatcher = AIDispatcher()
@@ -611,7 +631,7 @@ def _default_shared_files_base():
     return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'shared-files')
 
 SHARED_FILES_BASE = os.getenv('SHARED_FILES_BASE', _default_shared_files_base())
-CONTAINER_FILES_BASE = os.getenv('CONTAINER_FILES_BASE', 'shared-files')
+CONTAINER_FILES_BASE = os.getenv('CONTAINER_FILES_BASE', '/root/.openclaw/workspace/shared-files')
 
 
 def _get_today_dir():
@@ -624,7 +644,7 @@ def _get_today_dir():
 
 def host_path_to_container_path(host_path):
     """将宿主机文件路径转换为容器内路径
-    /opt/openclaw/shared-files/2026-02-27/file.md → /shared-files/2026-02-27/file.md
+    /opt/openclaw/shared-files/2026-02-27/file.md → /root/.openclaw/workspace/shared-files/2026-02-27/file.md
     """
     if host_path and host_path.startswith(SHARED_FILES_BASE):
         return CONTAINER_FILES_BASE + host_path[len(SHARED_FILES_BASE):]
@@ -862,7 +882,7 @@ def process_message_async(user_id, dispatcher_content, full_content, task_id, re
     """异步处理消息：先路由，再调用 agent 或直接回复，最后用 response_url 主动回复"""
     def worker():
         try:
-            agent_id, agent_url, direct_reply = route_message(dispatcher_content, user_id)
+            agent_id, agent_url, direct_reply, route_context = route_message(dispatcher_content, user_id)
             log_task(task_id, user_id, agent_id, dispatcher_content, status='processing')
 
             if direct_reply:
@@ -870,7 +890,14 @@ def process_message_async(user_id, dispatcher_content, full_content, task_id, re
                 reply = f"【调度员】\n{direct_reply}"
                 update_task_status(task_id, 'success', reply[:500])
             else:
-                result = call_openclaw_agent(agent_id, full_content, user_id, task_id, gateway_url=agent_url)
+                # 拼接调度员上下文摘要 + 当前消息，让 agent 了解完整诉求
+                agent_message = full_content
+                if route_context:
+                    # 限制 context 长度，防止 dispatcher 输出过长的摘要
+                    if len(route_context) > 500:
+                        route_context = route_context[:500] + '...'
+                    agent_message = f"[调度员上下文] {route_context}\n\n用户消息：{full_content}"
+                result = call_openclaw_agent(agent_id, agent_message, user_id, task_id, gateway_url=agent_url)
                 reply = result.get('reply', '处理失败，请稍后再试。')
                 # 记录 agent 回复到路由上下文，供下次调度员参考
                 _record_route(user_id, agent_id, reply[:500])

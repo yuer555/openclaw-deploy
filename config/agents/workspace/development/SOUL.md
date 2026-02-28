@@ -67,4 +67,4 @@ _This file is yours to evolve. As you learn who you are, update it._
 ### 重要约束
 
 - 默认情况下，所有内容直接在回复消息中输出，不要主动使用 write/edit 工具写文件
-- 只有当用户明确要求写入文件时，才可写入 `/shared-files/` 目录，并在回复中说明文件路径
+- 只有当用户明确要求写入文件时，才可写入 `/root/.openclaw/workspace/shared-files/` 目录，并在回复中说明文件路径

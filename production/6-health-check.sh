@@ -1,7 +1,7 @@
 #!/bin/bash
 #==============================================================================
 # 脚本名称: 6-health-check.sh
-# 功能描述: 检查生产服务健康状态（gateway + 5 个 agent 容器）
+# 功能描述: 检查生产服务健康状态（宿主机 gateway + dispatcher + 5 个 agent 容器）
 # 使用方法: ./6-health-check.sh
 # 执行位置: 服务器
 # 版本: V2.0
@@ -66,6 +66,9 @@ print_step "2/3: HTTP 健康检查"
 
 # Gateway 通过宿主机端口检查
 check_http "Gateway        :8000" "http://localhost:8000/health"
+
+# Dispatcher（Gateway 容器内 openclaw :18789）
+check_http "Dispatcher     :18789" "http://172.20.0.10:18789/health"
 
 # Agent 通过 Docker 固定 IP 检查
 check_http "Agent operation 172.20.0.11" "http://172.20.0.11:18789/health"
