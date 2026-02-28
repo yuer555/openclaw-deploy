@@ -16,6 +16,7 @@ import threading
 import mimetypes
 import re as _re
 import subprocess
+import websocket
 
 app = Flask(__name__)
 
@@ -43,7 +44,7 @@ OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '2700'))
 # OpenClaw 内部通信 Token
 OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-internal-secret')
 
-# 通信协议：http / sse / exec（默认 sse）
+# 通信协议：http / sse / ws / exec（默认 sse）
 OPENCLAW_PROTOCOL = os.getenv('OPENCLAW_PROTOCOL', 'sse')
 
 # Docker Exec 调度员容器名
@@ -179,6 +180,60 @@ def _call_openclaw_exec(url, message, session_key, timeout=2700):
         return reply_text
 
 
+def _call_openclaw_ws(url, message, session_key, timeout=2700):
+    """WebSocket 协议调用：connect 握手 + chat.send，监听 chat state=final 获取回复"""
+    ws_url = url.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
+    ws = websocket.create_connection(ws_url, timeout=timeout)
+    try:
+        # Step 1: 收 challenge
+        ws.recv()  # connect.challenge（无需处理）
+
+        # Step 2: connect 握手
+        ws.send(json.dumps({
+            "type": "req", "id": "connect-1", "method": "connect",
+            "params": {
+                "client": {"id": "cli", "mode": "cli", "platform": "linux", "version": "2026.2.28"},
+                "auth": {"token": OPENCLAW_INTERNAL_TOKEN},
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write"],
+                "minProtocol": 3, "maxProtocol": 3
+            }
+        }))
+        hello = json.loads(ws.recv())
+        if not hello.get('ok'):
+            raise Exception(f"WS connect 失败: {hello.get('error')}")
+
+        # Step 3: chat.send
+        req_id = str(uuid.uuid4())
+        ws.send(json.dumps({
+            "type": "req", "id": req_id, "method": "chat.send",
+            "params": {
+                "message": message,
+                "sessionKey": session_key,
+                "idempotencyKey": str(uuid.uuid4())
+            }
+        }))
+
+        # 监听事件流，chat state=final 包含完整回复
+        while True:
+            raw = ws.recv()
+            evt = json.loads(raw)
+            if evt.get('type') == 'event' and evt.get('event') == 'chat':
+                payload = evt.get('payload', {})
+                if payload.get('state') == 'final':
+                    msg = payload.get('message', {})
+                    texts = []
+                    for c in msg.get('content', []):
+                        if c.get('type') == 'text' and c.get('text'):
+                            texts.append(c['text'])
+                    return '\n'.join(texts).strip()
+            # RPC 错误
+            if evt.get('type') == 'res' and evt.get('id') == req_id and not evt.get('ok'):
+                raise Exception(f"WS RPC 错误: {evt.get('error')}")
+    finally:
+        ws.close()
+
+
 def _call_openclaw(url, message, session_key, timeout=2700):
     """统一调用入口，根据 OPENCLAW_PROTOCOL 选择协议"""
     protocol = OPENCLAW_PROTOCOL.lower()
@@ -188,6 +243,14 @@ def _call_openclaw(url, message, session_key, timeout=2700):
 
     elif protocol == 'exec':
         return _call_openclaw_exec(url, message, session_key, timeout)
+
+    elif protocol == 'ws':
+        try:
+            return _call_openclaw_ws(url, message, session_key, timeout)
+        except Exception as e:
+            logger.warning(f"WS 调用失败: {e}，尝试重试")
+            retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
+            return _call_openclaw_ws(url, retry_msg, session_key, timeout)
 
     else:  # 默认 sse
         try:
