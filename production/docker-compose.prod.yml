@@ -30,6 +30,7 @@ services:
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
       - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-6}
+      - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
     ports:
       - "18789:18789"
     volumes:
@@ -68,6 +69,7 @@ services:
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
       - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
     expose:
       - "18789"
     volumes:
@@ -103,6 +105,7 @@ services:
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
       - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
     expose:
       - "18789"
     volumes:
@@ -138,6 +141,7 @@ services:
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
       - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
     expose:
       - "18789"
     volumes:
@@ -173,6 +177,7 @@ services:
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
       - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
     expose:
       - "18789"
     volumes:
@@ -208,6 +213,7 @@ services:
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
       - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
     expose:
       - "18789"
     volumes:
