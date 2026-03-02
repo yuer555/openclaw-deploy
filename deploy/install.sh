@@ -20,6 +20,7 @@ fi
 INSTALL_DIR="/opt/openclaw/gateway"
 DATA_DIR="/opt/openclaw/data"
 LOG_DIR="/var/log/openclaw"
+VENV_DIR="/opt/openclaw/gateway/venv"
 USER="openclaw"
 GROUP="openclaw"
 
@@ -41,7 +42,7 @@ echo "📦 步骤 2/8: 安装系统依赖..."
 case $OS in
     ubuntu|debian)
         apt-get update -qq
-        apt-get install -y -qq python3 python3-pip python3-venv sqlite3 curl wget git
+        apt-get install -y -qq python3 python3-pip python3-venv python3-full sqlite3 curl wget git
         ;;
     centos|rhel|rocky|almalinux)
         yum install -y -q python3 python3-pip sqlite curl wget git
@@ -101,10 +102,17 @@ fi
 
 echo "   ✅ 代码文件复制完成"
 
-# 步骤 6: 安装 Python 依赖
+# 步骤 6: 创建 venv 并安装 Python 依赖
 echo ""
-echo "🐍 步骤 6/8: 安装 Python 依赖..."
-pip3 install -q -r "$INSTALL_DIR/src/gateway/requirements.txt"
+echo "🐍 步骤 6/8: 创建 Python 虚拟环境并安装依赖..."
+if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR"
+    echo "   ✅ 虚拟环境已创建: $VENV_DIR"
+else
+    echo "   虚拟环境已存在，跳过创建"
+fi
+"$VENV_DIR/bin/pip" install -q --upgrade pip
+"$VENV_DIR/bin/pip" install -q -r "$INSTALL_DIR/src/gateway/requirements.txt"
 echo "   ✅ Python 依赖安装完成"
 
 # 步骤 7: 设置权限
@@ -115,6 +123,7 @@ chown -R "$USER:$GROUP" "$DATA_DIR"
 chown -R "$USER:$GROUP" "$LOG_DIR"
 chmod 600 "$INSTALL_DIR/.env"
 chmod +x "$INSTALL_DIR/scripts/manage-agent.py"
+chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
 echo "   ✅ 权限设置完成"
 
 # 步骤 8: 安装并启动 systemd 服务
@@ -147,7 +156,7 @@ if systemctl is-active --quiet openclaw-gateway.service; then
     echo "下一步操作:"
     echo "  1. 编辑配置: sudo nano $INSTALL_DIR/.env"
     echo "  2. 重启服务: sudo systemctl restart openclaw-gateway"
-    echo "  3. 添加 Agent: cd $INSTALL_DIR && sudo -u $USER python3 scripts/manage-agent.py add <name>"
+    echo "  3. 添加 Agent: cd $INSTALL_DIR && sudo -u $USER $VENV_DIR/bin/python scripts/manage-agent.py add <name>"
     echo "  4. 查看日志: sudo journalctl -u openclaw-gateway -f"
     echo "  5. 查看状态: sudo systemctl status openclaw-gateway"
     echo ""
