@@ -881,6 +881,27 @@ def wecom_callback(agent_name):
             return jsonify({}), 500
 
 
+@app.route('/wecom/callback', methods=['GET', 'POST'])
+def wecom_callback_legacy():
+    """
+    兼容旧版路径的回调接口
+    自动路由到第一个启用的 Agent（临时兼容方案）
+    
+    ⚠️  建议：修改企业微信回调 URL 为 /{agent_name}/wecom/callback
+    """
+    if not AGENTS:
+        logger.error("没有启用任何 Agent")
+        return jsonify({'error': 'no agents enabled'}), 500
+    
+    # 使用第一个启用的 Agent（或根据其他逻辑选择）
+    default_agent = list(AGENTS.keys())[0]
+    logger.warning(f"⚠️  使用旧版路径 /wecom/callback，自动路由到: {default_agent}")
+    logger.warning(f"⚠️  建议修改企业微信回调 URL 为: /{default_agent}/wecom/callback")
+    
+    # 重定向到对应的 agent 路由处理
+    return wecom_callback(default_agent)
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """健康检查接口"""
