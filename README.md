@@ -1,132 +1,225 @@
-# OpenClaw V1.4 - 企业微信虚拟员工系统
+# OpenClaw 企业微信桥接网关
 
-> 🤖 基于 OpenClaw AI 框架的智能虚拟员工系统，支持企业微信集成
+将企业微信机器人消息桥接到 [OpenClaw](https://openclaw.ai) AI Agent 的轻量级网关。
 
-## 📖 项目简介
+Gateway **不管理** OpenClaw 的部署、容器或镜像 — 它只负责消息转发。
+你只需要告诉 Gateway：OpenClaw 的地址和认证 Token。
 
-OpenClaw 企业微信虚拟员工系统提供多角色 AI 助手，支持企业微信接入：
-- 🎯 **调度员** - 智能任务分发
-- 📊 **运营专员** - 运营数据分析
-- 🎨 **产品经理** - 产品需求管理
-- 💻 **开发工程师** - 技术支持
-- 🧪 **测试工程师** - 质量保障
-- 🎧 **客服专员** - 客户服务
+## 特性
 
-### 🌟 支持平台
+- **纯桥接模式** — Gateway 仅做企业微信与 OpenClaw 之间的消息转发
+- **多 Agent 支持** — 每个 Agent 对接一个企业微信机器人，一对一绑定
+- **灵活部署** — 单实例多 Agent / 多实例 / 混合模式，自动兼容
+- **SQLite 存储** — Agent 绑定关系持久化，通过管理脚本操作
+- **多协议** — 支持 WebSocket（默认）、SSE、HTTP 三种通信协议
+- **会话隔离** — 按 Agent + 企业微信用户自动隔离会话
 
-- **企业微信** - 企业内部协作首选
+## 部署模式
 
-## 🚀 快速开始
+```
+模式 A：单 OpenClaw 实例 + 多 Agent
+  企业微信A ──► /dev/wecom/callback  ──┐
+  企业微信B ──► /ops/wecom/callback  ──┼──► 同一个 OpenClaw（不同 agent_id）
+  企业微信C ──► /svc/wecom/callback  ──┘
 
-### 第一步：选择部署方式
+模式 B：多 OpenClaw 实例
+  企业微信A ──► /dev/wecom/callback  ──► OpenClaw 实例 1
+  企业微信B ──► /ops/wecom/callback  ──► OpenClaw 实例 2
 
-#### 🏠 **本地测试**（推荐先做）
-适合：在自己电脑上测试功能，熟悉系统
-```bash
-cd local/
-cat README.md  # 查看详细说明
+模式 C：混合
+  企业微信A ──► /dev/wecom/callback  ──┐
+  企业微信B ──► /ops/wecom/callback  ──┼──► OpenClaw 实例 1（不同 agent_id）
+  企业微信C ──► /svc/wecom/callback  ──────► OpenClaw 实例 2
 ```
 
-#### 🚀 **生产部署**（正式使用）
-适合：部署到云服务器，供团队使用
+无需额外配置，Gateway 根据 SQLite 中的绑定关系自动路由。
+
+## 快速开始
+
+### 环境要求
+
+- Python 3.10+
+- 已部署并运行的 OpenClaw 实例（需要其 URL 和 Token）
+- 企业微信应用（需要 Token 和 EncodingAESKey）
+
+### 1. 安装依赖
+
 ```bash
-cd production/
-cat README.md  # 查看详细说明
+pip3 install -r src/gateway/requirements.txt
 ```
 
-### 第二步：查看文档
+### 2. 配置环境变量
 
 ```bash
-docs/
-├── 00-项目介绍.md           # 📚 系统介绍和架构
-├── 01-本地测试指南.md       # 🏠 本地测试完整教程
-├── 02-生产部署指南.md       # 🚀 生产环境部署教程
-├── 03-企业微信配置.md       # 💬 企业微信对接配置
-├── 04-虚拟员工配置.md       # 🤖 虚拟员工角色配置
-├── 05-GitHub-Copilot配置.md # 🧠 AI 模型配置
-├── 06-常见问题.md           # ❓ FAQ 和解决方案
-├── 07-故障排查.md           # 🔧 问题诊断指南
+cp .env.example .env
+# 编辑 .env，按需修改
 ```
 
-## 📁 项目结构
+环境变量说明：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DB_PATH` | `/opt/openclaw/data/gateway/gateway.db` | SQLite 数据库路径 |
+| `GATEWAY_PORT` | `8000` | Gateway 监听端口 |
+| `OPENCLAW_PROTOCOL` | `ws` | 通信协议：`ws` / `sse` / `http` |
+| `OPENCLAW_TIMEOUT` | `2700` | OpenClaw 调用超时（秒） |
+| `GATEWAY_URL` | `http://localhost:8000` | Gateway 地址（管理脚本用于通知重载） |
+
+### 3. 启动 Gateway
+
+```bash
+python3 src/gateway/wecom_gateway.py
+```
+
+首次启动时无 Agent，Gateway 正常运行但不处理任何消息。
+
+### 4. 添加 Agent
+
+```bash
+python3 scripts/manage-agent.py add dev
+```
+
+按提示依次输入：
+- **显示名** — 如"开发工程师小明"
+- **企业微信 Token** — 企业微信应用的 Token
+- **企业微信 AES Key** — 企业微信应用的 EncodingAESKey
+- **OpenClaw 地址** — 如 `http://10.0.1.5:18789`
+- **OpenClaw Token** — OpenClaw 的认证 Token
+- **OpenClaw Agent ID** — 回车跳过则使用默认 `main`
+
+添加成功后，将企业微信回调地址设为：
+
+```
+https://your-domain/dev/wecom/callback
+```
+
+### 5. 验证
+
+```bash
+# 健康检查
+curl http://localhost:8000/health
+
+# 查看已绑定的 Agent
+curl http://localhost:8000/admin/agents
+```
+
+## Agent 管理
+
+所有 Agent 绑定通过 `scripts/manage-agent.py` 管理：
+
+```bash
+# 添加 Agent（交互式）
+python3 scripts/manage-agent.py add <name>
+
+# 列出所有 Agent
+python3 scripts/manage-agent.py list
+
+# 更新 Agent（交互式，回车保持原值不变）
+python3 scripts/manage-agent.py update <name>
+
+# 删除 Agent（需确认）
+python3 scripts/manage-agent.py remove <name>
+```
+
+管理脚本在添加/更新/删除后会自动通知 Gateway 重载配置，无需重启。
+
+## API 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/POST | `/{agent_name}/wecom/callback` | 企业微信回调（按 Agent 路由） |
+| GET/POST | `/wecom/callback` | 旧版兼容路径 |
+| GET | `/health` | 健康检查 |
+| GET | `/stats` | 统计信息 |
+| GET | `/admin/agents` | 列出所有 Agent 绑定 |
+| POST | `/admin/reload` | 重载 Agent 配置 |
+
+## 消息处理流程
+
+```
+企业微信用户发消息
+       │
+       ▼
+GET/POST /{agent_name}/wecom/callback
+       │
+       ├─ 从 SQLite 查找 agent 配置（未找到 → 404）
+       │
+       ├─ 用该 agent 的 wecom_token/aes_key 解密验签
+       │
+       ├─ 提取 user_id, content
+       │
+       ├─ 构造 session_key = "wecom:{agent_name}:{user_id}"
+       │
+       ├─ 调用 OpenClaw（WS/SSE/HTTP）
+       │   ├─ URL:      agent 的 openclaw_url
+       │   ├─ Token:    agent 的 openclaw_token
+       │   ├─ Agent ID: agent 的 openclaw_agent_id（默认 main）
+       │   └─ Session:  session_key
+       │
+       └─ 收到回复 → 通过企业微信回复用户
+```
+
+## 项目结构
 
 ```
 openclaw-deploy/
-├── 📚 docs/                   文档中心
-├── 🏠 local/                  本地测试环境（包含完整的测试脚本）
-├── 🚀 production/             生产部署环境（包含完整的部署脚本）
-├── ⚙️  config/                 配置文件（虚拟员工、Nginx、SSL）
-├── 🔧 scripts/                通用工具脚本（备份、恢复、监控）
-└── 🗄️  data/                   数据目录（自动生成）
+├── src/gateway/
+│   ├── wecom_gateway.py      # Gateway 主程序
+│   └── requirements.txt      # Python 依赖
+├── scripts/
+│   └── manage-agent.py       # Agent 绑定管理工具
+├── .env.example              # 环境变量模板
+├── AGENTS.md                 # AI 编码助手指南
+└── PHASE2-PLAN.md            # 架构方案文档
 ```
 
-## ✨ 核心特性
+## 数据库
 
-- ✅ **零基础部署** - 小白友好的脚本和文档
-- ✅ **本地测试** - 快速验证功能，无需服务器
-- ✅ **一键部署** - 自动化脚本，减少人工操作
-- ✅ **多角色支持** - 6 种虚拟员工角色
-- ✅ **企业微信集成
-- ✅ **安全可靠** - Docker 隔离，SSL 加密
-- ✅ **GitHub Copilot** - 支持最新 AI 模型
+Gateway 使用 SQLite 存储 Agent 绑定关系，数据库路径由 `DB_PATH` 环境变量指定。
 
-## 🎯 快速导航
+### agents 表
 
-### 新手入门
-1. 📖 阅读 `docs/00-项目介绍.md` 了解系统
-2. 🏠 按照 `docs/01-本地测试指南.md` 在本地测试
-3. 🚀 按照 `docs/02-生产部署指南.md` 部署到服务器
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | TEXT (PK) | 路由标识，用于 URL 路径 |
+| `display_name` | TEXT | 显示名称 |
+| `wecom_token` | TEXT | 企业微信 Token |
+| `wecom_aes_key` | TEXT | 企业微信 EncodingAESKey |
+| `openclaw_url` | TEXT | OpenClaw 地址 |
+| `openclaw_token` | TEXT | OpenClaw 认证 Token |
+| `openclaw_agent_id` | TEXT | OpenClaw Agent ID（空 = 默认 main） |
+| `created_at` | TEXT | 创建时间 |
+| `updated_at` | TEXT | 更新时间 |
 
-### 已有经验
-- 本地测试：`cd local/ && ./1-init-local.sh`
-- 生产部署：`cd production/ && ./1-prepare-server.sh`
+### task_logs 表
 
-## 📋 系统要求
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `task_id` | TEXT (PK) | 任务 ID |
+| `user_id` | TEXT | 用户 ID |
+| `agent_id` | TEXT | Agent 标识 |
+| `task_content` | TEXT | 任务内容 |
+| `status` | TEXT | 状态 |
+| `result` | TEXT | 结果 |
+| `created_at` | TIMESTAMP | 创建时间 |
+| `updated_at` | TIMESTAMP | 更新时间 |
 
-### 本地测试
-- macOS 或 Linux
-- Docker Desktop 已安装
-- 8GB+ 内存
-- 5GB+ 磁盘空间
+### 常用查询
 
-### 生产部署
-- Ubuntu 22.04 LTS 服务器
-- 8核16GB+ 内存（推荐 16核32GB）
-- 50GB+ 磁盘空间
-- 公网 IP 和域名（已备案）
-- 企业微信管理员权限
+```bash
+# 查看数据库结构
+sqlite3 $DB_PATH ".schema"
 
-## 🛠️ 技术栈
+# 查看所有 Agent 绑定
+sqlite3 $DB_PATH "SELECT name, display_name, openclaw_url FROM agents;"
 
-- **AI 框架**: OpenClaw
-- **容器化**: Docker & Docker Compose
-- **数据库**: PostgreSQL
-- **反向代理**: Nginx
-- **SSL**: Let's Encrypt
-- **监控**: Prometheus + Grafana（可选）
+# 查看任务统计
+sqlite3 $DB_PATH "SELECT COUNT(*), status FROM task_logs GROUP BY status;"
+```
 
-## 📞 获取帮助
+## 注意事项
 
-### 遇到问题？
-1. 查看 `docs/06-常见问题.md`
-2. 查看 `docs/07-故障排查.md`
-3. 运行健康检查：`./production/6-health-check.sh`
-
-### 社区支持
-- 📚 [官方文档](https://docs.openclaw.ai)
-- 💬 [Discord 社区](https://discord.com/invite/clawd)
-- 🐙 [GitHub Issues](https://github.com/openclaw/openclaw/issues)
-
-## 📝 版本信息
-
-- **当前版本**: V1.4
-- **发布日期**: 2026-02-24
-- **维护团队**: OpenClaw Team
-
-## 📄 许可证
-
-MIT License - 详见 LICENSE 文件
-
----
-
-**💡 提示**: 建议先在本地测试，熟悉系统后再部署到生产环境！
+- **安全**：不要将 `.env` 和 `*.db` 文件提交到 Git
+- **首次启动**：Gateway 正常启动但无 Agent，需通过 `manage-agent.py` 添加
+- **热重载**：添加/删除 Agent 后管理脚本自动通知 Gateway，无需重启
+- **数据目录**：`data/` 目录在运行时自动创建，已在 `.gitignore` 中排除

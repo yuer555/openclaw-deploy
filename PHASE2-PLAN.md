@@ -1,378 +1,414 @@
-# 阶段 2 方案：动态角色管理架构
+# 阶段 2 方案：企业微信桥接器 + 动态 Agent 绑定
 
-> 基于阶段 1（去除 Dispatcher，多 Agent 配置化部署）的成果，进行全面架构重构。
-> 从分支 `20260302_feat_remove_dispatcher` 拉新分支实施。
-
----
-
-## 一、原始诉求
-
-| # | 诉求 | 说明 |
-|---|------|------|
-| 1 | 精简脚本 | 去除 local/ 和 production/ 下的冗余脚本，只保留 5 个核心脚本 |
-| 2 | 自定义角色 | 放弃预设的 5 个固定角色，改为完全自定义。基于 openclaw 原有的 5 个 .md 文件，采用"在原有基础上追加"的方式 |
-| 3 | SQLite + 交互式管理脚本 | 角色定义存储在 SQLite 中，提供交互式脚本支持新增/删除角色。新增后自动注册 Gateway、自动构建并启动容器 |
-| 4 | 首次启动无 Agent | 服务首次启动时是空的，所有 Agent 通过管理脚本添加。同名角色支持更新（需确认提示） |
-| 5 | workspace 持久化 | 容器重建不丢失 memory（记忆），设计合理的 workspace 管理方案 |
+> **核心转变**：Gateway 不再管理 openclaw 的部署/容器/镜像，退化为纯粹的"企业微信 <-> openclaw 桥接器"。
+> openclaw 怎么部署、跑在哪里，完全不关心。Gateway 只需要知道 openclaw 的地址和 token。
+>
+> 分支：`20260302_feat_wecom_bridging`（基于 `20260302_feat_remove_dispatcher`）
 
 ---
 
-## 二、遗漏分析
+## 一、诉求
 
-### 诉求本身需要补充的点
-
-| 诉求 | 遗漏 / 需要补充 |
-|------|-----------------|
-| 1. 精简脚本 | local/ 和 production/ 是否合并为统一脚本目录？scripts/ 下 12 个旧脚本如何处理？ |
-| 2. 自定义角色 | 角色名的合法字符规则（用于容器名、URL 路径、环境变量前缀）；是否支持中文角色名 |
-| 3. SQLite + 管理脚本 | Gateway 如何"热感知"新角色（重启 vs 信号 vs API）；docker-compose 是静态的，如何动态管理容器；端口分配策略 |
-| 4. 首次启动无 Agent | Gateway 在无 Agent 时的行为（健康检查返回什么？）；管理入口是 Web 界面还是纯 CLI |
-| 5. workspace 持久化 | 持久化的范围（memory? 对话历史? AGENTS.md 修改?）；更新角色时持久化数据如何处理；备份/恢复策略 |
-
-### 额外遗漏的 6 个问题
-
-| # | 遗漏点 | 说明 |
-|---|--------|------|
-| A | docker-compose 静态 vs 动态 | 现在 docker-compose.yml 里硬编码 5 个 service，动态角色场景下不能继续用静态 compose。方案：放弃 compose 管理 agent 容器，改用 `docker run` 直接管理 |
-| B | 端口冲突检测 | 动态分配端口需要检测宿主机端口是否被占用 |
-| C | 角色删除的清理 | 删除角色时需要：停容器 → 删容器 → 删镜像 → 清理 Gateway 注册 → 可选删除持久化数据 |
-| D | Gateway 重启后的角色恢复 | Gateway 重启时需要从 SQLite 重新加载所有角色，而不是从环境变量。这是架构范式的根本转变 |
-| E | 角色定义文件的默认内容 | openclaw 原生的 AGENTS.md / SOUL.md 等有默认内容，用户要"在此基础上追加"。需要把默认内容存储在代码仓库中作为模板 |
-| F | 多机部署 / 迁移 | SQLite 是单机的，迁移到新服务器需要考虑 SQLite + 持久化数据的导出/导入 |
+| # | 诉求 |
+|---|------|
+| 1 | Gateway 仅做企业微信桥接，不管理 openclaw |
+| 2 | 支持单 openclaw 实例多 agent + 多实例多 agent + 混合模式 |
+| 3 | 一个 agent 对接一个企业微信机器人（一对一绑定） |
+| 4 | session 按企业微信消息来源的 userId 隔离 |
+| 5 | 使用 SQLite 做 agent 与企业微信机器人的绑定关系 |
+| 6 | 提供 Python 管理脚本：新增/删除绑定 |
+| 7 | 首次启动时无 agent，全部通过管理脚本添加 |
 
 ---
 
-## 三、整体架构
+## 二、架构
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                          宿主机                                    │
-│                                                                    │
-│  ┌──────────────────────────────────┐                              │
-│  │      Gateway (Flask :8000)       │                              │
-│  │                                  │                              │
-│  │  /{role}/wecom/callback ─────────┼──► 动态路由表（从 SQLite）   │
-│  │  /admin/agents (管理 API)        │                              │
-│  │                                  │                              │
-│  │  SQLite: gateway.db              │                              │
-│  │   ├─ agents 表（角色注册信息）    │                              │
-│  │   ├─ agent_files 表（角色定义）   │                              │
-│  │   ├─ sessions 表                 │                              │
-│  │   └─ message_queue 表            │                              │
-│  └──────────┬───────────────────────┘                              │
-│             │                                                      │
-│  ┌──────────▼───────────────────────┐                              │
-│  │    manage-agent.sh (管理脚本)     │                              │
-│  │                                  │                              │
-│  │  add <name>     → 交互式创建角色  │                              │
-│  │  remove <name>  → 删除角色        │                              │
-│  │  list           → 列出所有角色    │                              │
-│  │  update <name>  → 更新角色定义    │                              │
-│  │  status         → 查看容器状态    │                              │
-│  └──────────────────────────────────┘                              │
-│                                                                    │
-│  /opt/openclaw/                                                    │
-│   ├─ data/gateway/gateway.db          ← Gateway 数据库             │
-│   ├─ data/agents/{role}/              ← 角色持久化数据             │
-│   │   ├─ workspace/                   ← workspace 持久化           │
-│   │   │   ├─ memory/                  ← 对话记忆                   │
-│   │   │   ├─ MEMORY.md               ← 长期记忆                   │
-│   │   │   └─ shared-files/            ← 共享文件                   │
-│   │   └─ agents/                      ← openclaw 配置数据          │
-│   └─ shared-files/                    ← 全局共享文件               │
-│                                                                    │
-│  Docker 容器（每个角色一个，docker run 管理）                       │
-│  ┌─────────────────────┐  ┌─────────────────────┐                  │
-│  │ openclaw-agent-XXX  │  │ openclaw-agent-YYY  │  ...             │
-│  │  :自动分配端口→18789│  │  :自动分配端口→18789│                  │
-│  │                     │  │                     │                  │
-│  │  volumes:           │  │  volumes:           │                  │
-│  │  宿主data→容器wksp  │  │  宿主data→容器wksp  │                  │
-│  └─────────────────────┘  └─────────────────────┘                  │
-└────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Gateway（Flask :8000）                          │
+│                     纯企业微信桥接器，不管理 openclaw                │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────┐      │
+│  │  SQLite: gateway.db                                       │      │
+│  │   └─ agents 表（agent ↔ 企业微信机器人 绑定关系）          │      │
+│  └───────────────────────────────────────────────────────────┘      │
+│                                                                     │
+│  路由: /{agent_name}/wecom/callback                                 │
+│                                                                     │
+│  收到企业微信消息后:                                                 │
+│   1. 从 SQLite 查 agent_name → openclaw_url, token, agent_id       │
+│   2. 解密企业微信消息 → user_id, content                            │
+│   3. 调用 openclaw（WS/SSE/HTTP）                                   │
+│   4. 把回复发回企业微信                                              │
+└──────────┬──────────────────────────┬───────────────────────────────┘
+           │                          │
+           ▼                          ▼
+  openclaw 实例 A                openclaw 实例 B
+  (url_a, token_a)              (url_b, token_b)
+  ┌──────────────┐              ┌──────────────┐
+  │ agent: main  │              │ agent: main  │
+  │ agent: dev   │              └──────────────┘
+  │ agent: ops   │
+  └──────────────┘
+```
+
+### 三种部署模式自动兼容
+
+```
+模式 A：单实例多 agent
+══════════════════════════════════════════════════════
+  企业微信A ──► /{dev}/wecom/callback   ──┐
+  企业微信B ──► /{ops}/wecom/callback   ──┼──► 同一个 openclaw
+  企业微信C ──► /{svc}/wecom/callback   ──┘    agent_id 不同
+
+  agents 表:
+  name  │ openclaw_url              │ openclaw_token │ openclaw_agent_id
+  ──────┼───────────────────────────┼────────────────┼──────────────────
+  dev   │ http://10.0.1.5:18789    │ secret-abc     │ dev
+  ops   │ http://10.0.1.5:18789    │ secret-abc     │ ops
+  svc   │ http://10.0.1.5:18789    │ secret-abc     │ svc
+
+
+模式 B：多实例各一个 agent
+══════════════════════════════════════════════════════
+  企业微信A ──► /{dev}/wecom/callback   ──► openclaw 实例 1
+  企业微信B ──► /{ops}/wecom/callback   ──► openclaw 实例 2
+
+  agents 表:
+  name  │ openclaw_url              │ openclaw_token │ openclaw_agent_id
+  ──────┼───────────────────────────┼────────────────┼──────────────────
+  dev   │ http://10.0.1.5:18789    │ secret-abc     │ (空，默认 main)
+  ops   │ http://10.0.1.6:18789    │ secret-xyz     │ (空，默认 main)
+
+
+模式 C：混合
+══════════════════════════════════════════════════════
+  企业微信A ──► /{dev}/wecom/callback   ──┐
+  企业微信B ──► /{ops}/wecom/callback   ──┼──► openclaw 实例 1
+  企业微信C ──► /{svc}/wecom/callback   ──────► openclaw 实例 2
+
+  agents 表:
+  name  │ openclaw_url              │ openclaw_token │ openclaw_agent_id
+  ──────┼───────────────────────────┼────────────────┼──────────────────
+  dev   │ http://10.0.1.5:18789    │ secret-abc     │ dev
+  ops   │ http://10.0.1.5:18789    │ secret-abc     │ ops
+  svc   │ http://10.0.1.6:18789    │ secret-xyz     │ (空，默认 main)
 ```
 
 ---
 
-## 四、SQLite 表设计
-
-### agents 表
+## 三、SQLite 表设计
 
 ```sql
 CREATE TABLE agents (
-    name            TEXT PRIMARY KEY,          -- 角色名（英文小写，如 'developer'）
-    display_name    TEXT NOT NULL,             -- 显示名（中文，如 '开发工程师'）
-    port            INTEGER NOT NULL UNIQUE,   -- 宿主机映射端口
-    wecom_token     TEXT NOT NULL,             -- 企业微信 Token
-    wecom_aes_key   TEXT NOT NULL,             -- 企业微信 EncodingAESKey
-    container_name  TEXT NOT NULL,             -- Docker 容器名
-    image_name      TEXT NOT NULL,             -- Docker 镜像名
-    status          TEXT DEFAULT 'stopped',    -- running / stopped / building / error
-    created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
+    name              TEXT PRIMARY KEY,          -- 路由名，URL路径标识（如 'dev'）
+    display_name      TEXT NOT NULL,             -- 显示名（如 '开发工程师小明'）
+    wecom_token       TEXT NOT NULL,             -- 企业微信 Token
+    wecom_aes_key     TEXT NOT NULL,             -- 企业微信 EncodingAESKey
+    openclaw_url      TEXT NOT NULL,             -- openclaw 地址（如 http://10.0.1.5:18789）
+    openclaw_token    TEXT NOT NULL,             -- openclaw 认证 token
+    openclaw_agent_id TEXT DEFAULT '',           -- openclaw agent id（空 = 默认 main）
+    created_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at        TEXT DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
-### agent_files 表
+**字段说明：**
 
-```sql
-CREATE TABLE agent_files (
-    agent_name  TEXT NOT NULL,
-    filename    TEXT NOT NULL,             -- AGENTS.md / IDENTITY.md / SOUL.md / TOOLS.md / USER.md
-    content     TEXT NOT NULL,             -- 文件内容
-    PRIMARY KEY (agent_name, filename),
-    FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
-);
-```
-
----
-
-## 五、角色创建流程
-
-`./manage-agent.sh add my-developer` 执行步骤：
-
-```
-1. 交互式输入
-   ├─ 显示名: "开发工程师小明"
-   ├─ 企业微信 Token: xxx
-   ├─ 企业微信 AES Key: xxx
-   └─ 角色定义文件:
-       ├─ IDENTITY.md  (打开编辑器，预填模板)
-       ├─ SOUL.md      (打开编辑器，预填模板)
-       ├─ AGENTS.md    (使用默认，可选编辑)
-       ├─ TOOLS.md     (使用默认，可选编辑)
-       └─ USER.md      (打开编辑器，预填模板)
-
-2. 写入 SQLite
-   ├─ agents 表插入记录
-   └─ agent_files 表插入 5 个文件
-
-3. 自动分配端口
-   └─ 从 19001 开始，找第一个未使用的端口
-
-4. 构建 Docker 镜像
-   ├─ 从 SQLite 读取角色定义文件
-   ├─ 写入临时目录 /tmp/openclaw-build-{name}/workspace/
-   ├─ docker build -t openclaw-agent-{name}:latest
-   └─ 清理临时目录
-
-5. 启动容器
-   ├─ docker run -d --name openclaw-agent-{name} \
-   │     -p {port}:18789 \
-   │     -v /opt/openclaw/data/agents/{name}/workspace/memory:/root/.openclaw/workspace/memory \
-   │     -v /opt/openclaw/data/agents/{name}/workspace/MEMORY.md:/root/.openclaw/workspace/MEMORY.md \
-   │     -v /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro \
-   │     -e API_BASE_URL=... -e API_KEY=... \
-   │     --network openclaw-network \
-   │     --restart unless-stopped \
-   │     openclaw-agent-{name}:latest
-   └─ 更新 agents 表 status = 'running'
-
-6. 通知 Gateway 重载
-   └─ curl -X POST http://localhost:8000/admin/reload
-```
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `name` | 是 | 路由标识，用于 URL 路径 `/{name}/wecom/callback`。英文小写+数字+连字符，3-30 字符 |
+| `display_name` | 是 | 中文显示名，管理/日志用 |
+| `wecom_token` | 是 | 对应的企业微信机器人 Token |
+| `wecom_aes_key` | 是 | 对应的企业微信机器人 EncodingAESKey |
+| `openclaw_url` | 是 | 该 agent 连接的 openclaw 地址 |
+| `openclaw_token` | 是 | 该 openclaw 的认证 token |
+| `openclaw_agent_id` | 否 | 在 openclaw 中的 agent id，空串表示使用默认 main agent |
 
 ---
 
-## 六、workspace 持久化方案
-
-### 容器内目录结构
-
-```
-容器内 /root/.openclaw/
-├── workspace/                      ← WORKDIR
-│   ├── AGENTS.md                   ← 镜像内预置（不持久化，重建用最新版）
-│   ├── IDENTITY.md                 ← 镜像内预置（只读，不持久化）
-│   ├── SOUL.md                     ← 镜像内预置（不持久化）
-│   ├── TOOLS.md                    ← 镜像内预置（不持久化）
-│   ├── USER.md                     ← 镜像内预置（不持久化）
-│   ├── MEMORY.md                   ← ★ 持久化（挂载文件）
-│   ├── memory/                     ← ★ 持久化（挂载目录）
-│   │   ├── 2026-03-01.md
-│   │   └── 2026-03-02.md
-│   └── shared-files/               ← ★ 持久化（全局共享，只读）
-└── agents/                         ← openclaw 内部配置
-    └── main/agent/                 ← 不持久化（CMD 启动时动态生成）
-```
-
-### 持久化策略（三层）
-
-| 层级 | 内容 | 策略 | 理由 |
-|------|------|------|------|
-| 角色定义 | 5 个 .md 文件 | 存 SQLite，构建到镜像 | 更新需重建镜像，保证一致性 |
-| 记忆数据 | memory/ + MEMORY.md | volume 挂载到宿主机 | AI 运行时写入，容器重建不丢失 |
-| 共享文件 | shared-files/ | volume 挂载（只读） | 跨角色共享 |
-| openclaw 配置 | agents/ | 不持久化 | CMD 启动时动态生成 |
-
-### 更新角色时的行为
-
-- 角色定义文件更新 → 重新 build 镜像 → 重建容器 → **记忆数据保留**（因为是 volume 挂载）
-- 等效于：换了"知识/性格"，但保留了"记忆"
-
----
-
-## 七、Gateway 改造要点
+## 四、Gateway 改造要点
 
 ### 从环境变量加载 → 从 SQLite 加载
 
 ```python
-# 之前：硬编码角色名，从环境变量加载
+# 之前
 KNOWN_ROLES = ['operation', 'product', 'development', 'testing', 'service']
+DEFAULT_PORTS = {...}
 def load_agents_from_env(): ...
 
-# 之后：完全动态，从 SQLite 加载
+# 之后
 def load_agents_from_db():
-    """从 SQLite 读取所有已注册的 agent"""
+    """从 SQLite 加载所有 agent 绑定"""
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT name, port, wecom_token, wecom_aes_key, container_name "
-        "FROM agents WHERE status != 'removed'"
+        "SELECT name, display_name, wecom_token, wecom_aes_key, "
+        "openclaw_url, openclaw_token, openclaw_agent_id FROM agents"
     ).fetchall()
     agents = {}
-    for name, port, token, aes_key, container in rows:
+    for name, display, token, aes_key, url, oc_token, agent_id in rows:
         agents[name] = {
+            'display_name': display,
             'wecom_token': token,
             'wecom_encoding_aes_key': aes_key,
-            'port': port,
-            'url': f'http://localhost:{port}',
-            'container': container,
+            'openclaw_url': url,
+            'openclaw_token': oc_token,
+            'openclaw_agent_id': agent_id or 'main',
         }
     conn.close()
     return agents
 ```
+
+### 调用 openclaw 时传递 agent_id
+
+```python
+# HTTP/SSE 调用
+headers = {
+    'Authorization': f'Bearer {agent_cfg["openclaw_token"]}',
+    'Content-Type': 'application/json',
+    'x-openclaw-agent-id': agent_cfg['openclaw_agent_id'],
+}
+
+# WS 调用 — sessionKey 中包含 agent 信息
+session_key = f"wecom:{user_id}"  # openclaw 侧由 agent_id 路由，session 按 user 隔离
+```
+
+### 删除的代码/概念
+
+| 删除 | 说明 |
+|------|------|
+| `KNOWN_ROLES` | 不再有硬编码角色 |
+| `DEFAULT_PORTS` | 不再管理端口 |
+| `OPENCLAW_INTERNAL_TOKEN` 全局变量 | 每个 agent 有独立的 token |
+| `OPENCLAW_PROTOCOL` 全局变量 | 保留但改为每 agent 可配（或全局默认） |
+| `container` 参数 / exec 协议 | 不再管理容器，去掉 exec 协议 |
+| `_call_openclaw_exec()` | 不再需要 |
 
 ### 新增管理 API
 
 ```python
 @app.route('/admin/reload', methods=['POST'])
 def admin_reload():
-    """重新从 SQLite 加载 agent 列表（管理脚本调用）"""
+    """重新从 SQLite 加载绑定关系（管理脚本调用）"""
     global AGENTS
     AGENTS = load_agents_from_db()
     return jsonify({'status': 'ok', 'agents': list(AGENTS.keys())})
 
 @app.route('/admin/agents', methods=['GET'])
 def admin_list_agents():
-    """列出所有注册的 agent"""
-    return jsonify({'agents': [...]})
+    """列出所有绑定"""
+    return jsonify({'agents': {name: cfg['display_name'] for name, cfg in AGENTS.items()}})
 ```
 
 ### 无 Agent 时的行为
 
 - Gateway 正常启动，`/health` 返回 `{"status": "ok", "agents": 0}`
-- 访问任何 `/{role}/wecom/callback` 返回 404
-- `/wecom/callback` 旧兼容路由返回提示"请先添加 Agent"
+- 访问 `/{name}/wecom/callback` 返回 404
+- 旧兼容路由 `/wecom/callback` 返回提示"请先通过管理脚本添加 agent"
+
+### session key 构造
+
+```python
+# 隔离维度: agent_name + user_id
+session_key = f"wecom:{agent_name}:{user_id}"
+```
+
+openclaw 侧通过 `x-openclaw-agent-id` header 路由到正确的 agent，
+session 通过 `user` 字段（HTTP）或 `sessionKey`（WS）按企业微信用户隔离。
 
 ---
 
-## 八、精简后的目录结构
+## 五、管理脚本（Python）
+
+### 脚本: `scripts/manage-agent.py`
+
+```
+用法:
+  python3 manage-agent.py add <name>       交互式添加 agent-企业微信绑定
+  python3 manage-agent.py remove <name>    删除绑定（需确认）
+  python3 manage-agent.py list             列出所有绑定
+  python3 manage-agent.py update <name>    更新绑定（同名覆盖，需确认）
+```
+
+### add 流程
+
+```
+$ python3 manage-agent.py add dev
+
+agent 路由名: dev
+显示名: 开发工程师小明
+企业微信 Token: xxxxxx
+企业微信 AES Key: yyyyyy
+openclaw 地址: http://10.0.1.5:18789
+openclaw Token: secret-abc
+openclaw Agent ID (回车跳过，默认 main):
+
+确认添加？
+  路由名:     dev
+  显示名:     开发工程师小明
+  企业微信:   Token=xxxx... AESKey=yyyy...
+  openclaw:   http://10.0.1.5:18789 (agent: main)
+
+[Y/n] y
+✅ 已添加。企业微信回调地址: https://your-domain/dev/wecom/callback
+✅ 已通知 Gateway 重载。
+```
+
+### remove 流程
+
+```
+$ python3 manage-agent.py remove dev
+
+即将删除:
+  路由名: dev (开发工程师小明)
+  企业微信: Token=xxxx...
+  openclaw: http://10.0.1.5:18789 (agent: main)
+
+⚠️  确认删除？此操作不可恢复。[y/N] y
+✅ 已删除。
+✅ 已通知 Gateway 重载。
+```
+
+### update 流程
+
+```
+$ python3 manage-agent.py update dev
+
+当前配置:
+  显示名:     开发工程师小明
+  企业微信:   Token=xxxx... AESKey=yyyy...
+  openclaw:   http://10.0.1.5:18789 (agent: main)
+
+输入新值（回车保持不变）:
+显示名 [开发工程师小明]:
+企业微信 Token [xxxx...]:
+企业微信 AES Key [yyyy...]:
+openclaw 地址 [http://10.0.1.5:18789]:
+openclaw Token [secret-abc]:
+openclaw Agent ID [main]: dev
+
+确认更新？[Y/n] y
+✅ 已更新。
+✅ 已通知 Gateway 重载。
+```
+
+---
+
+## 六、精简后的目录结构
 
 ```
 openclaw-deploy/
+├── src/gateway/
+│   ├── wecom_gateway.py          ← Gateway 主程序（大幅精简）
+│   └── requirements.txt          ← Python 依赖（flask, requests, pycryptodome, websocket-client）
 ├── scripts/
-│   ├── 0-prepare.sh              ← 环境准备（安装 Docker/Python/Node/openclaw）
-│   ├── 1-upload.sh               ← 上传代码到服务器（rsync）
-│   ├── 2-build.sh                ← 构建 base 镜像 + Gateway 启动
-│   ├── 3-deploy.sh               ← 启动 Gateway + 从 SQLite 恢复已注册的 Agent
-│   ├── 4-clean.sh                ← 停止所有服务 + 可选清理数据
-│   └── manage-agent.sh           ← ★ 角色管理（add/remove/update/list/status）
-├── templates/                    ← 角色定义模板文件
-│   ├── AGENTS.md.default         ← openclaw 默认 + 追加内容
-│   ├── IDENTITY.md.template      ← 模板（需要填写名字/性格等）
-│   ├── SOUL.md.template
-│   ├── TOOLS.md.default
-│   └── USER.md.template
-├── src/gateway/                  ← Gateway 源码
-│   ├── wecom_gateway.py
-│   ├── requirements.txt
-│   └── Dockerfile.gateway
-├── config/
-│   ├── Dockerfile.base
-│   └── Dockerfile.agents         ← 改造：不再依赖固定角色目录
-├── .env.example                  ← 统一的环境变量示例
+│   └── manage-agent.py           ← ★ agent-企业微信绑定管理
+├── .env.example                  ← 环境变量示例（仅 Gateway 自身配置）
 ├── PHASE2-PLAN.md                ← 本文档
 └── AGENTS.md                     ← AI 编码助手指南
 
-删除：
-├── local/                        ← 合并到 scripts/
-├── production/                   ← 合并到 scripts/
+删除:
+├── config/Dockerfile.base        ← 不再构建镜像
+├── config/Dockerfile.agents      ← 不再构建镜像
+├── config/docker-compose.*       ← 不再编排容器
+├── config/agents/workspace/      ← 不再管理角色定义
+├── local/                        ← 不再需要本地环境脚本
+├── production/                   ← 不再需要生产部署脚本
 ├── scripts/ (旧的 12 个脚本)      ← 全部删除
-└── config/agents/workspace/      ← 不再需要（角色定义存 SQLite）
+└── docs/                         ← 需要重写（大部分失效）
 ```
 
-### 关键变化
-
-- `local/` 和 `production/` 合并为 `scripts/`，通过 `.env` 文件区分环境
-- 旧 `scripts/` 下 12 个脚本全部删除
-- 新增 `manage-agent.sh` 作为核心角色管理入口
-- 新增 `templates/` 存放角色定义模板
-- `config/agents/workspace/` 不再需要（角色定义从 SQLite 动态读取）
-
----
-
-## 九、Dockerfile.agents 改造
-
-```dockerfile
-FROM openclaw-base:latest
-
-# 不再依赖 config/agents/workspace/{ROLE}/
-# 改为从构建上下文的临时目录读取
-COPY workspace/ /root/.openclaw/workspace/
-
-RUN chmod 444 /root/.openclaw/workspace/IDENTITY.md
-
-WORKDIR /root/.openclaw/workspace
-EXPOSE 18789
-
-# CMD 保持不变（动态生成 openclaw 配置后启动 gateway）
-CMD ["sh", "-c", "\
-  mkdir -p /root/.openclaw/agents/main/agent && \
-  ...（与现有相同）... && \
-  npx openclaw gateway --allow-unconfigured --bind lan"]
-```
-
-构建方式变更：
+### .env.example 精简
 
 ```bash
-# manage-agent.sh 准备临时构建上下文
-mkdir -p /tmp/openclaw-build-{name}/workspace/
-# 从 SQLite 导出 5 个 .md 文件到 workspace/
-# 复制 Dockerfile.agents 到构建上下文
-docker build -t openclaw-agent-{name}:latest /tmp/openclaw-build-{name}/
-rm -rf /tmp/openclaw-build-{name}/
+# Gateway 自身配置
+DB_PATH=/opt/openclaw/data/gateway/gateway.db
+GATEWAY_PORT=8000
+
+# 通信协议（全局默认，可被每个 agent 覆盖）
+OPENCLAW_PROTOCOL=ws
+OPENCLAW_TIMEOUT=2700
+```
+
+不再需要:
+- `AGENT_*_ENABLE` / `AGENT_*_WECOM_TOKEN` 等环境变量（全部改为 SQLite）
+- `OPENCLAW_INTERNAL_TOKEN`（每个 agent 独立 token）
+- `OPENAI_API_KEY` / `API_BASE_URL` 等（openclaw 侧的事，Gateway 不关心）
+
+---
+
+## 七、Gateway 代码删减清单
+
+| 删除 | 文件/函数 | 原因 |
+|------|-----------|------|
+| `KNOWN_ROLES` / `DEFAULT_PORTS` | wecom_gateway.py:42-44 | 不再硬编码 |
+| `load_agents_from_env()` | wecom_gateway.py:47-63 | 改为 `load_agents_from_db()` |
+| `validate_agents()` | wecom_gateway.py:66-80 | 校验逻辑简化 |
+| `_call_openclaw_exec()` | wecom_gateway.py:158-196 | 不再管理容器 |
+| `OPENCLAW_INTERNAL_TOKEN` | wecom_gateway.py:37 | 每 agent 独立 token |
+| `container` 参数 | 多处 | 不再管理容器 |
+| 文件操作相关路由 | 如 `/files/*` | 不再管理 workspace |
+
+---
+
+## 八、消息处理流程
+
+```
+企业微信用户发消息
+       │
+       ▼
+GET/POST /{agent_name}/wecom/callback
+       │
+       ├─ AGENTS 字典查找 agent_name
+       │  (未找到 → 404)
+       │
+       ├─ 用该 agent 的 wecom_token + wecom_aes_key 解密/验签
+       │
+       ├─ 提取 user_id, content
+       │
+       ├─ 构造 session_key = f"wecom:{agent_name}:{user_id}"
+       │
+       ├─ 调用 openclaw:
+       │   URL:    agent_cfg['openclaw_url']
+       │   Token:  agent_cfg['openclaw_token']
+       │   Agent:  agent_cfg['openclaw_agent_id']  (默认 'main')
+       │   Session: session_key
+       │
+       ├─ 收到回复
+       │
+       └─ 通过企业微信 response_url 回复用户
 ```
 
 ---
 
-## 十、待确认的决策点
+## 九、已确认的决策
 
-| # | 决策点 | 建议 |
-|---|--------|------|
-| 1 | local/ 和 production/ 是否合并？ | 合并为 scripts/，通过 .env 文件区分环境 |
-| 2 | 角色名规则？ | 英文小写 + 数字 + 连字符，3-30 字符，如 `my-developer` |
-| 3 | 端口分配策略？ | 自动分配，从 19001 起步，也支持手动指定 |
-| 4 | Gateway 热加载方式？ | 管理脚本调用 `/admin/reload` API，Gateway 不需要重启 |
-| 5 | 放弃 docker-compose 管理 agent？ | 是，改用 `docker run`，仅保留网络创建 |
-| 6 | 更新角色时保留 memory？ | 默认保留，提供选项可清空 |
-| 7 | 管理脚本用 Python 还是 Bash？ | Python（需要操作 SQLite，逻辑较复杂） |
-| 8 | /admin/ API 需要鉴权吗？ | 用 OPENCLAW_INTERNAL_TOKEN 做简单 Bearer 认证 |
+| 决策 | 结论 |
+|------|------|
+| Gateway 是否管理 openclaw | **否**，纯桥接 |
+| 单实例 vs 多实例 | **都支持**，由 SQLite 绑定关系决定 |
+| agent_id 是否必填 | **否**，不配置默认为 main |
+| session 隔离方式 | `agent_name + user_id` |
+| 绑定关系存储 | SQLite |
+| 管理脚本语言 | Python |
+| exec 协议 | **删除**（不再管理容器） |
+| Docker 相关代码 | **全部删除** |
 
 ---
 
-## 十一、实施计划（预估）
+## 十、实施计划
 
-| 步骤 | 内容 | 依赖 |
-|------|------|------|
-| 1 | 从 `20260302_feat_remove_dispatcher` 拉新分支 | 决策点确认后开始 |
-| 2 | 创建 templates/ 目录和模板文件 | 无 |
-| 3 | 改造 Gateway：SQLite 加载 + 管理 API | 表结构确认 |
-| 4 | 编写 manage-agent.sh (Python) | Gateway API 就绪 |
-| 5 | 改造 Dockerfile.agents | 无 |
-| 6 | 编写 scripts/ 下 5 个核心脚本 | 目录结构确认 |
-| 7 | 清理旧文件（local/ production/ 旧 scripts/） | 新脚本就绪 |
-| 8 | 更新文档 | 全部完成后 |
+| # | 步骤 | 说明 |
+|---|------|------|
+| 1 | 改造 Gateway | 删除容器/镜像管理代码，SQLite 加载绑定，per-agent token/url |
+| 2 | 编写 manage-agent.py | 交互式 add/remove/update/list |
+| 3 | 清理旧文件 | config/ local/ production/ 旧 scripts/ docs/ |
+| 4 | 更新 .env.example | 仅保留 Gateway 自身配置 |
+| 5 | 更新 AGENTS.md | 适配新架构 |
+| 6 | 测试 | 本地验证桥接 + 管理脚本 |
 
 ---
 
 **创建日期**: 2026-03-02
-**状态**: 待确认决策点后进入实施
+**分支**: `20260302_feat_wecom_bridging`
+**状态**: 方案已确认，待实施

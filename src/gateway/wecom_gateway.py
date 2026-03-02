@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import hashlib
-import xml.etree.ElementTree as ET
 import sqlite3
 import uuid
 import time
@@ -11,11 +10,10 @@ import base64
 from Crypto.Cipher import AES
 import struct
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 import queue
 import mimetypes
-import subprocess
 import websocket
 
 app = Flask(__name__)
@@ -32,55 +30,60 @@ logger = logging.getLogger(__name__)
 # 数据库配置
 DB_PATH = os.getenv('DB_PATH', '/opt/openclaw/data/gateway/gateway.db')
 
-# OpenClaw 配置
+# 通信协议（全局默认）
 OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '2700'))
-OPENCLAW_INTERNAL_TOKEN = os.getenv('OPENCLAW_INTERNAL_TOKEN', 'openclaw-internal-secret')
 OPENCLAW_PROTOCOL = os.getenv('OPENCLAW_PROTOCOL', 'ws')
 
-# ============= 多 Agent 配置（从环境变量自动发现）=============
+# Gateway 端口
+GATEWAY_PORT = int(os.getenv('GATEWAY_PORT', '8000'))
 
-KNOWN_ROLES = ['operation', 'product', 'development', 'testing', 'service']
-# 默认端口映射
-DEFAULT_PORTS = {'operation': 18791, 'product': 18792, 'development': 18793, 'testing': 18794, 'service': 18795}
+# ============= Agent 绑定（从 SQLite 加载）=============
 
 
-def load_agents_from_env():
-    """从环境变量扫描 AGENT_{ROLE}_ENABLE 构建 AGENTS 字典"""
+def _ensure_agents_table():
+    """确保 agents 表存在"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''CREATE TABLE IF NOT EXISTS agents (
+        name              TEXT PRIMARY KEY,
+        display_name      TEXT NOT NULL,
+        wecom_token       TEXT NOT NULL,
+        wecom_aes_key     TEXT NOT NULL,
+        openclaw_url      TEXT NOT NULL,
+        openclaw_token    TEXT NOT NULL,
+        openclaw_agent_id TEXT DEFAULT '',
+        created_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at        TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    conn.commit()
+    conn.close()
+
+
+def load_agents_from_db():
+    """从 SQLite 加载所有 agent 绑定"""
+    _ensure_agents_table()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT name, display_name, wecom_token, wecom_aes_key, "
+        "openclaw_url, openclaw_token, openclaw_agent_id FROM agents"
+    ).fetchall()
     agents = {}
-    for role in KNOWN_ROLES:
-        prefix = f'AGENT_{role.upper()}_'
-        enable = os.getenv(f'{prefix}ENABLE', 'false').lower() == 'true'
-        if not enable:
-            continue
-        port = int(os.getenv(f'{prefix}PORT', str(DEFAULT_PORTS[role])))
-        agents[role] = {
-            'wecom_token': os.getenv(f'{prefix}WECOM_TOKEN', ''),
-            'wecom_encoding_aes_key': os.getenv(f'{prefix}WECOM_ENCODING_AES_KEY', ''),
-            'port': port,
-            'url': f'http://localhost:{port}',
-            'container': f'openclaw-agent-{role}',
+    for name, display, token, aes_key, url, oc_token, agent_id in rows:
+        agents[name] = {
+            'display_name': display,
+            'wecom_token': token,
+            'wecom_encoding_aes_key': aes_key,
+            'openclaw_url': url,
+            'openclaw_token': oc_token,
+            'openclaw_agent_id': agent_id or 'main',
         }
+    conn.close()
     return agents
 
 
-def validate_agents():
-    """启动时校验 enabled agent 的配置"""
-    if not AGENTS:
-        logger.error("❌ 没有启用任何 Agent！请在 .env 中设置 AGENT_*_ENABLE=true")
-        raise SystemExit(1)
-    errors = []
-    for name, cfg in AGENTS.items():
-        if not cfg['wecom_token']:
-            errors.append(f"Agent {name}: AGENT_{name.upper()}_WECOM_TOKEN 未配置")
-        if not cfg['wecom_encoding_aes_key']:
-            errors.append(f"Agent {name}: AGENT_{name.upper()}_WECOM_ENCODING_AES_KEY 未配置")
-    if errors:
-        for e in errors:
-            logger.error(f"❌ {e}")
-        raise SystemExit(1)
+# 确保数据库目录存在
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-
-AGENTS = load_agents_from_env()
+AGENTS = load_agents_from_db()
 
 
 # ============= OpenClaw API 通用调用 =============
@@ -96,14 +99,14 @@ def _extract_reply_text(data):
     return '\n'.join(texts).strip()
 
 
-def _call_openclaw_sse(url, message, session_key, timeout=2700):
+def _call_openclaw_sse(url, message, session_key, timeout=2700, token='', agent_id='main'):
     """单次 HTTP SSE 流式调用，返回回复文本。连接异常时抛出异常。"""
     resp = requests.post(
         f"{url}/v1/responses",
         headers={
-            'Authorization': f'Bearer {OPENCLAW_INTERNAL_TOKEN}',
+            'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json',
-            'x-openclaw-agent-id': 'main',
+            'x-openclaw-agent-id': agent_id,
         },
         json={'model': 'openclaw', 'input': message, 'stream': True, 'user': session_key},
         timeout=(10, timeout),
@@ -130,14 +133,14 @@ def _call_openclaw_sse(url, message, session_key, timeout=2700):
     return ''
 
 
-def _call_openclaw_http(url, message, session_key, timeout=2700):
+def _call_openclaw_http(url, message, session_key, timeout=2700, token='', agent_id='main'):
     """同步 HTTP POST 调用，不使用流式，直接拿完整 JSON 响应"""
     resp = requests.post(
         f"{url}/v1/responses",
         headers={
-            'Authorization': f'Bearer {OPENCLAW_INTERNAL_TOKEN}',
+            'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json',
-            'x-openclaw-agent-id': 'main',
+            'x-openclaw-agent-id': agent_id,
         },
         json={'model': 'openclaw', 'input': message, 'user': session_key},
         timeout=(10, timeout),
@@ -146,57 +149,7 @@ def _call_openclaw_http(url, message, session_key, timeout=2700):
     return _extract_reply_text(resp.json())
 
 
-def _extract_exec_reply(data):
-    """从 docker exec --json 输出中提取文本（格式: {payloads: [{text: ...}]})"""
-    texts = []
-    for p in data.get('payloads', []):
-        if p.get('text'):
-            texts.append(p['text'])
-    return '\n'.join(texts).strip()
-
-
-def _call_openclaw_exec(url, message, session_key, timeout=2700, container=''):
-    """通过 docker exec 调用容器内 openclaw CLI，解析 JSON 输出"""
-    if not container:
-        raise Exception("exec 协议需要指定容器名")
-
-    cmd = [
-        'docker', 'exec', container,
-        'npx', 'openclaw', 'agent', '--agent', 'main', '--local',
-        '--session-id', session_key,
-        '-m', message, '--json', '--timeout', str(timeout),
-    ]
-    logger.info(f"exec 调用: docker exec {container} ...")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 30)
-
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        logger.error(f"exec 调用失败 (rc={result.returncode}): {stderr[:500]}")
-        raise Exception(f"docker exec 失败: {stderr[:200]}")
-
-    stdout = result.stdout.strip()
-    if not stdout:
-        return ''
-    try:
-        data = json.loads(stdout)
-        return _extract_exec_reply(data)
-    except json.JSONDecodeError:
-        reply_text = ''
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                text = _extract_exec_reply(data)
-                if text:
-                    reply_text = text
-            except json.JSONDecodeError:
-                continue
-        return reply_text
-
-
-def _call_openclaw_ws(url, message, session_key, timeout=2700):
+def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_id='main'):
     """WebSocket 协议调用：connect 握手 + chat.send，监听 chat state=final 获取回复"""
     ws_url = url.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
     ws = websocket.create_connection(ws_url, timeout=timeout)
@@ -209,7 +162,7 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700):
             "type": "req", "id": "connect-1", "method": "connect",
             "params": {
                 "client": {"id": "cli", "mode": "cli", "platform": "linux", "version": "2026.2.28"},
-                "auth": {"token": OPENCLAW_INTERNAL_TOKEN},
+                "auth": {"token": token},
                 "role": "operator",
                 "scopes": ["operator.read", "operator.write"],
                 "minProtocol": 3, "maxProtocol": 3
@@ -219,13 +172,13 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700):
         if not hello.get('ok'):
             raise Exception(f"WS connect 失败: {hello.get('error')}")
 
-        # Step 3: chat.send
+        # Step 3: chat.send — sessionKey 包含 agent 路由信息
         req_id = str(uuid.uuid4())
         ws.send(json.dumps({
             "type": "req", "id": req_id, "method": "chat.send",
             "params": {
                 "message": message,
-                "sessionKey": session_key,
+                "sessionKey": f"agent:{agent_id}:{session_key}",
                 "idempotencyKey": str(uuid.uuid4())
             }
         }))
@@ -254,33 +207,35 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700):
         ws.close()
 
 
-def _call_openclaw(url, message, session_key, timeout=2700, container=''):
+def _call_openclaw(url, message, session_key, timeout=2700, token='', agent_id='main'):
     """统一调用入口，根据 OPENCLAW_PROTOCOL 选择协议"""
     protocol = OPENCLAW_PROTOCOL.lower()
 
     if protocol == 'http':
-        return _call_openclaw_http(url, message, session_key, timeout)
-
-    elif protocol == 'exec':
-        return _call_openclaw_exec(url, message, session_key, timeout, container=container)
+        return _call_openclaw_http(url, message, session_key, timeout,
+                                   token=token, agent_id=agent_id)
 
     elif protocol == 'ws':
         try:
-            return _call_openclaw_ws(url, message, session_key, timeout)
+            return _call_openclaw_ws(url, message, session_key, timeout,
+                                     token=token, agent_id=agent_id)
         except Exception as e:
             logger.warning(f"WS 调用失败: {e}，尝试重试")
             retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
-            return _call_openclaw_ws(url, retry_msg, session_key, timeout)
+            return _call_openclaw_ws(url, retry_msg, session_key, timeout,
+                                     token=token, agent_id=agent_id)
 
     else:  # 默认 sse
         try:
-            return _call_openclaw_sse(url, message, session_key, timeout)
+            return _call_openclaw_sse(url, message, session_key, timeout,
+                                      token=token, agent_id=agent_id)
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.ReadTimeout) as e:
             logger.warning(f"SSE 连接断开: {e}，尝试重试")
             retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
-            return _call_openclaw_sse(url, retry_msg, session_key, timeout)
+            return _call_openclaw_sse(url, retry_msg, session_key, timeout,
+                                      token=token, agent_id=agent_id)
 
 
 # ============= 企业微信加解密工具类 =============
@@ -357,11 +312,6 @@ def init_db():
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS user_roles (
-            user_id TEXT PRIMARY KEY,
-            roles TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS task_logs (
             task_id TEXT PRIMARY KEY,
             user_id TEXT,
@@ -386,27 +336,11 @@ def init_db():
         )''')
         conn.commit()
         conn.close()
-        logger.info("✅ 数据库初始化完成")
+        logger.info("数据库初始化完成")
     except Exception as e:
-        logger.error(f"❌ 数据库初始化失败: {e}")
+        logger.error(f"数据库初始化失败: {e}")
 
 init_db()
-
-def get_user_agents(user_id):
-    """查询用户绑定的代理"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT roles FROM user_roles WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-        conn.close()
-
-        if result:
-            return result[0].split(',')
-        return []
-    except Exception as e:
-        logger.error(f"查询用户绑定失败: {e}")
-        return []
 
 
 def log_task(task_id, user_id, agent_id, content, status='pending', result=''):
@@ -420,9 +354,8 @@ def log_task(task_id, user_id, agent_id, content, status='pending', result=''):
         )
         conn.commit()
         conn.close()
-        logger.info(f"✅ 任务日志已记录: {task_id} -> {agent_id} ({status})")
     except Exception as e:
-        logger.error(f"❌ 记录任务日志失败: {e}")
+        logger.error(f"记录任务日志失败: {e}")
 
 
 def update_task_status(task_id, status, result=''):
@@ -436,9 +369,8 @@ def update_task_status(task_id, status, result=''):
         )
         conn.commit()
         conn.close()
-        logger.info(f"✅ 任务状态已更新: {task_id} -> {status}")
     except Exception as e:
-        logger.error(f"❌ 更新任务状态失败: {e}")
+        logger.error(f"更新任务状态失败: {e}")
 
 
 def log_file_record(user_id, file_path, file_name, file_type, content_type, file_size, source_url, msg_type):
@@ -452,9 +384,8 @@ def log_file_record(user_id, file_path, file_name, file_type, content_type, file
         )
         conn.commit()
         conn.close()
-        logger.info(f"✅ 文件存档已记录: {file_name} (user={user_id})")
     except Exception as e:
-        logger.error(f"❌ 记录文件存档失败: {e}")
+        logger.error(f"记录文件存档失败: {e}")
 
 
 # ============= 长消息截断 =============
@@ -487,37 +418,28 @@ def truncate_message(text, max_len=WECOM_MSG_MAX_LEN):
     return result + suffix
 
 
-# ============= 共享文件目录配置 =============
+# ============= 文件下载目录 =============
 
-def _default_shared_files_base():
-    """本地开发时 /opt/openclaw/shared-files 不存在，自动 fallback 到 ./shared-files"""
-    prod_path = '/opt/openclaw/shared-files'
+def _default_files_base():
+    """文件存储基础目录"""
+    prod_path = '/opt/openclaw/data/gateway/files'
     if os.path.isdir(prod_path):
         return prod_path
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'shared-files')
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'data', 'files')
 
-SHARED_FILES_BASE = os.getenv('SHARED_FILES_BASE', _default_shared_files_base())
-CONTAINER_FILES_BASE = os.getenv('CONTAINER_FILES_BASE', '/root/.openclaw/workspace/shared-files')
+FILES_BASE = os.getenv('FILES_BASE', _default_files_base())
 
 
 def _get_today_dir():
-    """获取当日共享文件目录（宿主机路径），自动创建"""
+    """获取当日文件目录，自动创建"""
     today = datetime.now().strftime('%Y-%m-%d')
-    path = os.path.join(SHARED_FILES_BASE, today)
+    path = os.path.join(FILES_BASE, today)
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def host_path_to_container_path(host_path):
-    """将宿主机文件路径转换为容器内路径"""
-    if host_path and host_path.startswith(SHARED_FILES_BASE):
-        return CONTAINER_FILES_BASE + host_path[len(SHARED_FILES_BASE):]
-    return host_path
-
-
 # ============= 多类型消息处理 =============
 
-TEMP_FILE_DIR = None
 TEXT_EXTENSIONS = {'.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml', '.py', '.js', '.ts',
                    '.java', '.go', '.rs', '.rb', '.php', '.sh', '.bash', '.sql', '.html', '.css',
                    '.conf', '.cfg', '.ini', '.toml', '.log', '.env', '.properties'}
@@ -592,7 +514,7 @@ def _decrypt_file(encrypted_data, encoding_aes_key):
 
 
 def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes_key=''):
-    """下载临时 COS URL 到共享文件目录（按日期分区），返回 (local_path, text_content_or_none)"""
+    """下载临时 COS URL 到文件目录（按日期分区），返回 (local_path, text_content_or_none)"""
     try:
         today_dir = _get_today_dir()
         resp = requests.get(url, timeout=30, stream=True)
@@ -665,8 +587,7 @@ def extract_single_content(item, user_id='', encoding_aes_key=''):
             return '[用户发送了一张图片，但无法获取]'
         path, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image', encoding_aes_key=encoding_aes_key)
         if path:
-            container_path = host_path_to_container_path(path)
-            return f'[用户发送了一张图片，已保存到 {container_path}]'
+            return f'[用户发送了一张图片，已保存到 {path}]'
         return '[用户发送了一张图片，下载失败]'
 
     elif msg_type == 'file':
@@ -676,10 +597,9 @@ def extract_single_content(item, user_id='', encoding_aes_key=''):
         path, text_content = download_temp_file(url, prefix='file', user_id=user_id, msg_type='file', encoding_aes_key=encoding_aes_key)
         if not path:
             return '[用户发送了一个文件，下载失败]'
-        container_path = host_path_to_container_path(path)
         if text_content is not None:
-            return f'[用户发送了一个文本文件 {container_path}]\n文件内容：\n{text_content}'
-        return f'[用户发送了一个文件，已保存到 {container_path}]'
+            return f'[用户发送了一个文本文件 {path}]\n文件内容：\n{text_content}'
+        return f'[用户发送了一个文件，已保存到 {path}]'
 
     elif msg_type == 'mixed':
         parts = []
@@ -726,19 +646,27 @@ def _user_worker(queue_key):
         try:
             _process_single_message(**task)
         except Exception as e:
-            logger.error(f"❌ 处理消息失败 ({queue_key}): {e}")
+            logger.error(f"处理消息失败 ({queue_key}): {e}")
         finally:
             q.task_done()
 
 def _process_single_message(user_id, content, task_id, response_url, agent_name):
-    """处理单条消息：调用对应 agent → 回复"""
-    agent_cfg = AGENTS[agent_name]
-    session_key = f"{agent_name}-{user_id}"
+    """处理单条消息：调用对应 agent -> 回复"""
+    agent_cfg = AGENTS.get(agent_name)
+    if not agent_cfg:
+        logger.error(f"Agent {agent_name} 不存在（可能已被删除）")
+        return
+
+    session_key = f"wecom:{agent_name}:{user_id}"
     log_task(task_id, user_id, agent_name, content[:200], status='processing')
 
     try:
-        reply = _call_openclaw(agent_cfg['url'], content, session_key,
-                               timeout=OPENCLAW_TIMEOUT, container=agent_cfg['container'])
+        reply = _call_openclaw(
+            agent_cfg['openclaw_url'], content, session_key,
+            timeout=OPENCLAW_TIMEOUT,
+            token=agent_cfg['openclaw_token'],
+            agent_id=agent_cfg['openclaw_agent_id'],
+        )
         if not reply:
             reply = '处理失败，请稍后再试。'
             update_task_status(task_id, 'failed', '无响应')
@@ -751,8 +679,11 @@ def _process_single_message(user_id, content, task_id, response_url, agent_name)
 
     reply = truncate_message(reply)
     payload = {"msgtype": "markdown", "markdown": {"content": reply}}
-    resp = requests.post(response_url, json=payload, timeout=10)
-    logger.info(f"✅ [{agent_name}] 主动回复: {resp.status_code}, 长度: {len(reply)}")
+    try:
+        resp = requests.post(response_url, json=payload, timeout=10)
+        logger.info(f"[{agent_name}] 主动回复: {resp.status_code}, 长度: {len(reply)}")
+    except Exception as e:
+        logger.error(f"[{agent_name}] 主动回复失败: {e}")
 
 
 def process_message_async(user_id, content, task_id, response_url, agent_name):
@@ -774,7 +705,7 @@ def process_message_async(user_id, content, task_id, response_url, agent_name):
             logger.info(f"创建 worker: {queue_key}")
         _user_queues[queue_key].put(task)
         qsize = _user_queues[queue_key].qsize()
-    logger.info(f"✅ 消息已入队: {queue_key}, task_id={task_id}, 队列长度={qsize}")
+    logger.info(f"消息已入队: {queue_key}, task_id={task_id}, 队列长度={qsize}")
 
 
 # ============= 消息去重 =============
@@ -816,13 +747,13 @@ def wecom_callback(agent_name):
         echo_str = request.args.get('echostr', '')
         logger.info(f"[{agent_name}] 收到企业微信回调验证请求")
         if not crypto.verify_signature(msg_signature, timestamp, nonce, echo_str):
-            logger.error(f"[{agent_name}] ❌ 签名验证失败")
+            logger.error(f"[{agent_name}] 签名验证失败")
             return "signature verification failed", 403
         decrypted = crypto.decrypt(echo_str)
         if not decrypted:
-            logger.error(f"[{agent_name}] ❌ 解密失败")
+            logger.error(f"[{agent_name}] 解密失败")
             return "decryption failed", 500
-        logger.info(f"[{agent_name}] ✅ 回调验证成功")
+        logger.info(f"[{agent_name}] 回调验证成功")
         return decrypted
 
     # POST：接收消息（JSON 格式）
@@ -833,16 +764,16 @@ def wecom_callback(agent_name):
             encrypt_msg = body.get('encrypt', '')
 
             if not crypto.verify_signature(msg_signature, timestamp, nonce, encrypt_msg):
-                logger.error(f"[{agent_name}] ❌ 消息签名验证失败")
+                logger.error(f"[{agent_name}] 消息签名验证失败")
                 return jsonify({}), 403
 
             decrypted = crypto.decrypt(encrypt_msg)
             if not decrypted:
-                logger.error(f"[{agent_name}] ❌ 消息解密失败")
+                logger.error(f"[{agent_name}] 消息解密失败")
                 return jsonify({}), 500
 
             msg = json.loads(decrypted)
-            logger.info(f"[{agent_name}] 📩 解密消息: {json.dumps(msg, ensure_ascii=False)[:300]}")
+            logger.info(f"[{agent_name}] 解密消息: {json.dumps(msg, ensure_ascii=False)[:300]}")
 
             msg_type = msg.get('msgtype', '')
             msgid = msg.get('msgid', '')
@@ -853,7 +784,7 @@ def wecom_callback(agent_name):
                 return jsonify({}), 200
 
             if msgid and is_duplicate_msg(msgid):
-                logger.info(f"[{agent_name}] ⚠️  重复消息已跳过: {msgid}")
+                logger.info(f"[{agent_name}] 重复消息已跳过: {msgid}")
                 return jsonify({}), 200
 
             if msg_type in ('text', 'image', 'file', 'voice', 'mixed'):
@@ -863,7 +794,7 @@ def wecom_callback(agent_name):
 
                 task_id = str(uuid.uuid4())
 
-                processing_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": "⏳ 正在处理，请稍候..."}})
+                processing_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": "正在处理，请稍候..."}})
                 reply_pkg = crypto.build_reply(processing_msg, int(timestamp), nonce)
 
                 process_message_async(from_user, content, task_id, response_url, agent_name)
@@ -873,43 +804,62 @@ def wecom_callback(agent_name):
                 return jsonify({}), 200
 
             else:
-                logger.info(f"[{agent_name}] ⚠️  忽略消息类型: {msg_type}")
+                logger.info(f"[{agent_name}] 忽略消息类型: {msg_type}")
                 return jsonify({}), 200
 
         except Exception as e:
-            logger.error(f"[{agent_name}] ❌ 处理消息失败: {e}")
+            logger.error(f"[{agent_name}] 处理消息失败: {e}")
             return jsonify({}), 500
 
 
 @app.route('/wecom/callback', methods=['GET', 'POST'])
 def wecom_callback_legacy():
-    """
-    兼容旧版路径的回调接口
-    自动路由到第一个启用的 Agent（临时兼容方案）
-    
-    ⚠️  建议：修改企业微信回调 URL 为 /{agent_name}/wecom/callback
-    """
+    """兼容旧版路径 — 提示用户使用新路径"""
     if not AGENTS:
-        logger.error("没有启用任何 Agent")
-        return jsonify({'error': 'no agents enabled'}), 500
-    
-    # 使用第一个启用的 Agent（或根据其他逻辑选择）
+        return jsonify({'error': '尚未添加任何 agent，请先通过 manage-agent.py 添加'}), 404
+
+    # 使用第一个 agent（临时兼容）
     default_agent = list(AGENTS.keys())[0]
-    logger.warning(f"⚠️  使用旧版路径 /wecom/callback，自动路由到: {default_agent}")
-    logger.warning(f"⚠️  建议修改企业微信回调 URL 为: /{default_agent}/wecom/callback")
-    
-    # 重定向到对应的 agent 路由处理
+    logger.warning(f"旧版路径 /wecom/callback 请求，自动路由到: {default_agent}")
     return wecom_callback(default_agent)
+
+
+# ============= 管理 API =============
+
+@app.route('/admin/reload', methods=['POST'])
+def admin_reload():
+    """重新从 SQLite 加载绑定关系（管理脚本调用）"""
+    global AGENTS
+    AGENTS = load_agents_from_db()
+    logger.info(f"Agent 绑定已重载，当前 {len(AGENTS)} 个: {list(AGENTS.keys())}")
+    return jsonify({'status': 'ok', 'agents': list(AGENTS.keys())})
+
+
+@app.route('/admin/agents', methods=['GET'])
+def admin_list_agents():
+    """列出所有绑定"""
+    return jsonify({
+        'agents': {
+            name: {
+                'display_name': cfg['display_name'],
+                'openclaw_url': cfg['openclaw_url'],
+                'openclaw_agent_id': cfg['openclaw_agent_id'],
+            }
+            for name, cfg in AGENTS.items()
+        }
+    })
 
 
 @app.route('/health', methods=['GET'])
 def health():
     """健康检查接口"""
     return jsonify({
-        'status': 'healthy',
+        'status': 'ok',
         'timestamp': int(time.time()),
         'service': 'openclaw-wecom-gateway',
-        'agents': {name: {'url': cfg['url'], 'port': cfg['port']} for name, cfg in AGENTS.items()}
+        'protocol': OPENCLAW_PROTOCOL,
+        'agents': len(AGENTS),
+        'agent_names': list(AGENTS.keys()),
     })
 
 
@@ -929,17 +879,14 @@ def stats():
         cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'failed'")
         failed_tasks = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(*) FROM user_roles")
-        total_users = cursor.fetchone()[0]
-
         conn.close()
 
         return jsonify({
             'total_tasks': total_tasks,
             'success_tasks': success_tasks,
             'failed_tasks': failed_tasks,
-            'total_users': total_users,
             'success_rate': f"{success_tasks / total_tasks * 100:.2f}%" if total_tasks > 0 else "0%",
+            'agents': len(AGENTS),
             'timestamp': int(time.time())
         })
     except Exception as e:
@@ -949,17 +896,16 @@ def stats():
 
 if __name__ == '__main__':
     logger.info("=" * 60)
-    logger.info("OpenClaw 企业微信网关启动中...")
+    logger.info("OpenClaw 企业微信桥接网关启动中...")
+    logger.info(f"数据库路径: {DB_PATH}")
+    logger.info(f"通信协议: {OPENCLAW_PROTOCOL}")
+    logger.info(f"超时时间: {OPENCLAW_TIMEOUT}s")
+    if AGENTS:
+        logger.info(f"已加载 {len(AGENTS)} 个 Agent 绑定:")
+        for name, cfg in AGENTS.items():
+            logger.info(f"  - {name} ({cfg['display_name']}): {cfg['openclaw_url']} [agent: {cfg['openclaw_agent_id']}]")
+    else:
+        logger.info("当前无 Agent 绑定，请通过 manage-agent.py 添加")
     logger.info("=" * 60)
 
-    # 配置检查
-    validate_agents()
-
-    logger.info(f"✅ 数据库路径: {DB_PATH}")
-    logger.info(f"✅ 通信协议: {OPENCLAW_PROTOCOL}")
-    logger.info(f"✅ 已启用 {len(AGENTS)} 个 Agent:")
-    for name, cfg in AGENTS.items():
-        logger.info(f"   - {name}: {cfg['url']} (容器: {cfg['container']})")
-    logger.info("=" * 60)
-
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    app.run(host='0.0.0.0', port=GATEWAY_PORT, debug=False)
