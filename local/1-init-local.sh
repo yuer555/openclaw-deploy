@@ -3,7 +3,7 @@
 # 脚本名称: 1-init-local.sh
 # 功能描述: 初始化本地测试环境
 # 使用方法: ./1-init-local.sh
-# 版本: V2.0
+# 版本: V3.0
 #==============================================================================
 
 set -e
@@ -44,7 +44,7 @@ if ! docker compose version &> /dev/null; then
     print_error "Docker Compose 未安装！"
     exit 1
 fi
-print_success "Docker Compose 已安装: $(docker compose version)"
+print_success "Docker Compose 已安装"
 
 #------------------------------------------------------------------------------
 # 步骤 2: 检查端口占用
@@ -56,8 +56,7 @@ PORT_CONFLICT=0
 
 for PORT in "${PORTS[@]}"; do
     if lsof -i ":${PORT}" &> /dev/null; then
-        print_warning "端口 ${PORT} 已被占用："
-        lsof -i ":${PORT}" | grep LISTEN || true
+        print_warning "端口 ${PORT} 已被占用"
         PORT_CONFLICT=1
     else
         print_success "端口 ${PORT} 可用"
@@ -84,6 +83,7 @@ mkdir -p ../data/agents/product
 mkdir -p ../data/agents/development
 mkdir -p ../data/agents/testing
 mkdir -p ../data/agents/service
+mkdir -p ../shared-files
 mkdir -p ../logs/gateway
 
 print_success "目录结构创建完成"
@@ -99,7 +99,7 @@ else
     if [ -f ".env.local.example" ]; then
         cp .env.local.example .env.local
         print_success ".env.local 创建成功"
-        print_warning "请编辑 .env.local，填入 GITHUB_TOKEN 等必要配置"
+        print_warning "请编辑 .env.local，配置 API 和启用的 Agent"
     else
         print_error ".env.local.example 不存在！"
         exit 1
@@ -110,7 +110,7 @@ echo ""
 print_success "初始化完成！"
 echo ""
 echo -e "${YELLOW}下一步：${NC}"
-echo "  1. 编辑配置：vi .env.local"
+echo "  1. 编辑配置：vi .env.local（设置 API_KEY，启用 Agent）"
 echo "  2. 构建镜像：./0-build-images.sh（首次或代码变更后）"
 echo "  3. 启动服务：./2-start-local.sh"
 echo ""

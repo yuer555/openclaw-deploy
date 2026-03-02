@@ -70,7 +70,6 @@ else
     sudo apt-get install -y nodejs
     print_success "Node.js 安装完成: $(node --version)"
 fi
-# __CONTINUE_HERE__
 
 #------------------------------------------------------------------------------
 # 步骤 3: 安装 openclaw
@@ -107,9 +106,9 @@ fi
 print_success "Python 依赖安装完成（venv: $VENV_DIR）"
 
 #------------------------------------------------------------------------------
-# 步骤 5: 创建目录 + 复制 dispatcher workspace
+# 步骤 5: 创建目录
 #------------------------------------------------------------------------------
-print_step "步骤 5/5: 创建目录和配置"
+print_step "步骤 5/5: 创建目录"
 
 sudo mkdir -p /opt/openclaw/shared-files
 sudo mkdir -p /opt/openclaw/data/gateway
@@ -117,17 +116,6 @@ sudo mkdir -p /opt/openclaw/data/agents/{operation,product,development,testing,s
 sudo mkdir -p /opt/openclaw/logs/gateway
 sudo chown -R $USER:$USER /opt/openclaw
 chmod -R 755 /opt/openclaw
-
-# 复制 dispatcher workspace
-WORKSPACE_DIR="$HOME/.openclaw/workspace"
-mkdir -p "$WORKSPACE_DIR"
-if [ -d "$PROJECT_DIR/config/agents/workspace/dispatcher" ]; then
-    cp -r "$PROJECT_DIR/config/agents/workspace/dispatcher/"* "$WORKSPACE_DIR/"
-    print_success "Dispatcher workspace 已复制到 $WORKSPACE_DIR"
-elif [ -f "$PROJECT_DIR/config/agents/workspace/dispatcher.md" ]; then
-    cp "$PROJECT_DIR/config/agents/workspace/dispatcher.md" "$WORKSPACE_DIR/CLAUDE.md"
-    print_success "Dispatcher CLAUDE.md 已复制到 $WORKSPACE_DIR"
-fi
 
 mkdir -p /tmp/openclaw
 print_success "目录创建完成"

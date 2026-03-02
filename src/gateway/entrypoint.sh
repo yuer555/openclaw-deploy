@@ -1,6 +1,22 @@
 #!/bin/sh
 set -e
 
+# 读取角色配置
+AGENT_ROLE="${AGENT_ROLE:-service}"
+echo "Agent role: ${AGENT_ROLE}"
+
+# 拷贝角色文件到 openclaw workspace
+ROLE_DIR="/opt/agent-roles/${AGENT_ROLE}"
+if [ ! -d "$ROLE_DIR" ]; then
+  echo "ERROR: Role directory not found: ${ROLE_DIR}"
+  echo "Available roles: $(ls /opt/agent-roles/)"
+  exit 1
+fi
+
+mkdir -p /root/.openclaw/workspace
+cp -r "${ROLE_DIR}/"* /root/.openclaw/workspace/
+echo "Role files copied from ${ROLE_DIR} to workspace"
+
 # Configure openclaw with token auth and API provider
 mkdir -p /root/.openclaw/agents/main/agent
 INTERNAL_TOKEN="${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}"
@@ -46,8 +62,6 @@ CONF
 
 elif [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
   # 方式二：第三方流量池（自定义 provider，支持任意模型）
-  # MODEL_PROVIDER 用自定义名称（如 gmn），避免与 openclaw 内置 provider 冲突
-  # MODEL_API 指定 API 协议格式（默认 openai-responses）
   API_FORMAT="${MODEL_API:-openai-responses}"
 
   cat > /root/.openclaw/openclaw.json << CONF
@@ -135,16 +149,16 @@ fi
 
 export OPENCLAW_INTERNAL_TOKEN="$INTERNAL_TOKEN"
 
-echo "Starting OpenClaw dispatcher (port 18789)..."
+echo "Starting OpenClaw agent [${AGENT_ROLE}] (port 18789)..."
 cd /root/.openclaw/workspace
 npx openclaw gateway --allow-unconfigured &
 OPENCLAW_PID=$!
 
 # Wait for openclaw to be ready
-echo "Waiting for dispatcher to be ready..."
+echo "Waiting for agent to be ready..."
 for i in $(seq 1 30); do
     if curl -sf http://localhost:18789/health > /dev/null 2>&1; then
-        echo "Dispatcher ready."
+        echo "Agent ready."
         break
     fi
     sleep 2

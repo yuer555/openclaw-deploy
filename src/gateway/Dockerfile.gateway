@@ -1,6 +1,6 @@
 FROM openclaw-base:latest
 
-LABEL description="OpenClaw Gateway - Flask + Dispatcher openclaw"
+LABEL description="OpenClaw Single Container - Flask Gateway + openclaw Agent"
 
 # 安装 Python 和 Docker CLI（base 镜像已有 node/git/curl/openclaw）
 RUN apt-get update && \
@@ -31,15 +31,17 @@ WORKDIR /app
 COPY src/gateway/requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
-# 复制网关源码
+# 复制网关源码（不再需要 agent_registry.py）
 COPY src/gateway/wecom_gateway.py .
-COPY src/gateway/agent_registry.py .
 
-# 预置调度员 workspace 文件到 openclaw workspace 目录
-RUN mkdir -p /root/.openclaw/workspace
-COPY config/agents/workspace/dispatcher/ /root/.openclaw/workspace/
+# 预置所有角色目录到 /opt/agent-roles/，运行时由 entrypoint 按 AGENT_ROLE 选择
+COPY config/agents/workspace/operation/ /opt/agent-roles/operation/
+COPY config/agents/workspace/product/ /opt/agent-roles/product/
+COPY config/agents/workspace/development/ /opt/agent-roles/development/
+COPY config/agents/workspace/testing/ /opt/agent-roles/testing/
+COPY config/agents/workspace/service/ /opt/agent-roles/service/
 
-# 启动脚本：先启动 openclaw 调度员，再启动 Flask
+# 启动脚本：先启动 openclaw agent，再启动 Flask
 COPY src/gateway/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

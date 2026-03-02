@@ -37,10 +37,12 @@ print_success "Gateway 已停止"
 
 # 停止并删除容器
 print_info "停止并删除容器..."
-docker compose -f docker-compose.prod.yml --env-file .env.prod down -v 2>/dev/null || true
+docker compose -f docker-compose.prod.yml --env-file .env.prod \
+    --profile operation --profile product --profile development --profile testing --profile service \
+    down -v 2>/dev/null || true
 
 # 强制删除残留容器
-for NAME in openclaw-dispatcher openclaw-agent-operation openclaw-agent-product \
+for NAME in openclaw-agent-operation openclaw-agent-product \
             openclaw-agent-development openclaw-agent-testing openclaw-agent-service; do
     docker rm -f "$NAME" 2>/dev/null || true
 done

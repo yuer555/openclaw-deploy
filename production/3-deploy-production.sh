@@ -4,7 +4,7 @@
 # 功能描述: 部署 OpenClaw 生产环境（构建镜像、创建目录）
 # 使用方法: ./3-deploy-production.sh
 # 执行位置: 服务器
-# 版本: V2.0
+# 版本: V3.0
 #==============================================================================
 
 set -e
@@ -67,47 +67,42 @@ print_success "配置验证通过"
 print_step "步骤 3/4: 创建数据目录"
 
 sudo mkdir -p /opt/openclaw/data/gateway
-sudo mkdir -p /opt/openclaw/data/dispatcher
 sudo mkdir -p /opt/openclaw/data/agents/{operation,product,development,testing,service}
-sudo mkdir -p /opt/openclaw/logs/gateway
 sudo mkdir -p /opt/openclaw/shared-files
+sudo mkdir -p /opt/openclaw/logs/gateway
 sudo chown -R $USER:$USER /opt/openclaw
 chmod -R 755 /opt/openclaw
-print_success "数据目录创建完成（含 shared-files）"
+print_success "数据目录创建完成"
 
 #------------------------------------------------------------------------------
-# 步骤 4: 构建 Docker 镜像（base + agents）
+# 步骤 4: 构建 Docker 镜像
 #------------------------------------------------------------------------------
 print_step "步骤 4/4: 构建 Docker 镜像"
 
-print_info "构建 openclaw-base:latest（含 openclaw 依赖，可缓存）..."
+print_info "构建 openclaw-base:latest..."
 docker build \
     -f ../config/Dockerfile.base \
     -t openclaw-base:latest \
     ..
 print_success "openclaw-base:latest 构建完成"
 
-for ROLE in dispatcher operation product development testing service; do
-    # dispatcher 的镜像 tag 是 openclaw-dispatcher:prod（无 agent- 前缀）
-    # 其他角色的镜像 tag 是 openclaw-agent-{role}:prod
-    if [ "$ROLE" = "dispatcher" ]; then
-        IMAGE_TAG="openclaw-dispatcher:prod"
-    else
-        IMAGE_TAG="openclaw-agent-${ROLE}:prod"
-    fi
-    print_info "构建 ${IMAGE_TAG} ..."
+for ROLE in operation product development testing service; do
+    print_info "构建 openclaw-agent-${ROLE}:prod ..."
     docker build --no-cache \
         -f ../config/Dockerfile.agents \
         --build-arg ROLE=${ROLE} \
-        -t ${IMAGE_TAG} \
+        -t openclaw-agent-${ROLE}:prod \
         ..
-    print_success "${IMAGE_TAG} 构建完成"
+    print_success "openclaw-agent-${ROLE}:prod 构建完成"
 done
 
 echo ""
 print_success "部署准备完成！"
 echo ""
+docker images | grep "openclaw-"
+echo ""
 echo -e "${YELLOW}下一步：${NC}"
-echo "  1. 安装宿主机 Gateway 依赖: ./setup-host-gateway.sh"
-echo "  2. 启动服务: ./5-start-production.sh"
+echo "  1. 安装宿主机依赖: ./setup-host-gateway.sh"
+echo "  2. 编辑配置: vi .env.prod（启用 Agent，填入 Token/Key）"
+echo "  3. 启动服务: ./5-start-production.sh"
 echo ""

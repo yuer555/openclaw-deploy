@@ -1,9 +1,9 @@
 #!/bin/bash
 #==============================================================================
 # 脚本名称: 2-start-local.sh
-# 功能描述: 启动本地测试服务（宿主机 gateway + 5 个 agent 容器）
+# 功能描述: 启动本地测试服务（agent 容器 + 宿主机 Gateway）
 # 使用方法: ./2-start-local.sh
-# 版本: V2.0
+# 版本: V3.0
 #==============================================================================
 
 set -e
@@ -40,12 +40,11 @@ set -a
 source .env.local
 set +a
 
-# 创建本地共享文件目录
+# 创建共享文件目录
 SHARED_FILES_BASE="${SHARED_FILES_BASE:-$PROJECT_DIR/shared-files}"
 mkdir -p "$SHARED_FILES_BASE"
 export SHARED_FILES_BASE
-export CONTAINER_FILES_BASE="${CONTAINER_FILES_BASE:-/shared-files}"
-# __CONTINUE_HERE__
+export CONTAINER_FILES_BASE="${CONTAINER_FILES_BASE:-/root/.openclaw/workspace/shared-files}"
 
 #------------------------------------------------------------------------------
 # 步骤 2: 确保 Docker 网络存在
@@ -64,7 +63,21 @@ fi
 #------------------------------------------------------------------------------
 print_step "步骤 3/4: 启动虚拟员工容器"
 
-docker compose -f ../config/docker-compose.agents.yml --env-file .env.local up -d --force-recreate --no-build
+# 只启动 AGENT_*_ENABLE=true 的容器
+ENABLED_SERVICES=""
+for ROLE in operation product development testing service; do
+    ENABLE_VAR="AGENT_$(echo $ROLE | tr '[:lower:]' '[:upper:]')_ENABLE"
+    if [ "${!ENABLE_VAR}" = "true" ]; then
+        ENABLED_SERVICES="$ENABLED_SERVICES openclaw-agent-${ROLE}"
+    fi
+done
+
+if [ -z "$ENABLED_SERVICES" ]; then
+    print_error "没有启用任何 Agent！请编辑 .env.local 设置 AGENT_*_ENABLE=true"
+    exit 1
+fi
+
+docker compose -f ../config/docker-compose.agents.yml --env-file .env.local up -d --force-recreate --no-build $ENABLED_SERVICES
 print_success "虚拟员工容器已启动"
 
 #------------------------------------------------------------------------------
@@ -81,13 +94,14 @@ print_success "Gateway 已启动"
 echo ""
 print_success "服务启动完成！"
 echo ""
-echo -e "${YELLOW}服务地址：${NC}"
-echo "  Gateway:     http://localhost:8000"
-echo "  Operation:   http://localhost:18791"
-echo "  Product:     http://localhost:18792"
-echo "  Development: http://localhost:18793"
-echo "  Testing:     http://localhost:18794"
-echo "  Service:     http://localhost:18795"
+echo -e "${YELLOW}已启用的 Agent：${NC}"
+for ROLE in operation product development testing service; do
+    ENABLE_VAR="AGENT_$(echo $ROLE | tr '[:lower:]' '[:upper:]')_ENABLE"
+    PORT_VAR="AGENT_$(echo $ROLE | tr '[:lower:]' '[:upper:]')_PORT"
+    if [ "${!ENABLE_VAR}" = "true" ]; then
+        echo "  ✅ ${ROLE}: http://localhost:${!PORT_VAR} → /:8000/${ROLE}/wecom/callback"
+    fi
+done
 echo ""
 echo -e "${YELLOW}常用命令：${NC}"
 echo "  Gateway 日志:  tail -f /tmp/openclaw/flask.log"

@@ -1,28 +1,14 @@
 #==============================================================================
 # OpenClaw 生产环境 - Docker Compose 配置
-# 版本: V2.0（三层架构）
-# 用途: 生产部署，Docker 固定 IP，Gateway 运行在宿主机
-# 子网: 172.20.0.0/16
-#   gateway:     宿主机直接运行（:8000 + dispatcher :18789）
-#   operation:   172.20.0.11:18789
-#   product:     172.20.0.12:18789
-#   development: 172.20.0.13:18789
-#   testing:     172.20.0.14:18789
-#   service:     172.20.0.15:18789
+# 版本: V3.0（多 Agent 配置化部署）
+# 用途: Agent 容器（Gateway 运行在宿主机）
 #==============================================================================
 
 services:
-  #----------------------------------------------------------------------------
-  # Dispatcher 容器（AI 路由调度员）
-  #----------------------------------------------------------------------------
-  openclaw-dispatcher:
-    build:
-      context: ..
-      dockerfile: config/Dockerfile.agents
-      args:
-        ROLE: dispatcher
-    image: openclaw-dispatcher:prod
-    container_name: openclaw-dispatcher
+  #--- 虚拟员工容器 ---
+  openclaw-agent-operation:
+    image: openclaw-agent-operation:prod
+    container_name: openclaw-agent-operation
     restart: always
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
@@ -33,71 +19,31 @@ services:
       - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
       - MODEL_API=${MODEL_API:-openai-responses}
       - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
+      - OPENCLAW_TIMEOUT=${OPENCLAW_TIMEOUT:-2700}
+      - CONTAINER_FILES_BASE=${CONTAINER_FILES_BASE:-/root/.openclaw/workspace/shared-files}
     ports:
-      - "18789:18789"
+      - "${AGENT_OPERATION_PORT:-18791}:18789"
     volumes:
-      - /opt/openclaw/data/dispatcher:/workspace
-      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "10"
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
+      - /opt/openclaw/data/agents/operation:/root/.openclaw/workspace
     networks:
-      openclaw-network:
-        ipv4_address: 172.20.0.10
-  # 虚拟员工容器
-  #----------------------------------------------------------------------------
-  openclaw-agent-operation:
-    build:
-      context: ..
-      dockerfile: config/Dockerfile.agents
-      args:
-        ROLE: operation
-    image: openclaw-agent-operation:prod
-    container_name: openclaw-agent-operation
-    restart: always
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${API_KEY:-}
-      - API_BASE_URL=${API_BASE_URL:-}
-      - API_KEY=${API_KEY:-}
-      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
-      - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
-      - MODEL_API=${MODEL_API:-openai-responses}
-      - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
-    expose:
-      - "18789"
-    volumes:
-      - /opt/openclaw/data/agents/operation:/workspace
-      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "10"
-    networks:
-      openclaw-network:
+      openclaw-prod-net:
         ipv4_address: 172.20.0.11
+    profiles:
+      - operation
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   openclaw-agent-product:
-    build:
-      context: ..
-      dockerfile: config/Dockerfile.agents
-      args:
-        ROLE: product
     image: openclaw-agent-product:prod
     container_name: openclaw-agent-product
     restart: always
@@ -106,36 +52,35 @@ services:
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
-      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-6}
       - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
       - MODEL_API=${MODEL_API:-openai-responses}
       - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
-    expose:
-      - "18789"
+      - OPENCLAW_TIMEOUT=${OPENCLAW_TIMEOUT:-2700}
+      - CONTAINER_FILES_BASE=${CONTAINER_FILES_BASE:-/root/.openclaw/workspace/shared-files}
+    ports:
+      - "${AGENT_PRODUCT_PORT:-18792}:18789"
     volumes:
-      - /opt/openclaw/data/agents/product:/workspace
-      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
+      - /opt/openclaw/data/agents/product:/root/.openclaw/workspace
+    networks:
+      openclaw-prod-net:
+        ipv4_address: 172.20.0.12
+    profiles:
+      - product
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "10"
-    networks:
-      openclaw-network:
-        ipv4_address: 172.20.0.12
 
   openclaw-agent-development:
-    build:
-      context: ..
-      dockerfile: config/Dockerfile.agents
-      args:
-        ROLE: development
     image: openclaw-agent-development:prod
     container_name: openclaw-agent-development
     restart: always
@@ -144,36 +89,35 @@ services:
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
-      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-6}
       - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
       - MODEL_API=${MODEL_API:-openai-responses}
       - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
-    expose:
-      - "18789"
+      - OPENCLAW_TIMEOUT=${OPENCLAW_TIMEOUT:-2700}
+      - CONTAINER_FILES_BASE=${CONTAINER_FILES_BASE:-/root/.openclaw/workspace/shared-files}
+    ports:
+      - "${AGENT_DEVELOPMENT_PORT:-18793}:18789"
     volumes:
-      - /opt/openclaw/data/agents/development:/workspace
-      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
+      - /opt/openclaw/data/agents/development:/root/.openclaw/workspace
+    networks:
+      openclaw-prod-net:
+        ipv4_address: 172.20.0.13
+    profiles:
+      - development
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "10"
-    networks:
-      openclaw-network:
-        ipv4_address: 172.20.0.13
 
   openclaw-agent-testing:
-    build:
-      context: ..
-      dockerfile: config/Dockerfile.agents
-      args:
-        ROLE: testing
     image: openclaw-agent-testing:prod
     container_name: openclaw-agent-testing
     restart: always
@@ -182,36 +126,35 @@ services:
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
-      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-6}
       - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
       - MODEL_API=${MODEL_API:-openai-responses}
       - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
-    expose:
-      - "18789"
+      - OPENCLAW_TIMEOUT=${OPENCLAW_TIMEOUT:-2700}
+      - CONTAINER_FILES_BASE=${CONTAINER_FILES_BASE:-/root/.openclaw/workspace/shared-files}
+    ports:
+      - "${AGENT_TESTING_PORT:-18794}:18789"
     volumes:
-      - /opt/openclaw/data/agents/testing:/workspace
-      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
+      - /opt/openclaw/data/agents/testing:/root/.openclaw/workspace
+    networks:
+      openclaw-prod-net:
+        ipv4_address: 172.20.0.14
+    profiles:
+      - testing
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "10"
-    networks:
-      openclaw-network:
-        ipv4_address: 172.20.0.14
 
   openclaw-agent-service:
-    build:
-      context: ..
-      dockerfile: config/Dockerfile.agents
-      args:
-        ROLE: service
     image: openclaw-agent-service:prod
     container_name: openclaw-agent-service
     restart: always
@@ -220,37 +163,38 @@ services:
       - ANTHROPIC_API_KEY=${API_KEY:-}
       - API_BASE_URL=${API_BASE_URL:-}
       - API_KEY=${API_KEY:-}
-      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-20250514}
+      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-6}
       - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
       - MODEL_API=${MODEL_API:-openai-responses}
       - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
-    expose:
-      - "18789"
+      - OPENCLAW_TIMEOUT=${OPENCLAW_TIMEOUT:-2700}
+      - CONTAINER_FILES_BASE=${CONTAINER_FILES_BASE:-/root/.openclaw/workspace/shared-files}
+    ports:
+      - "${AGENT_SERVICE_PORT:-18795}:18789"
     volumes:
-      - /opt/openclaw/data/agents/service:/workspace
-      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files:ro
+      - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
+      - /opt/openclaw/data/agents/service:/root/.openclaw/workspace
+    networks:
+      openclaw-prod-net:
+        ipv4_address: 172.20.0.15
+    profiles:
+      - service
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "10"
-    networks:
-      openclaw-network:
-        ipv4_address: 172.20.0.15
 
-#------------------------------------------------------------------------------
-# 网络配置（固定子网）
-#------------------------------------------------------------------------------
 networks:
-  openclaw-network:
+  openclaw-prod-net:
     driver: bridge
     name: openclaw-prod-net
     ipam:
       config:
-        - subnet: 172.20.0.0/16
+        - subnet: 172.20.0.0/24

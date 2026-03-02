@@ -1,47 +1,10 @@
 #==============================================================================
 # OpenClaw 虚拟员工容器配置
-# 版本: V2.0（三层架构）
+# 版本: V3.0（无 dispatcher，Gateway 在宿主机运行）
 # 每个员工独立容器，各自运行 openclaw，预置角色性格
 #==============================================================================
 
 services:
-  openclaw-dispatcher:
-    build:
-      context: ..
-      dockerfile: config/Dockerfile.agents
-      args:
-        ROLE: dispatcher
-    image: openclaw-dispatcher:local
-    container_name: openclaw-dispatcher
-    restart: unless-stopped
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${API_KEY:-}
-      - API_BASE_URL=${API_BASE_URL:-}
-      - API_KEY=${API_KEY:-}
-      - MODEL_NAME=${MODEL_NAME:-claude-sonnet-4-6}
-      - MODEL_PROVIDER=${MODEL_PROVIDER:-anthropic}
-      - MODEL_API=${MODEL_API:-openai-responses}
-      - OPENCLAW_INTERNAL_TOKEN=${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}
-    ports:
-      - "18789:18789"
-    volumes:
-      - ../data/dispatcher:/workspace
-      - ../shared-files:/root/.openclaw/workspace/shared-files:ro
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    networks:
-      - openclaw-network
-
   openclaw-agent-operation:
     build:
       context: ..

@@ -1,26 +1,22 @@
 #!/bin/bash
 #==============================================================================
 # 脚本名称: 0-build-images.sh
-# 功能描述: 构建 openclaw-gateway 和 openclaw-agent 本地镜像
+# 功能描述: 构建 openclaw-base 和 agent 镜像
 # 使用方法: ./0-build-images.sh
-# 版本: V2.0
+# 版本: V3.0
 #==============================================================================
 
 set -e
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
 print_info()    { echo -e "${BLUE}ℹ️  $1${NC}"; }
 print_success() { echo -e "${GREEN}✅ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
-print_error()   { echo -e "${RED}❌ $1${NC}"; }
 print_step()    { echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n${BLUE}📍 $1${NC}\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"; }
 
-# 切换到项目根目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
@@ -31,23 +27,7 @@ docker build \
     .
 print_success "openclaw-base:latest 构建完成"
 
-print_step "构建 Gateway 镜像（openclaw-gateway:local）"
-docker build \
-    -f src/gateway/Dockerfile.gateway \
-    -t openclaw-gateway:local \
-    .
-print_success "openclaw-gateway:local 构建完成"
-
-print_step "构建 Dispatcher + Agent 镜像（6 个角色）"
-
-# dispatcher 单独构建（tag 无 agent- 前缀，与 compose 一致）
-print_info "构建 openclaw-dispatcher:local ..."
-docker build --no-cache \
-    -f config/Dockerfile.agents \
-    --build-arg ROLE=dispatcher \
-    -t openclaw-dispatcher:local \
-    .
-print_success "openclaw-dispatcher:local 构建完成"
+print_step "构建 Agent 镜像（5 个角色）"
 
 for ROLE in operation product development testing service; do
     print_info "构建 openclaw-agent-${ROLE}:local ..."
