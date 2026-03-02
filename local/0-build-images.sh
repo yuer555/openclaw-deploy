@@ -38,7 +38,16 @@ docker build \
     .
 print_success "openclaw-gateway:local 构建完成"
 
-print_step "构建 Agent 镜像（5 个角色）"
+print_step "构建 Dispatcher + Agent 镜像（6 个角色）"
+
+# dispatcher 单独构建（tag 无 agent- 前缀，与 compose 一致）
+print_info "构建 openclaw-dispatcher:local ..."
+docker build --no-cache \
+    -f config/Dockerfile.agents \
+    --build-arg ROLE=dispatcher \
+    -t openclaw-dispatcher:local \
+    .
+print_success "openclaw-dispatcher:local 构建完成"
 
 for ROLE in operation product development testing service; do
     print_info "构建 openclaw-agent-${ROLE}:local ..."

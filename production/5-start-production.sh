@@ -50,7 +50,9 @@ print_success "已有服务已停止"
 print_step "步骤 2/4: 启动 Dispatcher + Agent 容器"
 
 print_info "启动 dispatcher + agent 容器..."
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+# --force-recreate: 强制重建容器（确保使用最新镜像）
+# --no-build: 不重新构建镜像（使用 3-deploy-production.sh 已构建的镜像，避免缓存覆盖）
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --force-recreate --no-build
 print_success "Dispatcher + Agent 容器已启动"
 
 #------------------------------------------------------------------------------

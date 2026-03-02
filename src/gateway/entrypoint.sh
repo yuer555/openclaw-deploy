@@ -10,6 +10,7 @@ OPENAI_KEY="${OPENAI_API_KEY:-}"
 API_BASE="${API_BASE_URL:-}"
 API_SECRET="${API_KEY:-}"
 MODEL="${MODEL_NAME:-claude-sonnet-4-20250514}"
+PROVIDER="${MODEL_PROVIDER:-anthropic}"
 
 if [ -n "$OPENAI_KEY" ]; then
   # 方式一：直接使用 OpenAI API
@@ -44,20 +45,25 @@ CONF
   echo "Using OpenAI API (OPENAI_API_KEY), model: openai/gpt-4o"
 
 elif [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
-  # 方式二：第三方 API（通过 anthropic provider 代理）
+  # 方式二：第三方流量池（自定义 provider，支持任意模型）
+  # MODEL_PROVIDER 用自定义名称（如 gmn），避免与 openclaw 内置 provider 冲突
+  # MODEL_API 指定 API 协议格式（默认 openai-responses）
+  API_FORMAT="${MODEL_API:-openai-responses}"
+
   cat > /root/.openclaw/openclaw.json << CONF
 {
   "agents": {
     "defaults": {
       "model": {
-        "primary": "anthropic/${MODEL}"
+        "primary": "${PROVIDER}/${MODEL}"
       },
       "models": {
-        "anthropic/${MODEL}": {}
+        "${PROVIDER}/${MODEL}": {}
       }
     }
   },
   "gateway": {
+    "bind": "lan",
     "auth": {
       "mode": "token",
       "token": "${INTERNAL_TOKEN}"
@@ -66,6 +72,9 @@ elif [ -n "$API_BASE" ] && [ -n "$API_SECRET" ]; then
       "endpoints": {
         "responses": { "enabled": true }
       }
+    },
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
     }
   }
 }
@@ -73,27 +82,35 @@ CONF
   cat > /root/.openclaw/agents/main/agent/models.json << CONF
 {
   "providers": {
-    "anthropic": {
+    "${PROVIDER}": {
       "baseUrl": "${API_BASE}",
-      "models": []
+      "apiKey": "${API_SECRET}",
+      "auth": "api-key",
+      "api": "${API_FORMAT}",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "${MODEL}",
+          "name": "${MODEL}"
+        }
+      ]
     }
   }
 }
 CONF
   cat > /root/.openclaw/agents/main/agent/auth-profiles.json << CONF
 {
+  "version": 1,
   "profiles": {
-    "anthropic:manual": {
-      "provider": "anthropic",
-      "kind": "apiKey",
-      "apiKey": "${API_SECRET}",
-      "label": "third-party"
+    "${PROVIDER}:default": {
+      "type": "api_key",
+      "provider": "${PROVIDER}",
+      "key": "${API_SECRET}"
     }
   }
 }
 CONF
-  export ANTHROPIC_API_KEY="${API_SECRET}"
-  echo "Using third-party API: ${API_BASE} model: anthropic/${MODEL}"
+  echo "Using third-party API: ${API_BASE} provider: ${PROVIDER} model: ${PROVIDER}/${MODEL} api: ${API_FORMAT}"
 
 else
   cat > /root/.openclaw/openclaw.json << CONF

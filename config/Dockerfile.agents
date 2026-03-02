@@ -20,17 +20,20 @@ WORKDIR /root/.openclaw/workspace
 EXPOSE 18789
 
 # 启动时：配置 API（OPENAI_API_KEY 优先）、启动 gateway
+# 支持 MODEL_PROVIDER 自定义 provider 名（避免与 openclaw 内置 provider 冲突）
+# 支持 MODEL_API 指定 API 协议格式（默认 openai-responses）
 CMD ["sh", "-c", "\
   mkdir -p /root/.openclaw/agents/main/agent && \
   INTERNAL_TOKEN=\"${OPENCLAW_INTERNAL_TOKEN:-openclaw-internal-secret}\" && \
+  PROVIDER=\"${MODEL_PROVIDER:-anthropic}\" && \
+  API_FORMAT=\"${MODEL_API:-openai-responses}\" && \
   if [ -n \"$OPENAI_API_KEY\" ]; then \
     printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openai/gpt-4o\"},\"models\":{\"openai/gpt-4o\":{}}}},\"gateway\":{\"bind\":\"lan\",\"auth\":{\"mode\":\"token\",\"token\":\"%s\"},\"http\":{\"endpoints\":{\"responses\":{\"enabled\":true}}},\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' \"$INTERNAL_TOKEN\" > /root/.openclaw/openclaw.json; \
   elif [ -n \"$API_BASE_URL\" ] && [ -n \"$API_KEY\" ]; then \
     MODEL=${MODEL_NAME:-claude-sonnet-4-20250514} && \
-    printf '{\"providers\":{\"anthropic\":{\"baseUrl\":\"%s\",\"models\":[]}}}' \"$API_BASE_URL\" > /root/.openclaw/agents/main/agent/models.json && \
-    printf '{\"profiles\":{\"anthropic:manual\":{\"provider\":\"anthropic\",\"kind\":\"apiKey\",\"apiKey\":\"%s\",\"label\":\"third-party\"}}}' \"$API_KEY\" > /root/.openclaw/agents/main/agent/auth-profiles.json && \
-    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"anthropic/%s\"},\"models\":{\"anthropic/%s\":{}}}},\"gateway\":{\"bind\":\"lan\",\"auth\":{\"mode\":\"token\",\"token\":\"%s\"},\"http\":{\"endpoints\":{\"responses\":{\"enabled\":true}}},\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' \"$MODEL\" \"$MODEL\" \"$INTERNAL_TOKEN\" > /root/.openclaw/openclaw.json && \
-    export ANTHROPIC_API_KEY=\"$API_KEY\"; \
+    printf '{\"providers\":{\"%s\":{\"baseUrl\":\"%s\",\"apiKey\":\"%s\",\"auth\":\"api-key\",\"api\":\"%s\",\"authHeader\":true,\"models\":[{\"id\":\"%s\",\"name\":\"%s\"}]}}}' \"$PROVIDER\" \"$API_BASE_URL\" \"$API_KEY\" \"$API_FORMAT\" \"$MODEL\" \"$MODEL\" > /root/.openclaw/agents/main/agent/models.json && \
+    printf '{\"version\":1,\"profiles\":{\"%s:default\":{\"type\":\"api_key\",\"provider\":\"%s\",\"key\":\"%s\"}}}' \"$PROVIDER\" \"$PROVIDER\" \"$API_KEY\" > /root/.openclaw/agents/main/agent/auth-profiles.json && \
+    printf '{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"%s/%s\"},\"models\":{\"%s/%s\":{}}}},\"gateway\":{\"bind\":\"lan\",\"auth\":{\"mode\":\"token\",\"token\":\"%s\"},\"http\":{\"endpoints\":{\"responses\":{\"enabled\":true}}},\"controlUi\":{\"dangerouslyAllowHostHeaderOriginFallback\":true}}}' \"$PROVIDER\" \"$MODEL\" \"$PROVIDER\" \"$MODEL\" \"$INTERNAL_TOKEN\" > /root/.openclaw/openclaw.json; \
   fi && \
   cd /root/.openclaw/workspace && \
   npx openclaw gateway --allow-unconfigured --bind lan"]

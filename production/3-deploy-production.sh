@@ -88,13 +88,20 @@ docker build \
 print_success "openclaw-base:latest 构建完成"
 
 for ROLE in dispatcher operation product development testing service; do
-    print_info "构建 openclaw-agent-${ROLE}:prod ..."
+    # dispatcher 的镜像 tag 是 openclaw-dispatcher:prod（无 agent- 前缀）
+    # 其他角色的镜像 tag 是 openclaw-agent-{role}:prod
+    if [ "$ROLE" = "dispatcher" ]; then
+        IMAGE_TAG="openclaw-dispatcher:prod"
+    else
+        IMAGE_TAG="openclaw-agent-${ROLE}:prod"
+    fi
+    print_info "构建 ${IMAGE_TAG} ..."
     docker build --no-cache \
         -f ../config/Dockerfile.agents \
         --build-arg ROLE=${ROLE} \
-        -t openclaw-agent-${ROLE}:prod \
+        -t ${IMAGE_TAG} \
         ..
-    print_success "openclaw-agent-${ROLE}:prod 构建完成"
+    print_success "${IMAGE_TAG} 构建完成"
 done
 
 echo ""

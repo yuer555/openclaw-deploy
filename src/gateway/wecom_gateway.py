@@ -13,6 +13,7 @@ import struct
 import requests
 from datetime import datetime, timedelta
 import threading
+import queue
 import mimetypes
 import re as _re
 import subprocess
@@ -186,7 +187,7 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700):
     ws = websocket.create_connection(ws_url, timeout=timeout)
     try:
         # Step 1: 收 challenge
-        ws.recv()  # connect.challenge（无需处理）
+        ws.recv()
 
         # Step 2: connect 握手
         ws.send(json.dumps({
@@ -221,7 +222,9 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700):
             if evt.get('type') == 'event' and evt.get('event') == 'chat':
                 payload = evt.get('payload', {})
                 # 校验 sessionKey，忽略其他用户的 broadcast 事件
-                if payload.get('sessionKey') and payload.get('sessionKey') != session_key:
+                # openclaw 会在 sessionKey 前加 "agent:main:" 前缀，用包含匹配
+                evt_sk = (payload.get('sessionKey') or '').lower()
+                if evt_sk and session_key.lower() not in evt_sk:
                     continue
                 if payload.get('state') == 'final':
                     msg = payload.get('message', {})
@@ -306,7 +309,7 @@ class AIDispatcher:
                     # 尝试从 markdown 代码块中提取 JSON（dispatcher 有时会用 ```json ... ``` 包裹）
                     m = _re.search(r'```(?:json)?\s*(\{[^`]+\})\s*```', reply_text, _re.DOTALL)
                     if not m:
-                        m = _re.search(r'\{[^}]+\}', reply_text)
+                        m = _re.search(r'\{.*\}', reply_text, _re.DOTALL)
                     if m:
                         try:
                             dispatch_data = json.loads(m.group(1) if m.lastindex else m.group())
@@ -879,46 +882,80 @@ def extract_message_content(msg, user_id=''):
     return dispatcher_main, full_main
 
 
-# ============= 异步处理 =============
+# ============= 异步处理（per-user 消息管道）=============
+
+_user_queues = {}  # user_id -> queue.Queue
+_user_workers = {}  # user_id -> Thread
+_queue_lock = threading.Lock()
+
+
+def _user_worker(user_id):
+    """单个用户的消息 worker，串行处理该用户的所有消息"""
+    q = _user_queues[user_id]
+    while True:
+        try:
+            task = q.get(timeout=300)  # 5分钟无消息则退出 worker
+        except queue.Empty:
+            with _queue_lock:
+                # 再检查一次，防止刚好有新消息入队
+                if q.empty():
+                    del _user_queues[user_id]
+                    del _user_workers[user_id]
+                    logger.info(f"用户 {user_id} worker 空闲退出")
+                    return
+                continue
+        try:
+            _process_single_message(**task)
+        except Exception as e:
+            logger.error(f"❌ 处理消息失败 (user={user_id}): {e}")
+        finally:
+            q.task_done()
+
+def _process_single_message(user_id, dispatcher_content, full_content, task_id, response_url):
+    """处理单条消息：路由 → 调用 agent → 回复"""
+    agent_id, agent_url, direct_reply, route_context = route_message(dispatcher_content, user_id)
+    log_task(task_id, user_id, agent_id, dispatcher_content, status='processing')
+
+    if direct_reply:
+        reply = f"【调度员】\n{direct_reply}"
+        update_task_status(task_id, 'success', reply[:500])
+    else:
+        agent_message = full_content
+        if route_context:
+            if len(route_context) > 500:
+                route_context = route_context[:500] + '...'
+            agent_message = f"[调度员上下文] {route_context}\n\n用户消息：{full_content}"
+        result = call_openclaw_agent(agent_id, agent_message, user_id, task_id, gateway_url=agent_url)
+        reply = result.get('reply', '处理失败，请稍后再试。')
+        _record_route(user_id, agent_id, reply[:500])
+        agent_name = AGENT_REGISTRY.get(agent_id, {}).get('name', agent_id)
+        reply = f"【{agent_name}】\n{reply}"
+
+    reply = truncate_message(reply)
+    payload = {"msgtype": "markdown", "markdown": {"content": reply}}
+    resp = requests.post(response_url, json=payload, timeout=10)
+    logger.info(f"✅ 主动回复: {resp.status_code}, 长度: {len(reply)}")
+
 
 def process_message_async(user_id, dispatcher_content, full_content, task_id, response_url, crypto, timestamp, nonce):
-    """异步处理消息：先路由，再调用 agent 或直接回复，最后用 response_url 主动回复"""
-    def worker():
-        try:
-            agent_id, agent_url, direct_reply, route_context = route_message(dispatcher_content, user_id)
-            log_task(task_id, user_id, agent_id, dispatcher_content, status='processing')
-
-            if direct_reply:
-                # 调度员直接回复（模糊/闲聊类消息）
-                reply = f"【调度员】\n{direct_reply}"
-                update_task_status(task_id, 'success', reply[:500])
-            else:
-                # 拼接调度员上下文摘要 + 当前消息，让 agent 了解完整诉求
-                agent_message = full_content
-                if route_context:
-                    # 限制 context 长度，防止 dispatcher 输出过长的摘要
-                    if len(route_context) > 500:
-                        route_context = route_context[:500] + '...'
-                    agent_message = f"[调度员上下文] {route_context}\n\n用户消息：{full_content}"
-                result = call_openclaw_agent(agent_id, agent_message, user_id, task_id, gateway_url=agent_url)
-                reply = result.get('reply', '处理失败，请稍后再试。')
-                # 记录 agent 回复到路由上下文，供下次调度员参考
-                _record_route(user_id, agent_id, reply[:500])
-                # 添加虚拟员工标识前缀
-                agent_name = AGENT_REGISTRY.get(agent_id, {}).get('name', agent_id)
-                reply = f"【{agent_name}】\n{reply}"
-            reply = truncate_message(reply)
-            payload = {
-                "msgtype": "markdown",
-                "markdown": {"content": reply}
-            }
-            resp = requests.post(response_url, json=payload, timeout=10)
-            logger.info(f"✅ 主动回复: {resp.status_code}, 长度: {len(reply)}")
-        except Exception as e:
-            logger.error(f"❌ 异步处理消息失败: {e}")
-
-    threading.Thread(target=worker, daemon=True).start()
-    logger.info(f"✅ 已启动异步处理线程: task_id={task_id}")
+    """将消息放入用户队列，串行处理"""
+    task = {
+        'user_id': user_id,
+        'dispatcher_content': dispatcher_content,
+        'full_content': full_content,
+        'task_id': task_id,
+        'response_url': response_url,
+    }
+    with _queue_lock:
+        if user_id not in _user_queues:
+            _user_queues[user_id] = queue.Queue()
+            t = threading.Thread(target=_user_worker, args=(user_id,), daemon=True)
+            _user_workers[user_id] = t
+            t.start()
+            logger.info(f"创建用户 {user_id} 消息 worker")
+        _user_queues[user_id].put(task)
+        qsize = _user_queues[user_id].qsize()
+    logger.info(f"✅ 消息已入队: user={user_id}, task_id={task_id}, 队列长度={qsize}")
 
 
 # ============= 消息去重 =============
@@ -1080,7 +1117,7 @@ def test_route():
     content = data.get('content')
     if not content:
         return jsonify({'error': 'content is required'}), 400
-    agent_id, agent_url, direct_reply = route_message(content)
+    agent_id, agent_url, direct_reply, route_context = route_message(content)
     result = {
         'agent_id': agent_id,
         'agent_url': agent_url,

@@ -64,7 +64,7 @@ fi
 #------------------------------------------------------------------------------
 print_step "步骤 3/4: 启动虚拟员工容器"
 
-docker compose -f ../config/docker-compose.agents.yml --env-file .env.local up -d
+docker compose -f ../config/docker-compose.agents.yml --env-file .env.local up -d --force-recreate --no-build
 print_success "虚拟员工容器已启动"
 
 #------------------------------------------------------------------------------
