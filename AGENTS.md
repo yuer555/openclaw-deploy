@@ -13,6 +13,7 @@
 - **Agent 绑定**: 每个 agent 对接一个企业微信机器人，绑定关系存储在 SQLite
 - **通信协议**: WS / SSE / HTTP（默认 WS）
 - **管理工具**: `scripts/manage-agent.py` 管理 agent-企业微信绑定
+- **安装脚本**: `scripts/install-openclaw.sh` 一键安装配置 OpenClaw + Agent + 人格设定
 
 ### 三种部署模式（自动兼容）
 - **模式 A**: 单 openclaw 实例 + 多 agent（同 URL/Token，不同 agent_id）
@@ -27,6 +28,28 @@
 ```bash
 pip3 install -r src/gateway/requirements.txt
 ```
+
+### 安装配置 OpenClaw
+```bash
+# 一键安装 OpenClaw + 配置模型 + 创建 Agent + 编辑人格设定
+bash scripts/install-openclaw.sh
+
+# 跳过安装，只做配置（OpenClaw 已安装）
+bash scripts/install-openclaw.sh --skip-install
+
+# 只添加新 Agent（交互式创建 + 编辑人格设定）
+bash scripts/install-openclaw.sh --add-agent
+
+# 只添加模型提供商（官方 API Key 或第三方流量池）
+bash scripts/install-openclaw.sh --add-provider
+```
+
+安装脚本五步流程：
+1. 检查环境 & 安装 OpenClaw（需要 Node.js 22+）
+2. 配置模型提供商（Anthropic/OpenAI/DeepSeek 等官方 + GMN 等第三方）
+3. 创建 Agent（workspace、沙箱配置，用 `$EDITOR` 编辑人格设定文件）
+4. 输出 Gateway 集成信息（URL/Token，用于 manage-agent.py）
+5. 最终检查（列出 Agent/模型，健康检查）
 
 ### 启动 Gateway
 ```bash
@@ -80,7 +103,13 @@ openclaw-deploy/
 │   ├── wecom_gateway.py      # Gateway 主程序
 │   └── requirements.txt      # Python 依赖
 ├── scripts/
-│   └── manage-agent.py       # Agent 绑定管理工具
+│   ├── manage-agent.py       # Agent 绑定管理工具
+│   └── install-openclaw.sh   # OpenClaw 一键安装配置脚本
+├── deploy/
+│   ├── install.sh            # Gateway 自动化部署脚本
+│   ├── uninstall.sh          # 卸载脚本
+│   ├── gateway-ctl.sh        # 运维快捷命令
+│   └── openclaw-gateway.service  # systemd 服务文件
 ├── .env.example              # 环境变量示例
 ├── AGENTS.md                 # 本文档
 └── PHASE2-PLAN.md            # 架构方案文档

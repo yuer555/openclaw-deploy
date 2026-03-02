@@ -5,6 +5,13 @@
 Gateway **不管理** OpenClaw 的部署、容器或镜像 — 它只负责消息转发。
 你只需要告诉 Gateway：OpenClaw 的地址和认证 Token。
 
+## 📚 文档导航
+
+- **[用户指南](USER-GUIDE.md)** - 从零开始的傻瓜式教程，10 分钟部署完成
+- **[并发分析](docs/CONCURRENCY-ANALYSIS.md)** - 多用户场景下的性能分析和优化建议
+- **[开发指南](AGENTS.md)** - AI 编码助手的项目规范和常用命令
+- **[架构设计](PHASE2-PLAN.md)** - 纯桥接模式的设计文档
+
 ## 特性
 
 - **纯桥接模式** — Gateway 仅做企业微信与 OpenClaw 之间的消息转发
@@ -35,6 +42,31 @@ Gateway **不管理** OpenClaw 的部署、容器或镜像 — 它只负责消�
 无需额外配置，Gateway 根据 SQLite 中的绑定关系自动路由。
 
 ## 快速开始
+
+### 方式零：安装配置 OpenClaw
+
+如果服务器上还没有安装 OpenClaw，使用一键安装脚本：
+
+```bash
+git clone https://github.com/your-org/openclaw-deploy.git
+cd openclaw-deploy
+
+# 一键安装 OpenClaw + 配置模型 + 创建 Agent + 编辑人格设定
+bash scripts/install-openclaw.sh
+```
+
+安装脚本会自动完成：
+1. 安装 OpenClaw（需要 Node.js 22+）
+2. 配置模型提供商（官方 API Key + 第三方流量池如 GMN）
+3. 创建多个 Agent（各自 workspace、沙箱配置、人格设定）
+4. 输出 Gateway 集成所需的 URL 和 Token
+
+快捷模式：
+```bash
+bash scripts/install-openclaw.sh --skip-install   # 跳过安装，只做配置
+bash scripts/install-openclaw.sh --add-agent       # 只添加新 Agent
+bash scripts/install-openclaw.sh --add-provider    # 只添加模型提供商
+```
 
 ### 方式一：生产环境自动化部署（推荐）
 
@@ -71,7 +103,7 @@ sudo bash deploy/gateway-ctl.sh logs
 #### 环境要求
 
 - Python 3.10+
-- 已部署并运行的 OpenClaw 实例（需要其 URL 和 Token）
+- 已部署并运行的 OpenClaw 实例（可通过 `bash scripts/install-openclaw.sh` 安装）
 - 企业微信应用（需要 Token 和 EncodingAESKey）
 
 #### 1. 安装依赖
@@ -325,7 +357,8 @@ openclaw-deploy/
 │   ├── wecom_gateway.py      # Gateway 主程序
 │   └── requirements.txt      # Python 依赖
 ├── scripts/
-│   └── manage-agent.py       # Agent 绑定管理工具
+│   ├── manage-agent.py       # Agent 绑定管理工具
+│   └── install-openclaw.sh   # OpenClaw 一键安装配置脚本
 ├── deploy/
 │   ├── install.sh            # 自动化部署脚本
 │   ├── uninstall.sh          # 卸载脚本
