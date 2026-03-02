@@ -219,7 +219,7 @@ check_and_install_openclaw() {
 
         if confirm "是否更新到最新版?" "n"; then
             step "更新 OpenClaw..."
-            npm install -g openclaw@latest
+            sudo npm install -g openclaw@latest
             success "已更新到 $(openclaw --version)"
         fi
     else
@@ -231,7 +231,7 @@ check_and_install_openclaw() {
 
         case "$install_method" in
             0)
-                npm install -g openclaw@latest
+                sudo npm install -g openclaw@latest
                 ;;
             1)
                 curl -fsSL https://openclaw.ai/install.sh | bash
