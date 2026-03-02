@@ -1,0 +1,161 @@
+#!/bin/bash
+set -e
+
+# OpenClaw Gateway 自动化部署脚本
+# 用途: 在全新 Linux 服务器上一键部署 Gateway
+# 用法: sudo bash deploy/install.sh
+
+echo "=========================================="
+echo "OpenClaw Gateway 自动化部署"
+echo "=========================================="
+echo ""
+
+# 检查是否以 root 运行
+if [ "$EUID" -ne 0 ]; then 
+    echo "❌ 请使用 sudo 运行此脚本"
+    exit 1
+fi
+
+# 配置变量
+INSTALL_DIR="/opt/openclaw/gateway"
+DATA_DIR="/opt/openclaw/data"
+LOG_DIR="/var/log/openclaw"
+USER="openclaw"
+GROUP="openclaw"
+
+# 步骤 1: 检测操作系统
+echo "📋 步骤 1/8: 检测操作系统..."
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+    VERSION=$VERSION_ID
+    echo "   检测到: $PRETTY_NAME"
+else
+    echo "❌ 无法检测操作系统"
+    exit 1
+fi
+
+# 步骤 2: 安装系统依赖
+echo ""
+echo "📦 步骤 2/8: 安装系统依赖..."
+case $OS in
+    ubuntu|debian)
+        apt-get update -qq
+        apt-get install -y -qq python3 python3-pip python3-venv sqlite3 curl wget git
+        ;;
+    centos|rhel|rocky|almalinux)
+        yum install -y -q python3 python3-pip sqlite curl wget git
+        ;;
+    *)
+        echo "⚠️  未识别的系统: $OS，尝试继续..."
+        ;;
+esac
+echo "   ✅ 系统依赖安装完成"
+
+# 步骤 3: 创建用户和组
+echo ""
+echo "👤 步骤 3/8: 创建运行用户..."
+if id "$USER" &>/dev/null; then
+    echo "   用户 $USER 已存在，跳过"
+else
+    useradd -r -s /bin/false -d "$INSTALL_DIR" "$USER"
+    echo "   ✅ 已创建用户: $USER"
+fi
+
+# 步骤 4: 创建目录结构
+echo ""
+echo "📁 步骤 4/8: 创建目录结构..."
+mkdir -p "$INSTALL_DIR"
+mkdir -p "$DATA_DIR/gateway"
+mkdir -p "$LOG_DIR"
+
+echo "   ✅ 目录创建完成"
+
+# 步骤 5: 复制代码文件
+echo ""
+echo "📄 步骤 5/8: 复制代码文件..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cp -r "$SCRIPT_DIR/src" "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
+
+# 创建 .env 文件（如果不存在）
+if [ ! -f "$INSTALL_DIR/.env" ]; then
+    if [ -f "$SCRIPT_DIR/.env.example" ]; then
+        cp "$SCRIPT_DIR/.env.example" "$INSTALL_DIR/.env"
+        echo "   ✅ 已创建 .env 配置文件"
+        echo "   ⚠️  请编辑 $INSTALL_DIR/.env 修改配置"
+    else
+        # 创建默认配置
+        cat > "$INSTALL_DIR/.env" <<EOF
+DB_PATH=$DATA_DIR/gateway/gateway.db
+GATEWAY_PORT=8000
+OPENCLAW_PROTOCOL=ws
+OPENCLAW_TIMEOUT=2700
+GATEWAY_URL=http://localhost:8000
+EOF
+        echo "   ✅ 已创建默认 .env 配置文件"
+    fi
+else
+    echo "   .env 已存在，跳过"
+fi
+
+echo "   ✅ 代码文件复制完成"
+
+# 步骤 6: 安装 Python 依赖
+echo ""
+echo "🐍 步骤 6/8: 安装 Python 依赖..."
+pip3 install -q -r "$INSTALL_DIR/src/gateway/requirements.txt"
+echo "   ✅ Python 依赖安装完成"
+
+# 步骤 7: 设置权限
+echo ""
+echo "🔐 步骤 7/8: 设置文件权限..."
+chown -R "$USER:$GROUP" "$INSTALL_DIR"
+chown -R "$USER:$GROUP" "$DATA_DIR"
+chown -R "$USER:$GROUP" "$LOG_DIR"
+chmod 600 "$INSTALL_DIR/.env"
+chmod +x "$INSTALL_DIR/scripts/manage-agent.py"
+echo "   ✅ 权限设置完成"
+
+# 步骤 8: 安装并启动 systemd 服务
+echo ""
+echo "⚙️  步骤 8/8: 配置 systemd 服务..."
+cp "$SCRIPT_DIR/deploy/openclaw-gateway.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable openclaw-gateway.service
+systemctl start openclaw-gateway.service
+
+echo "   ✅ systemd 服务已安装并启动"
+
+# 等待服务启动
+echo ""
+echo "⏳ 等待服务启动..."
+sleep 3
+
+# 检查服务状态
+if systemctl is-active --quiet openclaw-gateway.service; then
+    echo ""
+    echo "=========================================="
+    echo "✅ 部署完成！"
+    echo "=========================================="
+    echo ""
+    echo "服务状态: $(systemctl is-active openclaw-gateway.service)"
+    echo "安装目录: $INSTALL_DIR"
+    echo "数据目录: $DATA_DIR"
+    echo "日志目录: $LOG_DIR"
+    echo ""
+    echo "下一步操作:"
+    echo "  1. 编辑配置: sudo nano $INSTALL_DIR/.env"
+    echo "  2. 重启服务: sudo systemctl restart openclaw-gateway"
+    echo "  3. 添加 Agent: cd $INSTALL_DIR && sudo -u $USER python3 scripts/manage-agent.py add <name>"
+    echo "  4. 查看日志: sudo journalctl -u openclaw-gateway -f"
+    echo "  5. 查看状态: sudo systemctl status openclaw-gateway"
+    echo ""
+    echo "健康检查: curl http://localhost:8000/health"
+    echo ""
+else
+    echo ""
+    echo "❌ 服务启动失败，请查看日志:"
+    echo "   sudo journalctl -u openclaw-gateway -n 50"
+    exit 1
+fi

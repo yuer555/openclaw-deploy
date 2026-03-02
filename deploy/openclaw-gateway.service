@@ -1,0 +1,30 @@
+[Unit]
+Description=OpenClaw 企业微信桥接网关
+After=network.target
+Documentation=https://github.com/your-org/openclaw-deploy
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/opt/openclaw/gateway
+EnvironmentFile=/opt/openclaw/gateway/.env
+ExecStart=/usr/bin/python3 /opt/openclaw/gateway/src/gateway/wecom_gateway.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/openclaw/gateway.log
+StandardError=append:/var/log/openclaw/gateway-error.log
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/openclaw/data /var/log/openclaw
+
+# 资源限制
+LimitNOFILE=65535
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

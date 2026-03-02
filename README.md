@@ -36,19 +36,51 @@ Gateway **不管理** OpenClaw 的部署、容器或镜像 — 它只负责消�
 
 ## 快速开始
 
-### 环境要求
+### 方式一：生产环境自动化部署（推荐）
+
+适用于 Ubuntu/Debian/CentOS/RHEL 等 Linux 服务器，一键部署并配置 systemd 服务，支持崩溃自动重启。
+
+```bash
+# 下载项目
+git clone https://github.com/your-org/openclaw-deploy.git
+cd openclaw-deploy
+
+# 一键部署（需要 root 权限）
+sudo bash deploy/install.sh
+```
+
+部署完成后：
+
+```bash
+# 添加 Agent
+sudo bash deploy/gateway-ctl.sh add-agent dev
+
+# 查看服务状态
+sudo bash deploy/gateway-ctl.sh status
+
+# 查看实时日志
+sudo bash deploy/gateway-ctl.sh logs
+```
+
+**更多运维命令** 见下方 [生产环境运维](#生产环境运维) 章节。
+
+### 方式二：开发环境手动启动
+
+适用于本地开发和测试。
+
+#### 环境要求
 
 - Python 3.10+
 - 已部署并运行的 OpenClaw 实例（需要其 URL 和 Token）
 - 企业微信应用（需要 Token 和 EncodingAESKey）
 
-### 1. 安装依赖
+#### 1. 安装依赖
 
 ```bash
 pip3 install -r src/gateway/requirements.txt
 ```
 
-### 2. 配置环境变量
+#### 2. 配置环境变量
 
 ```bash
 cp .env.example .env
@@ -65,7 +97,7 @@ cp .env.example .env
 | `OPENCLAW_TIMEOUT` | `2700` | OpenClaw 调用超时（秒） |
 | `GATEWAY_URL` | `http://localhost:8000` | Gateway 地址（管理脚本用于通知重载） |
 
-### 3. 启动 Gateway
+#### 3. 启动 Gateway
 
 ```bash
 python3 src/gateway/wecom_gateway.py
@@ -73,7 +105,7 @@ python3 src/gateway/wecom_gateway.py
 
 首次启动时无 Agent，Gateway 正常运行但不处理任何消息。
 
-### 4. 添加 Agent
+#### 4. 添加 Agent
 
 ```bash
 python3 scripts/manage-agent.py add dev
@@ -93,7 +125,7 @@ python3 scripts/manage-agent.py add dev
 https://your-domain/dev/wecom/callback
 ```
 
-### 5. 验证
+#### 5. 验证
 
 ```bash
 # 健康检查
@@ -119,6 +151,132 @@ python3 scripts/manage-agent.py update <name>
 
 # 删除 Agent（需确认）
 python3 scripts/manage-agent.py remove <name>
+```
+
+管理脚本在添加/更新/删除后会自动通知 Gateway 重载配置，无需重启。
+
+## 生产环境运维
+
+### systemd 服务管理
+
+部署后，Gateway 作为 systemd 服务运行，支持崩溃自动重启。
+
+```bash
+# 启动服务
+sudo systemctl start openclaw-gateway
+
+# 停止服务
+sudo systemctl stop openclaw-gateway
+
+# 重启服务
+sudo systemctl restart openclaw-gateway
+
+# 查看状态
+sudo systemctl status openclaw-gateway
+
+# 查看日志
+sudo journalctl -u openclaw-gateway -f
+
+# 开机自启（默认已启用）
+sudo systemctl enable openclaw-gateway
+```
+
+### 快捷运维脚本
+
+`deploy/gateway-ctl.sh` 提供了常用运维命令：
+
+```bash
+# 服务管理
+sudo bash deploy/gateway-ctl.sh start          # 启动
+sudo bash deploy/gateway-ctl.sh stop           # 停止
+sudo bash deploy/gateway-ctl.sh restart        # 重启
+sudo bash deploy/gateway-ctl.sh status         # 状态
+sudo bash deploy/gateway-ctl.sh logs           # 日志
+
+# 监控检查
+sudo bash deploy/gateway-ctl.sh health         # 健康检查
+sudo bash deploy/gateway-ctl.sh agents         # Agent 列表
+sudo bash deploy/gateway-ctl.sh stats          # 统计信息
+
+# Agent 管理
+sudo bash deploy/gateway-ctl.sh add-agent dev       # 添加 Agent
+sudo bash deploy/gateway-ctl.sh list-agents         # 列出所有 Agent
+sudo bash deploy/gateway-ctl.sh update-agent dev    # 更新 Agent
+sudo bash deploy/gateway-ctl.sh remove-agent dev    # 删除 Agent
+
+# 数据库
+sudo bash deploy/gateway-ctl.sh db             # 打开 SQLite 数据库
+```
+
+### 卸载
+
+```bash
+# 完全卸载（保留数据库）
+sudo bash deploy/uninstall.sh
+```
+
+### 目录结构
+
+生产环境安装后的目录结构：
+
+```
+/opt/openclaw/gateway/          # 安装目录
+├── src/gateway/                # 源代码
+├── scripts/                    # 管理脚本
+└── .env                        # 环境配置
+
+/opt/openclaw/data/             # 数据目录
+└── gateway/
+    └── gateway.db              # SQLite 数据库
+
+/var/log/openclaw/              # 日志目录
+├── gateway.log                 # 标准输出
+└── gateway-error.log           # 错误日志
+```
+
+### 崩溃自动重启
+
+systemd 服务配置了以下重启策略：
+
+- `Restart=always` — 任何退出都自动重启
+- `RestartSec=10` — 重启前等待 10 秒
+- 日志自动追加到 `/var/log/openclaw/` 目录
+
+测试自动重启：
+
+```bash
+# 强制结束进程
+sudo pkill -9 -f wecom_gateway.py
+
+# 查看日志，应看到 10 秒后自动重启
+sudo journalctl -u openclaw-gateway -f
+```
+
+## Agent 管理
+
+所有 Agent 绑定通过 `scripts/manage-agent.py` 管理：
+
+```bash
+# 添加 Agent（交互式）
+python3 scripts/manage-agent.py add <name>
+
+# 列出所有 Agent
+python3 scripts/manage-agent.py list
+
+# 更新 Agent（交互式，回车保持原值不变）
+python3 scripts/manage-agent.py update <name>
+
+# 删除 Agent（需确认）
+python3 scripts/manage-agent.py remove <name>
+```
+
+生产环境可使用快捷命令：
+
+```bash
+sudo bash deploy/gateway-ctl.sh add-agent <name>
+sudo bash deploy/gateway-ctl.sh list-agents
+sudo bash deploy/gateway-ctl.sh update-agent <name>
+sudo bash deploy/gateway-ctl.sh remove-agent <name>
 ```
 
 管理脚本在添加/更新/删除后会自动通知 Gateway 重载配置，无需重启。
@@ -168,6 +326,11 @@ openclaw-deploy/
 │   └── requirements.txt      # Python 依赖
 ├── scripts/
 │   └── manage-agent.py       # Agent 绑定管理工具
+├── deploy/
+│   ├── install.sh            # 自动化部署脚本
+│   ├── uninstall.sh          # 卸载脚本
+│   ├── gateway-ctl.sh        # 运维快捷命令
+│   └── openclaw-gateway.service  # systemd 服务文件
 ├── .env.example              # 环境变量模板
 ├── AGENTS.md                 # AI 编码助手指南
 └── PHASE2-PLAN.md            # 架构方案文档
