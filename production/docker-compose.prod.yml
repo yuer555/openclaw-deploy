@@ -25,7 +25,6 @@ services:
       - "${AGENT_OPERATION_PORT:-18791}:18789"
     volumes:
       - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
-      - /opt/openclaw/data/agents/operation:/root/.openclaw/workspace
     networks:
       openclaw-prod-net:
         ipv4_address: 172.20.0.11
@@ -62,7 +61,6 @@ services:
       - "${AGENT_PRODUCT_PORT:-18792}:18789"
     volumes:
       - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
-      - /opt/openclaw/data/agents/product:/root/.openclaw/workspace
     networks:
       openclaw-prod-net:
         ipv4_address: 172.20.0.12
@@ -99,7 +97,6 @@ services:
       - "${AGENT_DEVELOPMENT_PORT:-18793}:18789"
     volumes:
       - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
-      - /opt/openclaw/data/agents/development:/root/.openclaw/workspace
     networks:
       openclaw-prod-net:
         ipv4_address: 172.20.0.13
@@ -136,7 +133,6 @@ services:
       - "${AGENT_TESTING_PORT:-18794}:18789"
     volumes:
       - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
-      - /opt/openclaw/data/agents/testing:/root/.openclaw/workspace
     networks:
       openclaw-prod-net:
         ipv4_address: 172.20.0.14
@@ -173,7 +169,6 @@ services:
       - "${AGENT_SERVICE_PORT:-18795}:18789"
     volumes:
       - /opt/openclaw/shared-files:/root/.openclaw/workspace/shared-files
-      - /opt/openclaw/data/agents/service:/root/.openclaw/workspace
     networks:
       openclaw-prod-net:
         ipv4_address: 172.20.0.15
