@@ -44,7 +44,7 @@ export CONTAINER_FILES_BASE="${CONTAINER_FILES_BASE:-/root/.openclaw/workspace/s
 #------------------------------------------------------------------------------
 # 步骤 1: 停止已有服务
 #------------------------------------------------------------------------------
-print_step "步骤 1/4: 停止已有服务"
+print_step "步骤 1/3: 停止已有服务"
 
 "$PROJECT_DIR/scripts/stop-gateway.sh" 2>/dev/null || true
 # 停止所有 profiles 的容器
@@ -54,21 +54,9 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod \
 print_success "已有服务已停止"
 
 #------------------------------------------------------------------------------
-# 步骤 2: 确保 Docker 网络存在
+# 步骤 2: 启动 Agent 容器（只启动 enabled 的）
 #------------------------------------------------------------------------------
-print_step "步骤 2/4: 准备 Docker 网络"
-
-if ! docker network inspect openclaw-prod-net &> /dev/null; then
-    docker network create --subnet=172.20.0.0/24 openclaw-prod-net
-    print_success "openclaw-prod-net 网络已创建"
-else
-    print_success "openclaw-prod-net 网络已存在"
-fi
-
-#------------------------------------------------------------------------------
-# 步骤 3: 启动 Agent 容器（只启动 enabled 的）
-#------------------------------------------------------------------------------
-print_step "步骤 3/4: 启动虚拟员工容器"
+print_step "步骤 2/3: 启动虚拟员工容器"
 
 # 构建 profiles 参数：只启动 AGENT_*_ENABLE=true 的
 PROFILES=""
@@ -90,7 +78,7 @@ print_success "虚拟员工容器已启动"
 #------------------------------------------------------------------------------
 # 步骤 4: 启动宿主机 Gateway
 #------------------------------------------------------------------------------
-print_step "步骤 4/4: 启动宿主机 Gateway"
+print_step "步骤 3/3: 启动宿主机 Gateway"
 
 export DB_PATH="${DB_PATH:-/opt/openclaw/data/gateway/gateway.db}"
 mkdir -p "$(dirname "$DB_PATH")"
