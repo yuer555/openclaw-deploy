@@ -246,21 +246,18 @@ check_and_install_openclaw() {
         fi
     else
         step "安装 OpenClaw..."
+        echo ""
+        echo "选择安装方式:"
+        echo "  1) npm install -g openclaw@latest (推荐)"
+        echo "  2) curl -fsSL https://openclaw.ai/install.sh | bash"
+        echo ""
+
         local install_method
-        install_method=$(select_option "选择安装方式:" \
-            "npm install -g openclaw@latest (推荐)" \
-            "curl -fsSL https://openclaw.ai/install.sh | bash")
-
-        local select_status=$?
-
-        # 如果 select_option 失败，使用默认方法（curl）
-        if [[ $select_status -ne 0 ]]; then
-            warn "非交互式环境，使用默认安装方式（curl）"
-            install_method=1
-        fi
+        read -p "请输入选项 [1-2, 默认 2]: " install_method
+        install_method="${install_method:-2}"
 
         case "$install_method" in
-            0)
+            1)
                 # 尝试不用 sudo，如果失败再提示
                 if npm install -g openclaw@latest 2>/dev/null; then
                     success "OpenClaw 安装成功（用户级）"
@@ -274,7 +271,11 @@ check_and_install_openclaw() {
                     fi
                 fi
                 ;;
-            1)
+            2)
+                curl -fsSL https://openclaw.ai/install.sh | bash
+                ;;
+            *)
+                warn "无效选项，使用默认方式（curl）"
                 curl -fsSL https://openclaw.ai/install.sh | bash
                 ;;
         esac
@@ -486,38 +487,53 @@ configure_models() {
     openclaw models list 2>/dev/null || echo "  (无)"
     echo ""
 
+    # 简化为 y/n 确认方式
+    if ! confirm "是否需要添加或修改模型提供商?" "n"; then
+        success "跳过模型配置"
+        return 0
+    fi
+
     while true; do
-        local provider_type
-        provider_type=$(select_option "选择要配置的提供商类型:" \
-            "官方 API 提供商 (Anthropic, OpenAI, DeepSeek 等)" \
-            "第三方流量池 (如 GMN)" \
-            "完成，继续下一步")
+        echo ""
+        echo "请选择提供商类型:"
+        echo "  1) 官方 API 提供商 (Anthropic, OpenAI, DeepSeek 等)"
+        echo "  2) 第三方流量池 (如 GMN)"
+        echo "  3) 完成，继续下一步"
+        echo ""
 
-        local select_status=$?
+        local choice
+        read -p "请输入选项 [1-3]: " choice
 
-        # 如果 select_option 失败（非交互式环境），直接退出循环
-        if [[ $select_status -ne 0 ]]; then
-            warn "检测到非交互式环境或输入错误，跳过模型配置"
-            break
-        fi
+        case "$choice" in
+            1)
+                # 官方提供商 - 简化为直接输入 ID
+                echo ""
+                echo "官方提供商列表:"
+                for i in "${!PROVIDER_IDS[@]}"; do
+                    echo "  $((i+1))) ${PROVIDER_NAMES[$i]} (${PROVIDER_IDS[$i]})"
+                done
+                echo ""
 
-        case "$provider_type" in
-            0)
-                # 官方提供商选择
-                local idx
-                idx=$(select_option "选择提供商:" "${PROVIDER_NAMES[@]}")
-                if [[ $? -eq 0 ]]; then
+                local provider_choice
+                read -p "请输入选项 [1-${#PROVIDER_IDS[@]}]: " provider_choice
+
+                if [[ "$provider_choice" =~ ^[0-9]+$ ]] && (( provider_choice >= 1 && provider_choice <= ${#PROVIDER_IDS[@]} )); then
+                    local idx=$((provider_choice - 1))
                     setup_official_provider "${PROVIDER_IDS[$idx]}"
+                else
+                    warn "无效选项"
                 fi
                 ;;
-            1)
+            2)
                 setup_custom_provider
                 ;;
-            2)
+            3|"")
                 break
                 ;;
+            *)
+                warn "无效选项，请输入 1-3"
+                ;;
         esac
-        echo ""
     done
 
     success "模型配置完成"
