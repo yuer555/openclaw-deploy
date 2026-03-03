@@ -22,10 +22,15 @@ if [ ! -f "$MANAGE_PY" ]; then
     exit 1
 fi
 
-# 生产环境：使用 venv python
+# 生产环境：使用 venv python，以 openclaw 用户运行（确保数据库写权限）
 VENV_PYTHON="/opt/openclaw/gateway/venv/bin/python"
+RUN_USER="openclaw"
 if [ -x "$VENV_PYTHON" ]; then
-    exec "$VENV_PYTHON" "$MANAGE_PY" "$@"
+    if [ "$(whoami)" = "$RUN_USER" ]; then
+        exec "$VENV_PYTHON" "$MANAGE_PY" "$@"
+    else
+        exec sudo -u "$RUN_USER" "$VENV_PYTHON" "$MANAGE_PY" "$@"
+    fi
 fi
 
 # 开发环境：直接用 python3

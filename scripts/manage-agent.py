@@ -65,27 +65,40 @@ def _try_read_local_token():
 
 def get_db():
     """获取数据库连接，确保表存在"""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''CREATE TABLE IF NOT EXISTS agents (
-        name              TEXT PRIMARY KEY,
-        display_name      TEXT NOT NULL,
-        wecom_token       TEXT NOT NULL,
-        wecom_aes_key     TEXT NOT NULL,
-        openclaw_url      TEXT NOT NULL,
-        openclaw_token    TEXT NOT NULL,
-        openclaw_agent_id TEXT DEFAULT '',
-        shared_dir        TEXT DEFAULT '',
-        created_at        TEXT DEFAULT CURRENT_TIMESTAMP,
-        updated_at        TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-    # 兼容旧版数据库：如果 shared_dir 列不存在则添加
+    db_dir = os.path.dirname(DB_PATH)
     try:
-        conn.execute("SELECT shared_dir FROM agents LIMIT 0")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE agents ADD COLUMN shared_dir TEXT DEFAULT ''")
-    conn.commit()
-    return conn
+        os.makedirs(db_dir, exist_ok=True)
+    except PermissionError:
+        print(f"错误: 无权创建目录 {db_dir}")
+        print(f"提示: 生产环境请通过 04-manage-agent.sh 运行（会自动切换到 openclaw 用户）")
+        sys.exit(1)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('''CREATE TABLE IF NOT EXISTS agents (
+            name              TEXT PRIMARY KEY,
+            display_name      TEXT NOT NULL,
+            wecom_token       TEXT NOT NULL,
+            wecom_aes_key     TEXT NOT NULL,
+            openclaw_url      TEXT NOT NULL,
+            openclaw_token    TEXT NOT NULL,
+            openclaw_agent_id TEXT DEFAULT '',
+            shared_dir        TEXT DEFAULT '',
+            created_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at        TEXT DEFAULT CURRENT_TIMESTAMP
+        )''')
+        # 兼容旧版数据库：如果 shared_dir 列不存在则添加
+        try:
+            conn.execute("SELECT shared_dir FROM agents LIMIT 0")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE agents ADD COLUMN shared_dir TEXT DEFAULT ''")
+        conn.commit()
+        return conn
+    except sqlite3.OperationalError as e:
+        if 'readonly' in str(e).lower():
+            print(f"错误: 数据库只读 — {DB_PATH}")
+            print(f"提示: 生产环境请通过 04-manage-agent.sh 运行（会自动切换到 openclaw 用户）")
+            sys.exit(1)
+        raise
 
 
 def notify_reload():
