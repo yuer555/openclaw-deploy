@@ -351,9 +351,7 @@ setup_official_provider() {
 
     header "配置 ${provider_name}"
 
-    echo ""
-    echo "请输入 ${provider_name} API Key (输入时会显示):"
-    printf "%s" "API Key: "
+    printf "%s" "请输入 ${provider_name} API Key (输入时会显示): "
     read -r api_key </dev/tty
     echo ""
 
@@ -388,9 +386,7 @@ setup_custom_provider() {
     printf "%s" "API Base URL (如 https://gmn.chuangzuoli.com/v1): "
     read -r base_url </dev/tty
 
-    echo ""
-    echo "请输入 API Key (输入时会显示):"
-    printf "%s" "API Key: "
+    printf "%s" "API Key (输入时会显示): "
     read -r api_key </dev/tty
 
     printf "%s" "API 格式 [openai-responses]: "
