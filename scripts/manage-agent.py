@@ -7,12 +7,15 @@ OpenClaw 企业微信桥接网关 — Agent 绑定管理工具
   python3 manage-agent.py remove <name>    删除绑定（需确认）
   python3 manage-agent.py list             列出所有绑定
   python3 manage-agent.py update <name>    更新绑定（同名覆盖，需确认）
+  python3 manage-agent.py sync-token       同步 openclaw token（批量更新）
 """
 
 import sys
 import os
 import re
+import json
 import sqlite3
+import unicodedata
 import requests
 
 # 数据库路径（与 Gateway 一致）
@@ -28,6 +31,36 @@ DEFAULT_OPENCLAW_URL = 'http://localhost:18789'
 OPENCLAW_HOME = os.path.expanduser(os.getenv('OPENCLAW_HOME', '~/.openclaw'))
 
 NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9\-]{1,28}[a-z0-9]$')
+
+
+def display_width(s):
+    """计算字符串在终端的显示宽度（中文/全角字符占 2 列）"""
+    w = 0
+    for ch in s:
+        eaw = unicodedata.east_asian_width(ch)
+        w += 2 if eaw in ('F', 'W') else 1
+    return w
+
+
+def pad(s, width):
+    """将字符串填充到指定终端显示宽度"""
+    return s + ' ' * max(0, width - display_width(s))
+
+
+def _try_read_local_token():
+    """尝试从本地 OpenClaw 配置读取 gateway token（best-effort）
+    
+    适用于 Gateway 与 OpenClaw 同机部署的场景。
+    跨机部署时返回 None，用户需手动输入。
+    """
+    config_path = os.path.join(OPENCLAW_HOME, 'openclaw.json')
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        token = config.get('gateway', {}).get('auth', {}).get('token', '')
+        return token if token else None
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
 
 
 def get_db():
@@ -115,8 +148,14 @@ def cmd_add(name):
 
     openclaw_token = input("openclaw Token: ").strip()
     if not openclaw_token:
-        print("错误: openclaw Token 不能为空")
-        sys.exit(1)
+        # 尝试从本地 OpenClaw 配置自动获取（同机部署场景）
+        local_token = _try_read_local_token()
+        if local_token:
+            openclaw_token = local_token
+            print(f"  已从本地配置读取 token: {mask(openclaw_token)}")
+        else:
+            print("错误: openclaw Token 不能为空（跨机部署请手动输入）")
+            sys.exit(1)
 
     openclaw_agent_id = input("openclaw Agent ID（回车跳过，默认 main）: ").strip()
 
@@ -224,7 +263,17 @@ def cmd_update(name):
     wecom_aes_key = input(f"企业微信 AES Key [{mask(old_aes)}]: ").strip() or old_aes
     openclaw_url = input(f"openclaw 地址 [{old_url}]: ").strip() or old_url
     openclaw_url = openclaw_url.rstrip('/')
-    openclaw_token = input(f"openclaw Token [{mask(old_oc_token)}]: ").strip() or old_oc_token
+    openclaw_token = input(f"openclaw Token [{mask(old_oc_token)}]: ").strip()
+    if not openclaw_token:
+        openclaw_token = old_oc_token
+    elif openclaw_token == 'auto':
+        local_token = _try_read_local_token()
+        if local_token:
+            openclaw_token = local_token
+            print(f"  已从本地配置读取 token: {mask(openclaw_token)}")
+        else:
+            print("  无法读取本地配置，保持原值")
+            openclaw_token = old_oc_token
     openclaw_agent_id = input(f"openclaw Agent ID [{old_agent_id or 'main'}]: ").strip()
     if not openclaw_agent_id:
         openclaw_agent_id = old_agent_id
@@ -282,12 +331,105 @@ def cmd_list():
 
     print(f"\n共 {len(rows)} 个 agent 绑定:")
     print("-" * 100)
-    print(f"{'名称':<12} {'显示名':<16} {'openclaw 地址':<28} {'Agent ID':<10} {'共享目录':<30} {'创建时间'}")
+    print(f"{pad('名称', 12)} {pad('显示名', 16)} {pad('openclaw 地址', 28)} {pad('Agent ID', 10)} {pad('共享目录', 30)} 创建时间")
     print("-" * 100)
     for name, display, url, agent_id, shared_dir, created, updated in rows:
-        print(f"{name:<12} {display:<16} {url:<28} {(agent_id or 'main'):<10} {(shared_dir or '-'):<30} {created}")
+        print(f"{pad(name, 12)} {pad(display, 16)} {pad(url, 28)} {pad(agent_id or 'main', 10)} {pad(shared_dir or '-', 30)} {created}")
     print("-" * 100)
     print(f"\n回调地址格式: https://your-domain/<name>/wecom/callback")
+
+
+def cmd_sync_token():
+    """同步 openclaw token — 批量更新 DB 中 agent 的 token
+    
+    支持两种方式：
+    - 自动从本地 OpenClaw 配置读取（同机部署）
+    - 手动输入新 token（跨机部署）
+    
+    可选 --url 参数：只更新指向特定 openclaw 实例的 agent
+    """
+    # 解析 --url 参数
+    target_url = None
+    for i, arg in enumerate(sys.argv):
+        if arg == '--url' and i + 1 < len(sys.argv):
+            target_url = sys.argv[i + 1].rstrip('/')
+            break
+
+    conn = get_db()
+
+    # 查询受影响的 agent
+    if target_url:
+        rows = conn.execute(
+            "SELECT name, openclaw_url, openclaw_token FROM agents WHERE openclaw_url = ? ORDER BY name",
+            (target_url,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT name, openclaw_url, openclaw_token FROM agents ORDER BY name"
+        ).fetchall()
+
+    if not rows:
+        msg = f"没有找到指向 {target_url} 的 agent" if target_url else "当前无 agent 绑定"
+        print(msg)
+        conn.close()
+        return
+
+    # 按 openclaw_url 分组显示
+    by_url = {}
+    for name, url, token in rows:
+        by_url.setdefault(url, []).append((name, token))
+
+    print(f"\n将更新以下 agent 的 openclaw token:")
+    for url, agents in by_url.items():
+        print(f"\n  openclaw: {url}")
+        for name, token in agents:
+            print(f"    - {name} (当前 token: {mask(token)})")
+
+    # 获取新 token
+    local_token = _try_read_local_token()
+    if local_token:
+        print(f"\n检测到本地 OpenClaw 配置，token: {mask(local_token)}")
+        new_token = input(f"新 token（回车使用本地配置值，或手动输入）: ").strip()
+        if not new_token:
+            new_token = local_token
+    else:
+        new_token = input("新 token: ").strip()
+
+    if not new_token:
+        print("错误: token 不能为空")
+        conn.close()
+        sys.exit(1)
+
+    # 检查是否有变化
+    all_same = all(token == new_token for _, _, token in rows)
+    if all_same:
+        print("\n所有 agent 的 token 已经是最新值，无需更新")
+        conn.close()
+        return
+
+    confirm = input(f"\n确认更新 {len(rows)} 个 agent 的 token？[Y/n] ").strip().lower()
+    if confirm and confirm != 'y':
+        print("已取消")
+        conn.close()
+        return
+
+    # 执行更新
+    if target_url:
+        conn.execute(
+            "UPDATE agents SET openclaw_token = ?, updated_at = CURRENT_TIMESTAMP WHERE openclaw_url = ?",
+            (new_token, target_url)
+        )
+    else:
+        conn.execute(
+            "UPDATE agents SET openclaw_token = ?, updated_at = CURRENT_TIMESTAMP",
+            (new_token,)
+        )
+    conn.commit()
+    conn.close()
+
+    updated = len(rows)
+    print(f"\n已更新 {updated} 个 agent 的 token: {mask(new_token)}")
+    notify_reload()
 
 
 def main():
@@ -314,6 +456,8 @@ def main():
             print("用法: python3 manage-agent.py update <name>")
             sys.exit(1)
         cmd_update(sys.argv[2])
+    elif command == 'sync-token':
+        cmd_sync_token()
     else:
         print(f"未知命令: {command}")
         print(__doc__)

@@ -819,6 +819,7 @@ for agent in agents_list:
             "docker": {
                 "network": "bridge",
                 "readOnlyRoot": False,
+                "setupCommand": "apt-get update && apt-get install -y git curl wget file && rm -rf /var/lib/apt/lists/*",
                 "binds": [
                     f"{shared_dir}:/shared:rw"
                 ]
@@ -1056,7 +1057,7 @@ final_check() {
 main() {
     echo ""
     echo -e "${BOLD}${GREEN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${GREEN}║  OpenClaw 一键安装配置脚本 v1.0     ║${NC}"
+    echo -e "${BOLD}${GREEN}║  OpenClaw 一键安装配置脚本 v1.0      ║${NC}"
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════╝${NC}"
     echo ""
 

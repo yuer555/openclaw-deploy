@@ -159,8 +159,11 @@ def _call_openclaw_http(url, message, session_key, timeout=2700, token='', agent
 def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_id='main'):
     """WebSocket 协议调用：connect 握手 + chat.send，监听 chat state=final 获取回复"""
     ws_url = url.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
-    ws = websocket.create_connection(ws_url, timeout=timeout)
+    # 连接阶段使用短超时（10 秒），避免服务不可达时等待过长
+    ws = websocket.create_connection(ws_url, timeout=10)
     try:
+        # 连接成功后切换到长超时（等待 Agent 处理）
+        ws.settimeout(timeout)
         # Step 1: 收 challenge
         ws.recv()
 
@@ -227,6 +230,10 @@ def _call_openclaw(url, message, session_key, timeout=2700, token='', agent_id='
             return _call_openclaw_ws(url, message, session_key, timeout,
                                      token=token, agent_id=agent_id)
         except Exception as e:
+            err_msg = str(e)
+            # 确定性错误（认证失败、RPC 错误）不重试
+            if 'connect 失败' in err_msg or 'RPC 错误' in err_msg:
+                raise
             logger.warning(f"WS 调用失败: {e}，尝试重试")
             retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
             return _call_openclaw_ws(url, retry_msg, session_key, timeout,
