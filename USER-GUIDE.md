@@ -11,7 +11,7 @@
 | 1. 上传代码 | `bin/01-upload.sh` | 本地 | 打包项目文件并上传到服务器 |
 | 2. 安装 Gateway | `sudo bash bin/02-install-gateway.sh` | 服务器 | 安装 Python 依赖、配置 systemd 服务 |
 | 3. 安装 OpenClaw | `bash bin/03-install-openclaw.sh` | 服务器 | 安装 OpenClaw、配置模型和 Agent |
-| 4. 添加 Agent 绑定 | `sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add <name>` | 服务器 | 绑定企业微信机器人到 OpenClaw Agent |
+| 4. 添加 Agent 绑定 | `sudo bin/04-manage-agent.sh add <name>` | 服务器 | 绑定企业微信机器人到 OpenClaw Agent |
 | 5. 清理环境 | `sudo bash bin/05-cleanup.sh` | 服务器 | 卸载服务 / 清空 OpenClaw / 全部重置 |
 
 ---
