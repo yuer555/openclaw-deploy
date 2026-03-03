@@ -738,29 +738,39 @@ configure_agents() {
     echo ""
 
     # 配置 main agent 人格
-    if confirm "是否编辑主 Agent (main) 的人格设定?" "y"; then
+    printf "%s" "是否编辑主 Agent (main) 的人格设定? [Y/n]: "
+    read -r edit_main_yn </dev/tty
+    edit_main_yn="${edit_main_yn:-y}"
+    if [[ "$edit_main_yn" =~ ^[Yy] ]]; then
         edit_agent_persona "main"
     fi
 
     # 创建额外 Agent
     echo ""
     while true; do
-        if ! confirm "是否创建新的 Agent?" "y"; then
+        printf "%s" "是否创建新的 Agent? [Y/n]: "
+        read -r create_agent_yn </dev/tty
+        create_agent_yn="${create_agent_yn:-y}"
+        if [[ ! "$create_agent_yn" =~ ^[Yy] ]]; then
             break
         fi
 
         echo ""
-        local agent_id agent_name use_sandbox
-
-        agent_id=$(read_input "Agent ID (英文, 如 development, testing, service)")
+        printf "%s" "Agent ID (英文, 如 development, testing, service): "
+        read -r agent_id </dev/tty
         if [[ -z "$agent_id" ]]; then
             warn "未输入 Agent ID，跳过"
             continue
         fi
 
-        agent_name=$(read_input "显示名称 (中文, 如 开发工程师)" "$agent_id")
+        printf "%s" "显示名称 (中文, 如 开发工程师) [${agent_id}]: "
+        read -r agent_name </dev/tty
+        agent_name="${agent_name:-$agent_id}"
 
-        if confirm "是否启用 Docker 沙箱?" "y"; then
+        printf "%s" "是否启用 Docker 沙箱? [Y/n]: "
+        read -r sandbox_yn </dev/tty
+        sandbox_yn="${sandbox_yn:-y}"
+        if [[ "$sandbox_yn" =~ ^[Yy] ]]; then
             use_sandbox="true"
         else
             use_sandbox="false"
@@ -770,7 +780,10 @@ configure_agents() {
         create_agent "$agent_id" "$agent_name" "$use_sandbox"
 
         # 编辑人格设定
-        if confirm "是否立即编辑此 Agent 的人格设定?" "y"; then
+        printf "%s" "是否立即编辑此 Agent 的人格设定? [Y/n]: "
+        read -r edit_yn </dev/tty
+        edit_yn="${edit_yn:-y}"
+        if [[ "$edit_yn" =~ ^[Yy] ]]; then
             edit_agent_persona "$agent_id"
         fi
 
