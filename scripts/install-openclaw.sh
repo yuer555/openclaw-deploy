@@ -645,36 +645,30 @@ create_agent() {
             --workspace "$workspace" \
             --non-interactive 2>/dev/null || {
             warn "openclaw agents add 失败，尝试手动配置..."
-            # 手动创建 workspace 目录
+            # 手动创建 workspace 目录和初始化文件
             mkdir -p "$workspace"
-            # 创建基本的初始化文件
-            cat > "$workspace/IDENTITY.md" << 'IDENTITY_EOF'
-# Agent Identity
+            touch "$workspace/IDENTITY.md" "$workspace/SOUL.md" \
+                  "$workspace/USER.md" "$workspace/TOOLS.md" "$workspace/AGENTS.md"
+            # 写入 agents.list
+            python3 << PYEOF
+import json, os
 
-Name: Agent
-Species: AI Assistant
-Personality: Professional and helpful
-IDENTITY_EOF
-            cat > "$workspace/SOUL.md" << 'SOUL_EOF'
-# Agent Soul
+config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+with open(config_path, "r") as f:
+    config = json.load(f)
 
-Core values and behavior guidelines.
-SOUL_EOF
-            cat > "$workspace/USER.md" << 'USER_EOF'
-# User Information
+agents = config.setdefault("agents", {}).setdefault("list", [])
+existing_ids = [a.get("id") for a in agents]
+if "${agent_id}" not in existing_ids:
+    agents.append({
+        "id": "${agent_id}",
+        "name": "${agent_name}",
+        "workspace": "${workspace}"
+    })
 
-Information about the user.
-USER_EOF
-            cat > "$workspace/TOOLS.md" << 'TOOLS_EOF'
-# Tools Configuration
-
-Available tools and environment setup.
-TOOLS_EOF
-            cat > "$workspace/AGENTS.md" << 'AGENTS_EOF'
-# Workspace Rules
-
-Session flow, memory management, and safety rules.
-AGENTS_EOF
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+PYEOF
         }
     fi
 
