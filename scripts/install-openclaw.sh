@@ -476,6 +476,12 @@ _append_model_to_config() {
     local max_tokens="$5"
     local reasoning="$6"
 
+    # 转换 bash 布尔值为 Python 布尔值
+    local py_reasoning="False"
+    if [[ "$reasoning" == "true" ]]; then
+        py_reasoning="True"
+    fi
+
     # 使用 python3/node 来安全地修改 JSON
     if cmd_exists python3; then
         python3 << PYEOF
@@ -508,7 +514,7 @@ if "${model_id}" not in existing_ids:
     model_entry = {
         "id": "${model_id}",
         "name": "${model_name}",
-        "reasoning": ${reasoning},
+        "reasoning": ${py_reasoning},
         "input": ["text", "image"],
         "contextWindow": ${ctx_window},
         "maxTokens": ${max_tokens}
