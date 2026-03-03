@@ -622,6 +622,34 @@ create_agent() {
             warn "openclaw agents add 失败，尝试手动配置..."
             # 手动创建 workspace 目录
             mkdir -p "$workspace"
+            # 创建基本的初始化文件
+            cat > "$workspace/IDENTITY.md" << 'IDENTITY_EOF'
+# Agent Identity
+
+Name: Agent
+Species: AI Assistant
+Personality: Professional and helpful
+IDENTITY_EOF
+            cat > "$workspace/SOUL.md" << 'SOUL_EOF'
+# Agent Soul
+
+Core values and behavior guidelines.
+SOUL_EOF
+            cat > "$workspace/USER.md" << 'USER_EOF'
+# User Information
+
+Information about the user.
+USER_EOF
+            cat > "$workspace/TOOLS.md" << 'TOOLS_EOF'
+# Tools Configuration
+
+Available tools and environment setup.
+TOOLS_EOF
+            cat > "$workspace/AGENTS.md" << 'AGENTS_EOF'
+# Workspace Rules
+
+Session flow, memory management, and safety rules.
+AGENTS_EOF
         }
     fi
 
