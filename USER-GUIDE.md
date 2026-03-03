@@ -270,8 +270,10 @@ Agent ID (英文标识, 如 development, testing, service): development
     "docker": {
       "network": "bridge",
       "readOnlyRoot": false,
-      "user": "0:0",
-      "setupCommand": "apt-get update && apt-get install -y git curl wget && rm -rf /var/lib/apt/lists/*"
+      "setupCommand": "apt-get update && apt-get install -y git curl wget file && rm -rf /var/lib/apt/lists/*",
+      "binds": [
+        "<workspace>/shared:/shared:rw"
+      ]
     }
   }
 }
@@ -281,8 +283,8 @@ Agent ID (英文标识, 如 development, testing, service): development
 |------|-----|------|
 | `network` | `bridge` | 容器需要联网（apt 下载、API 调用等） |
 | `readOnlyRoot` | `false` | 容器根文件系统可写（apt 需要写入） |
-| `user` | `0:0` | 以 root 运行（apt-get 需要） |
-| `setupCommand` | `apt-get update...` | 首次启动时预装 git/curl/wget |
+| `setupCommand` | `apt-get update...` | 首次启动时预装 git/curl/wget/file |
+| `binds` | `<workspace>/shared:/shared:rw` | 将 workspace 内 shared 目录挂载到容器 /shared |
 
 创建完成后同样会询问是否编辑人格设定。子 Agent 的模型配置（`auth-profiles.json`、`models.json`）会自动从主 Agent 同步。
 
