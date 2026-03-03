@@ -82,7 +82,7 @@ cmd_exists() { command -v "$1" &>/dev/null; }
 config_get() { openclaw config get "$1" 2>/dev/null || echo ""; }
 
 # JSON5 配置设置（通过 openclaw config set）
-config_set() { openclaw config set "$1" "$2" 2>/dev/null; }
+config_set() { openclaw config set "$1" "$2" 2>/dev/null || true; }
 
 # 读取用户输入（带默认值）
 read_input() {
