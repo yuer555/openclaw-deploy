@@ -351,8 +351,9 @@ setup_official_provider() {
 
     header "配置 ${provider_name}"
 
-    local api_key
-    api_key=$(read_secret "请输入 ${provider_name} API Key")
+    printf "%s" "请输入 ${provider_name} API Key: "
+    read -rs api_key </dev/tty
+    echo ""
 
     if [[ -z "$api_key" ]]; then
         warn "未输入 API Key，跳过 ${provider_name}"
@@ -374,18 +375,24 @@ setup_custom_provider() {
     header "配置第三方模型提供商"
 
     echo ""
-    local provider_id
-    provider_id=$(read_input "提供商 ID (英文, 如 gmn)")
+    printf "%s" "提供商 ID (英文, 如 gmn): "
+    read -r provider_id </dev/tty
 
     if [[ -z "$provider_id" ]]; then
         warn "未输入提供商 ID，跳过"
         return 1
     fi
 
-    local base_url api_key api_format
-    base_url=$(read_input "API Base URL (如 https://gmn.chuangzuoli.com/v1)")
-    api_key=$(read_secret "API Key")
-    api_format=$(read_input "API 格式" "openai-responses")
+    printf "%s" "API Base URL (如 https://gmn.chuangzuoli.com/v1): "
+    read -r base_url </dev/tty
+
+    printf "%s" "API Key: "
+    read -rs api_key </dev/tty
+    echo ""
+
+    printf "%s" "API 格式 [openai-responses]: "
+    read -r api_format </dev/tty
+    api_format="${api_format:-openai-responses}"
 
     if [[ -z "$base_url" || -z "$api_key" ]]; then
         warn "信息不完整，跳过"
@@ -403,16 +410,26 @@ setup_custom_provider() {
     echo ""
     step "添加模型..."
     while true; do
-        local model_id model_name context_window max_tokens is_reasoning
-
-        model_id=$(read_input "模型 ID (如 gpt-5.3-codex, 留空结束)")
+        printf "%s" "模型 ID (如 gpt-5.3-codex, 留空结束): "
+        read -r model_id </dev/tty
         [[ -z "$model_id" ]] && break
 
-        model_name=$(read_input "模型显示名称" "$model_id")
-        context_window=$(read_input "上下文窗口大小" "200000")
-        max_tokens=$(read_input "最大输出 Token" "128000")
+        printf "%s" "模型显示名称 [${model_id}]: "
+        read -r model_name </dev/tty
+        model_name="${model_name:-$model_id}"
 
-        if confirm "是否支持推理 (reasoning)?" "y"; then
+        printf "%s" "上下文窗口大小 [200000]: "
+        read -r context_window </dev/tty
+        context_window="${context_window:-200000}"
+
+        printf "%s" "最大输出 Token [128000]: "
+        read -r max_tokens </dev/tty
+        max_tokens="${max_tokens:-128000}"
+
+        printf "%s" "是否支持推理 (reasoning)? [Y/n]: "
+        read -r reasoning_yn </dev/tty
+        reasoning_yn="${reasoning_yn:-y}"
+        if [[ "$reasoning_yn" =~ ^[Yy] ]]; then
             is_reasoning="true"
         else
             is_reasoning="false"
@@ -432,9 +449,11 @@ setup_custom_provider() {
     done
 
     # 询问是否设为默认
-    if confirm "是否将此提供商的模型设为默认?" "n"; then
-        local default_model
-        default_model=$(read_input "默认模型 (如 ${provider_id}/${model_id})")
+    printf "%s" "是否将此提供商的模型设为默认? [y/N]: "
+    read -r set_default </dev/tty
+    if [[ "$set_default" =~ ^[Yy] ]]; then
+        printf "%s" "默认模型 (如 ${provider_id}/${model_id}): "
+        read -r default_model </dev/tty
         if [[ -n "$default_model" ]]; then
             openclaw models set "$default_model" 2>/dev/null || \
                 config_set "agents.defaults.model.primary" "$default_model"
