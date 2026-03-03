@@ -28,7 +28,16 @@ GATEWAY_URL = os.getenv('GATEWAY_URL', 'http://localhost:8000')
 DEFAULT_OPENCLAW_URL = 'http://localhost:18789'
 
 # 默认共享目录基础路径（位于 agent workspace 内，确保 Docker sandbox 能挂载）
-OPENCLAW_HOME = os.path.expanduser(os.getenv('OPENCLAW_HOME', '~/.openclaw'))
+# 如果以 sudo 运行，使用实际调用者的 home 目录（避免展开为 /root/.openclaw）
+_openclaw_home_env = os.getenv('OPENCLAW_HOME', '')
+if _openclaw_home_env:
+    OPENCLAW_HOME = os.path.expanduser(_openclaw_home_env)
+else:
+    sudo_user = os.getenv('SUDO_USER', '')
+    if sudo_user and os.getuid() == 0:
+        OPENCLAW_HOME = os.path.expanduser(f'~{sudo_user}/.openclaw')
+    else:
+        OPENCLAW_HOME = os.path.expanduser('~/.openclaw')
 
 NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9\-]{1,28}[a-z0-9]$')
 
