@@ -4,6 +4,13 @@
 
 set -e
 
+# 禁止以 root/sudo 运行（避免共享目录路径解析为 /root/.openclaw）
+if [ "$(id -u)" -eq 0 ]; then
+    echo "错误: 请不要使用 sudo 运行此脚本"
+    echo "用法: ./04-manage-agent.sh <command> [args]"
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 从 bin/ 找兄弟 scripts/ 目录
 MANAGE_PY="$(dirname "$SCRIPT_DIR")/scripts/manage-agent.py"
