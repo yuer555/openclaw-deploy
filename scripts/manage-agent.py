@@ -204,9 +204,14 @@ def cmd_add(name):
     conn.commit()
     conn.close()
 
-    # 自动创建共享目录
-    os.makedirs(shared_dir, exist_ok=True)
-    print(f"已创建共享目录: {shared_dir}")
+    # 尝试创建共享目录（可能因权限不足失败，例如 sudo -u openclaw 无法写 ubuntu 的 home）
+    try:
+        os.makedirs(shared_dir, exist_ok=True)
+        print(f"已创建共享目录: {shared_dir}")
+    except PermissionError:
+        print(f"注意: 无权创建共享目录 {shared_dir}")
+        print(f"  请手动执行: mkdir -p {shared_dir}")
+        print(f"  Gateway 启动时也会自动创建此目录")
 
     print(f"已添加 agent '{name}'")
     print(f"企业微信回调地址: https://your-domain/{name}/wecom/callback")
