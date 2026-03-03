@@ -48,6 +48,7 @@ MIN_NODE_VERSION=22
 SKIP_INSTALL=false
 ADD_AGENT_ONLY=false
 ADD_PROVIDER_ONLY=false
+GATEWAY_TOKEN_SYNC_CHANGED=false
 
 # ---------------------------------------------------------------------------
 # 参数解析
@@ -83,6 +84,165 @@ config_get() { openclaw config get "$1" 2>/dev/null || echo ""; }
 
 # JSON5 配置设置（通过 openclaw config set）
 config_set() { openclaw config set "$1" "$2" 2>/dev/null || true; }
+
+
+sync_gateway_tokens() {
+    # 对齐 gateway.auth.token 与 gateway.remote.token，避免 token mismatch
+    local auth_token remote_token desired_token
+
+    auth_token=$(config_get "gateway.auth.token")
+    remote_token=$(config_get "gateway.remote.token")
+    desired_token="$auth_token"
+
+    if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
+        desired_token="$OPENCLAW_GATEWAY_TOKEN"
+        if [[ "$auth_token" != "$desired_token" ]]; then
+            config_set "gateway.auth.token" "$desired_token"
+            auth_token="$desired_token"
+            GATEWAY_TOKEN_SYNC_CHANGED=true
+            step "已将 gateway.auth.token 对齐到 OPENCLAW_GATEWAY_TOKEN"
+        fi
+    fi
+
+    if [[ -z "$desired_token" ]]; then
+        warn "未检测到 gateway.auth.token，无法自动对齐 remote.token"
+        return 0
+    fi
+
+    if [[ "$remote_token" != "$desired_token" ]]; then
+        config_set "gateway.remote.token" "$desired_token"
+        GATEWAY_TOKEN_SYNC_CHANGED=true
+        step "已将 gateway.remote.token 对齐到 gateway.auth.token"
+    fi
+
+    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
+        success "Gateway token 已对齐（auth/remote）"
+    else
+        step "Gateway token 已对齐，无需调整"
+    fi
+}
+
+
+hard_check_gateway_token_health() {
+    # 硬校验：gateway status 必须 RPC ok，doctor 不得出现 token stale/mismatch
+    local status_output doctor_output
+
+    step "Gateway RPC 探针校验..."
+    status_output="$(openclaw gateway status 2>&1 || true)"
+    if ! echo "$status_output" | grep -q "RPC probe: ok"; then
+        error "Gateway RPC probe 未通过，请先修复后再继续"
+        echo "$status_output"
+        return 1
+    fi
+
+    if echo "$status_output" | grep -Eqi "config token differs from service token|gateway token mismatch|gateway auth token mismatch|service token is stale"; then
+        error "检测到 Gateway token 不一致（gateway status）"
+        echo "$status_output"
+        return 1
+    fi
+    success "Gateway RPC probe: ok"
+
+    step "OpenClaw doctor token 校验..."
+    doctor_output="$(openclaw doctor 2>&1 || true)"
+    if echo "$doctor_output" | grep -Eqi "service token is stale|gateway token mismatch|gateway auth token mismatch|config token differs from service token"; then
+        error "检测到 token 漂移（openclaw doctor）"
+        echo "$doctor_output"
+        return 1
+    fi
+    success "OpenClaw doctor 未发现 token 漂移"
+}
+
+
+hard_check_sandbox_shared_contract() {
+    # 硬校验：沙箱 agent 的共享目录契约必须成立（<workspace>/shared -> /workspace/shared）
+    if ! cmd_exists python3; then
+        warn "未找到 python3，跳过共享目录契约校验"
+        return 0
+    fi
+
+    local check_output
+    check_output="$(python3 <<'PYEOF'
+import json
+import os
+import sys
+
+config_path = os.path.expanduser('~/.openclaw/openclaw.json')
+if not os.path.exists(config_path):
+    print(f'ERROR: OpenClaw 配置不存在: {config_path}')
+    sys.exit(1)
+
+with open(config_path, 'r') as f:
+    config = json.load(f)
+
+agents = config.get('agents', {}).get('list', [])
+errors = []
+notes = []
+checked = 0
+
+for agent in agents:
+    agent_id = agent.get('id', '')
+    if not agent_id or agent_id == 'main':
+        continue
+
+    sandbox = agent.get('sandbox', {})
+    if sandbox.get('mode') != 'all':
+        continue
+
+    checked += 1
+
+    if sandbox.get('workspaceAccess') != 'rw':
+        errors.append(f"{agent_id}: workspaceAccess 不是 rw（当前: {sandbox.get('workspaceAccess')}）")
+
+    workspace = agent.get('workspace') or os.path.expanduser(f"~/.openclaw/workspace-{agent_id}")
+    shared = os.path.join(workspace, 'shared')
+
+    if not os.path.isdir(workspace):
+        errors.append(f"{agent_id}: workspace 不存在: {workspace}")
+        continue
+
+    if not os.path.exists(shared):
+        os.makedirs(shared, exist_ok=True)
+        notes.append(f"{agent_id}: 已自动创建共享目录 {shared}")
+
+    if os.path.realpath(shared) != os.path.realpath(os.path.join(workspace, 'shared')):
+        errors.append(f"{agent_id}: 共享目录路径异常: {shared}")
+
+if errors:
+    print('SANDBOX_SHARED_CONTRACT_FAILED')
+    for item in errors:
+        print(f"- {item}")
+    sys.exit(1)
+
+if checked == 0:
+    print('NO_SANDBOX_AGENT')
+else:
+    print('SANDBOX_SHARED_CONTRACT_OK')
+    for item in notes:
+        print(f"- {item}")
+PYEOF
+)" || {
+        error "共享目录契约校验失败"
+        echo "$check_output"
+        return 1
+    }
+
+    if [[ "$check_output" == *"NO_SANDBOX_AGENT"* ]]; then
+        step "未检测到启用沙箱的子 Agent，跳过共享目录契约校验"
+        return 0
+    fi
+
+    if [[ "$check_output" == *"SANDBOX_SHARED_CONTRACT_OK"* ]]; then
+        success "沙箱共享目录契约校验通过（容器内路径: /workspace/shared）"
+        if echo "$check_output" | grep -q "^- "; then
+            echo "$check_output" | grep "^- "
+        fi
+        return 0
+    fi
+
+    error "共享目录契约校验结果异常"
+    echo "$check_output"
+    return 1
+}
 
 # 读取用户输入（带默认值）
 read_input() {
@@ -336,6 +496,18 @@ check_and_install_openclaw() {
         else
             warn "Gateway 启动失败，Agent 创建可能受影响，请稍后手动运行: openclaw gateway start"
         fi
+    fi
+
+    # --- 对齐 Gateway token（auth/remote）---
+    echo ""
+    step "同步 Gateway token 配置..."
+    sync_gateway_tokens
+    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
+        step "检测到 token 变更，重启 Gateway 使配置生效..."
+        openclaw gateway restart >/dev/null 2>&1 || {
+            warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
+        }
+        sleep 2
     fi
 }
 
@@ -796,7 +968,8 @@ _configure_sandbox() {
     local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
     local shared_dir="${workspace}/shared"
 
-    # 确保共享目录存在
+    # 确保共享目录存在。
+    # 约定：容器内通过 /workspace/shared 访问（workspaceAccess=rw 会挂载整个 workspace 到 /workspace）
     mkdir -p "$shared_dir"
 
     if cmd_exists python3; then
@@ -807,8 +980,6 @@ config_path = os.path.expanduser("~/.openclaw/openclaw.json")
 with open(config_path, "r") as f:
     config = json.loads(f.read())
 
-shared_dir = "${shared_dir}"
-
 agents_list = config.get("agents", {}).get("list", [])
 for agent in agents_list:
     if agent.get("id") == "${agent_id}":
@@ -818,11 +989,7 @@ for agent in agents_list:
             "workspaceAccess": "rw",
             "docker": {
                 "network": "bridge",
-                "readOnlyRoot": False,
-                "setupCommand": "apt-get update && apt-get install -y git curl wget file && rm -rf /var/lib/apt/lists/*",
-                "binds": [
-                    f"{shared_dir}:/shared:rw"
-                ]
+                "readOnlyRoot": False
             }
         }
         break
@@ -830,7 +997,7 @@ for agent in agents_list:
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 PYEOF
-        success "沙箱配置已写入（共享目录: ${shared_dir} -> /shared）"
+        success "沙箱配置已写入（共享目录: ${shared_dir}，容器内路径: /workspace/shared）"
     else
         warn "未找到 python3，请手动配置沙箱"
     fi
@@ -992,7 +1159,7 @@ configure_gateway_integration() {
         echo "在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
         echo "不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。"
         echo ""
-        echo "共享文件目录（Gateway 下载的文件保存于此，同时挂载到 Docker 沙箱的 /shared）:"
+        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /workspace/shared 访问）:"
         echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
     else
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
@@ -1003,7 +1170,7 @@ configure_gateway_integration() {
         echo -e "  ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
         echo "  在交互式提示中填入以上 URL 和 Token，以及对应的 openclaw_agent_id。"
         echo ""
-        echo "共享文件目录（Gateway 下载的文件保存于此，同时挂载到 Docker 沙箱的 /shared）:"
+        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /workspace/shared 访问）:"
         echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
     fi
 
@@ -1034,6 +1201,20 @@ final_check() {
         success "OpenClaw Gateway 运行正常"
     else
         warn "OpenClaw Gateway 未运行。启动命令: openclaw gateway start"
+    fi
+
+    # 硬校验：沙箱共享目录契约
+    if ! hard_check_sandbox_shared_contract; then
+        error "最终校验未通过，请先修复沙箱共享目录配置后重试"
+        error "建议检查: ~/.openclaw/openclaw.json 的 agents.list[].workspace 与 sandbox.workspaceAccess"
+        exit 1
+    fi
+
+    # 硬校验：token 一致性和 RPC 探针必须通过
+    if ! hard_check_gateway_token_health; then
+        error "最终校验未通过，请先修复 token 配置后重试"
+        error "建议执行: openclaw gateway restart && openclaw doctor"
+        exit 1
     fi
 
     echo ""

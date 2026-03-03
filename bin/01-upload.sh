@@ -287,7 +287,7 @@ echo -e "${YELLOW}4. 安装配置 OpenClaw（如未安装）：${NC}"
 echo -e "   ${BLUE}cd ${REMOTE_DIR} && bash bin/03-install-openclaw.sh${NC}\n"
 
 echo -e "${YELLOW}5. 添加 Agent 绑定：${NC}"
-echo -e "   ${BLUE}sudo ${REMOTE_DIR}/gateway/bin/04-manage-agent.sh add <name>${NC}\n"
+echo -e "   ${BLUE}${REMOTE_DIR}/gateway/bin/04-manage-agent.sh add <name>${NC}\n"
 
 echo -e "${YELLOW}6. 查看服务状态 / 日志：${NC}"
 echo -e "   ${BLUE}sudo systemctl status openclaw-gateway${NC}"

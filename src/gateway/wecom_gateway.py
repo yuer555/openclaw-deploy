@@ -252,6 +252,27 @@ def _call_openclaw(url, message, session_key, timeout=2700, token='', agent_id='
                                       token=token, agent_id=agent_id)
 
 
+_SANDBOX_MOUNT_ERROR_MARKERS = (
+    'outside of container mount namespace root',
+    'container breakout detected',
+    'current working directory is outside',
+    'mount namespace',
+    '路径隔离问题',
+    '挂载异常',
+)
+
+
+def _looks_like_sandbox_mount_error(reply_text):
+    """判断回复文本是否包含沙箱路径挂载异常特征"""
+    if not reply_text:
+        return False
+    text = reply_text.lower()
+    for marker in _SANDBOX_MOUNT_ERROR_MARKERS:
+        if marker.lower() in text:
+            return True
+    return False
+
+
 # ============= 企业微信加解密工具类 =============
 
 class WXBizMsgCrypt:
@@ -462,8 +483,8 @@ def _get_today_dir_for_agent(shared_dir):
     os.makedirs(path, exist_ok=True)
     return path
 
-# 容器内共享目录挂载点
-CONTAINER_SHARED_MOUNT = '/shared'
+# 容器内共享目录路径（通过 workspace 挂载访问）
+CONTAINER_SHARED_MOUNT = '/workspace/shared'
 
 
 # ============= 多类型消息处理 =============
@@ -604,23 +625,26 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
 
 
 def _to_container_path(host_path, shared_dir):
-    """将宿主机路径转换为容器内路径（/shared/...）
+    """将宿主机路径转换为容器内路径（/workspace/shared/...）
     
-    如果 shared_dir 已配置且 host_path 在该目录下，将前缀替换为 /shared。
+    如果 shared_dir 已配置且 host_path 在该目录下，将前缀替换为 /workspace/shared。
     否则返回原始宿主机路径（适用于 main agent 等无沙箱场景）。
     """
-    if shared_dir and host_path.startswith(shared_dir):
-        relative = host_path[len(shared_dir):]
-        if not relative.startswith('/'):
-            relative = '/' + relative
-        return CONTAINER_SHARED_MOUNT + relative
+    if shared_dir:
+        host_norm = os.path.normpath(host_path)
+        shared_norm = os.path.normpath(shared_dir)
+        if host_norm == shared_norm or host_norm.startswith(shared_norm + os.sep):
+            relative = host_norm[len(shared_norm):]
+            if not relative.startswith(os.sep):
+                relative = os.sep + relative
+            return (CONTAINER_SHARED_MOUNT + relative).replace(os.sep, '/')
     return host_path
 
 
 def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir=''):
     """提取单条消息内容（主消息或 quote 内的消息），返回文本描述
     
-    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，路径转为容器内路径 /shared/...
+    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，路径转为容器内路径 /workspace/shared/...
     """
     msg_type = item.get('msgtype', '')
 
@@ -724,6 +748,18 @@ def _process_single_message(user_id, content, task_id, response_url, agent_name)
             token=agent_cfg['openclaw_token'],
             agent_id=agent_cfg['openclaw_agent_id'],
         )
+        # 兜底恢复：如果回复提示“沙箱挂载异常”，自动切新会话重试一次
+        if _looks_like_sandbox_mount_error(reply):
+            logger.warning(f"[{agent_name}] 检测到沙箱路径异常，切换新会话重试一次")
+            recovery_session_key = f"{session_key}:recovery:{uuid.uuid4().hex[:8]}"
+            recovery_reply = _call_openclaw(
+                agent_cfg['openclaw_url'], content, recovery_session_key,
+                timeout=OPENCLAW_TIMEOUT,
+                token=agent_cfg['openclaw_token'],
+                agent_id=agent_cfg['openclaw_agent_id'],
+            )
+            if recovery_reply:
+                reply = recovery_reply
         if not reply:
             reply = '处理失败，请稍后再试。'
             update_task_status(task_id, 'failed', '无响应')

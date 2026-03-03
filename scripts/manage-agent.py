@@ -27,7 +27,7 @@ GATEWAY_URL = os.getenv('GATEWAY_URL', 'http://localhost:8000')
 # 默认 OpenClaw 地址
 DEFAULT_OPENCLAW_URL = 'http://localhost:18789'
 
-# 默认共享目录基础路径（位于 agent workspace 内，确保 Docker sandbox 能挂载）
+# 默认共享目录基础路径（位于 agent workspace 内，容器内通过 /workspace/shared 访问）
 # 如果以 sudo 运行，使用实际调用者的 home 目录（避免展开为 /root/.openclaw）
 _openclaw_home_env = os.getenv('OPENCLAW_HOME', '')
 if _openclaw_home_env:
@@ -40,6 +40,32 @@ else:
         OPENCLAW_HOME = os.path.expanduser('~/.openclaw')
 
 NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9\-]{1,28}[a-z0-9]$')
+CONTAINER_SHARED_PATH = '/workspace/shared'
+
+
+def _agent_workspace(agent_id):
+    """根据 agent_id 计算 OpenClaw workspace 路径"""
+    if agent_id and agent_id != 'main':
+        return os.path.join(OPENCLAW_HOME, f'workspace-{agent_id}')
+    return os.path.join(OPENCLAW_HOME, 'workspace')
+
+
+def _default_shared_dir(agent_id):
+    """共享目录固定使用 <workspace>/shared"""
+    return os.path.join(_agent_workspace(agent_id), 'shared')
+
+
+def _validate_shared_dir(shared_dir, agent_id):
+    """校验共享目录必须是 <workspace>/shared，确保容器内路径稳定"""
+    shared_abs = os.path.realpath(os.path.expanduser(shared_dir))
+    expected_abs = os.path.realpath(os.path.expanduser(_default_shared_dir(agent_id)))
+    if shared_abs != expected_abs:
+        print("错误: 共享目录必须使用当前 Agent workspace 的 shared 目录")
+        print(f"  当前: {shared_abs}")
+        print(f"  建议: {expected_abs}")
+        print(f"  原因: Gateway 会将路径转换为容器内固定路径 {CONTAINER_SHARED_PATH}")
+        sys.exit(1)
+    return shared_abs
 
 
 def display_width(s):
@@ -79,7 +105,7 @@ def get_db():
         os.makedirs(db_dir, exist_ok=True)
     except PermissionError:
         print(f"错误: 无权创建目录 {db_dir}")
-        print(f"提示: 生产环境请通过 04-manage-agent.sh 运行（会自动切换到 openclaw 用户）")
+        print("提示: 请使用 Gateway 运行用户执行 04-manage-agent.sh（不要 sudo）")
         sys.exit(1)
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -105,7 +131,7 @@ def get_db():
     except sqlite3.OperationalError as e:
         if 'readonly' in str(e).lower():
             print(f"错误: 数据库只读 — {DB_PATH}")
-            print(f"提示: 生产环境请通过 04-manage-agent.sh 运行（会自动切换到 openclaw 用户）")
+            print("提示: 请使用 Gateway 运行用户执行 04-manage-agent.sh（不要 sudo）")
             sys.exit(1)
         raise
 
@@ -181,13 +207,13 @@ def cmd_add(name):
 
     openclaw_agent_id = input("openclaw Agent ID（回车跳过，默认 main）: ").strip()
 
-    # 共享目录：Gateway 下载的文件保存到此目录，同时挂载到 Docker 沙箱容器的 /shared
-    # 共享目录位于 agent workspace 内，确保 Docker sandbox bind mount 安全检查通过
+    # 共享目录：Gateway 下载的文件保存到此目录，容器内通过 /workspace/shared 访问
     openclaw_agent = openclaw_agent_id or 'main'
-    default_shared = os.path.join(OPENCLAW_HOME, f'workspace-{openclaw_agent}', 'shared') if openclaw_agent != 'main' else os.path.join(OPENCLAW_HOME, 'workspace', 'shared')
+    default_shared = _default_shared_dir(openclaw_agent)
     shared_dir = input(f"共享文件目录（回车使用默认 {default_shared}）: ").strip()
     if not shared_dir:
         shared_dir = default_shared
+    shared_dir = _validate_shared_dir(shared_dir, openclaw_agent)
 
     # 确认
     print(f"\n确认添加？")
@@ -196,6 +222,7 @@ def cmd_add(name):
     print(f"  企业微信:   Token={mask(wecom_token)} AESKey={mask(wecom_aes_key)}")
     print(f"  openclaw:   {openclaw_url} (agent: {openclaw_agent_id or 'main'})")
     print(f"  共享目录:   {shared_dir}")
+    print(f"  容器路径:   {CONTAINER_SHARED_PATH}")
 
     confirm = input("\n[Y/n] ").strip().lower()
     if confirm and confirm != 'y':
@@ -213,7 +240,7 @@ def cmd_add(name):
     conn.commit()
     conn.close()
 
-    # 尝试创建共享目录（可能因权限不足失败，例如 sudo -u openclaw 无法写 ubuntu 的 home）
+    # 尝试创建共享目录（权限不足时给出提示，不阻塞绑定创建）
     try:
         os.makedirs(shared_dir, exist_ok=True)
         print(f"已创建共享目录: {shared_dir}")
@@ -306,11 +333,16 @@ def cmd_update(name):
         openclaw_agent_id = old_agent_id
 
     openclaw_agent = openclaw_agent_id or old_agent_id or 'main'
-    if not old_shared_dir:
-        default_shared = os.path.join(OPENCLAW_HOME, f'workspace-{openclaw_agent}', 'shared') if openclaw_agent != 'main' else os.path.join(OPENCLAW_HOME, 'workspace', 'shared')
-    else:
-        default_shared = old_shared_dir
+    default_shared = _default_shared_dir(openclaw_agent)
+    if old_shared_dir:
+        old_shared_norm = os.path.realpath(os.path.expanduser(old_shared_dir))
+        default_shared_norm = os.path.realpath(os.path.expanduser(default_shared))
+        if old_shared_norm != default_shared_norm:
+            print("注意: 当前共享目录与推荐路径不一致，建议修正为默认路径")
+            print(f"  当前: {old_shared_norm}")
+            print(f"  建议: {default_shared_norm}")
     shared_dir = input(f"共享文件目录 [{default_shared}]: ").strip() or default_shared
+    shared_dir = _validate_shared_dir(shared_dir, openclaw_agent)
 
     # 确认
     print(f"\n确认更新？")
@@ -319,6 +351,7 @@ def cmd_update(name):
     print(f"  企业微信:   Token={mask(wecom_token)} AESKey={mask(wecom_aes_key)}")
     print(f"  openclaw:   {openclaw_url} (agent: {openclaw_agent_id or 'main'})")
     print(f"  共享目录:   {shared_dir}")
+    print(f"  容器路径:   {CONTAINER_SHARED_PATH}")
 
     confirm = input("\n[Y/n] ").strip().lower()
     if confirm and confirm != 'y':
@@ -337,7 +370,11 @@ def cmd_update(name):
 
     # 确保共享目录存在
     if shared_dir:
-        os.makedirs(shared_dir, exist_ok=True)
+        try:
+            os.makedirs(shared_dir, exist_ok=True)
+        except PermissionError:
+            print(f"注意: 无权创建共享目录 {shared_dir}")
+            print(f"  请手动执行: mkdir -p {shared_dir}")
 
     print(f"已更新 agent '{name}'")
     notify_reload()
