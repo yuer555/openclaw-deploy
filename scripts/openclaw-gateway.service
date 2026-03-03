@@ -5,8 +5,8 @@ Documentation=https://github.com/your-org/openclaw-deploy
 
 [Service]
 Type=simple
-User=openclaw
-Group=openclaw
+User=__RUN_USER__
+Group=__RUN_GROUP__
 WorkingDirectory=/opt/openclaw/gateway
 EnvironmentFile=/opt/openclaw/gateway/.env
 ExecStart=/opt/openclaw/gateway/venv/bin/python /opt/openclaw/gateway/src/gateway/wecom_gateway.py
@@ -18,9 +18,6 @@ StandardError=append:/var/log/openclaw/gateway-error.log
 # 安全加固
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/openclaw/data /var/log/openclaw
 
 # 资源限制
 LimitNOFILE=65535

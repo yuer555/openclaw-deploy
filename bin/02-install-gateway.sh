@@ -21,8 +21,16 @@ INSTALL_DIR="/opt/openclaw/gateway"
 DATA_DIR="/opt/openclaw/data"
 LOG_DIR="/var/log/openclaw"
 VENV_DIR="/opt/openclaw/gateway/venv"
-USER="openclaw"
-GROUP="openclaw"
+
+# 使用调用 sudo 的实际用户运行 Gateway（与 OpenClaw 共用同一用户，避免权限问题）
+RUN_USER="${SUDO_USER:-$(whoami)}"
+RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"
+if [ "$RUN_USER" = "root" ]; then
+    echo "错误: 请使用 sudo 运行（不要直接以 root 登录运行）"
+    echo "用法: sudo bash $0"
+    exit 1
+fi
+echo "Gateway 将以用户 $RUN_USER:$RUN_GROUP 运行"
 
 # 步骤 1: 检测操作系统
 echo "📋 步骤 1/8: 检测操作系统..."
@@ -53,15 +61,10 @@ case $OS in
 esac
 echo "   ✅ 系统依赖安装完成"
 
-# 步骤 3: 创建用户和组
+# 步骤 3: 确认运行用户
 echo ""
-echo "👤 步骤 3/8: 创建运行用户..."
-if id "$USER" &>/dev/null; then
-    echo "   用户 $USER 已存在，跳过"
-else
-    useradd -r -s /bin/false -d "$INSTALL_DIR" "$USER"
-    echo "   ✅ 已创建用户: $USER"
-fi
+echo "👤 步骤 3/8: 确认运行用户..."
+echo "   Gateway 将以 $RUN_USER:$RUN_GROUP 运行（与 OpenClaw 共用同一用户）"
 
 # 步骤 4: 创建目录结构
 echo ""
@@ -119,9 +122,9 @@ echo "   ✅ Python 依赖安装完成"
 # 步骤 7: 设置权限
 echo ""
 echo "🔐 步骤 7/8: 设置文件权限..."
-chown -R "$USER:$GROUP" "$INSTALL_DIR"
-chown -R "$USER:$GROUP" "$DATA_DIR"
-chown -R "$USER:$GROUP" "$LOG_DIR"
+chown -R "$RUN_USER:$RUN_GROUP" "$INSTALL_DIR"
+chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
+chown -R "$RUN_USER:$RUN_GROUP" "$LOG_DIR"
 chmod 600 "$INSTALL_DIR/.env"
 chmod +x "$INSTALL_DIR/scripts/manage-agent.py"
 chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
@@ -131,7 +134,9 @@ echo "   ✅ 权限设置完成"
 # 步骤 8: 安装并启动 systemd 服务
 echo ""
 echo "⚙️  步骤 8/8: 配置 systemd 服务..."
-cp "$SCRIPT_DIR/scripts/openclaw-gateway.service" /etc/systemd/system/
+# 用实际运行用户替换 service 模板中的占位符
+sed -e "s/__RUN_USER__/$RUN_USER/g" -e "s/__RUN_GROUP__/$RUN_GROUP/g" \
+    "$SCRIPT_DIR/scripts/openclaw-gateway.service" > /etc/systemd/system/openclaw-gateway.service
 systemctl daemon-reload
 systemctl enable openclaw-gateway.service
 systemctl start openclaw-gateway.service
@@ -158,8 +163,8 @@ if systemctl is-active --quiet openclaw-gateway.service; then
     echo "下一步操作:"
     echo "  1. 编辑配置: sudo nano $INSTALL_DIR/.env"
     echo "  2. 重启服务: sudo systemctl restart openclaw-gateway"
-    echo "  3. 添加 Agent: sudo $INSTALL_DIR/bin/04-manage-agent.sh add <name>"
-    echo "  4. 查看日志: sudo journalctl -u openclaw-gateway -f"
+    echo "  3. 添加 Agent: $INSTALL_DIR/bin/04-manage-agent.sh add <name>"
+    echo "  4. 查看日志: tail -f /var/log/openclaw/gateway.log"
     echo "  5. 查看状态: sudo systemctl status openclaw-gateway"
     echo ""
     echo "健康检查: curl http://localhost:8000/health"
