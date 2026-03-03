@@ -122,6 +122,7 @@ PYEOF
 sync_gateway_tokens() {
     # 对齐 gateway.auth.token 与 gateway.remote.token，避免 token mismatch
     local auth_token remote_token desired_token
+    GATEWAY_TOKEN_SYNC_CHANGED=false
 
     auth_token=$(_read_token_from_config_file "auth")
     remote_token=$(_read_token_from_config_file "remote")
@@ -156,20 +157,53 @@ sync_gateway_tokens() {
 }
 
 
-hard_check_gateway_token_health() {
-    # 硬校验：gateway status 必须 RPC ok，doctor 不得出现 token stale/mismatch
-    local status_output doctor_output
+_status_has_token_mismatch() {
+    local text="$1"
+    echo "$text" | grep -Eqi "config token differs from service token|gateway token mismatch|gateway auth token mismatch|service token is stale"
+}
 
-    step "Gateway RPC 探针校验..."
+
+repair_gateway_service_token_if_needed() {
+    # 如果 service token 与 config token 漂移，自动执行 gateway install --force 修复
+    local status_output
     status_output="$(openclaw gateway status 2>&1 || true)"
-    if ! echo "$status_output" | grep -q "RPC probe: ok"; then
-        error "Gateway RPC probe 未通过，请先修复后再继续"
+
+    if ! _status_has_token_mismatch "$status_output"; then
+        return 0
+    fi
+
+    warn "检测到 Gateway 服务 token 与配置可能不一致，尝试自动修复..."
+    if ! openclaw gateway install --force >/dev/null 2>&1; then
+        error "自动修复失败: openclaw gateway install --force"
         echo "$status_output"
         return 1
     fi
 
-    if echo "$status_output" | grep -Eqi "config token differs from service token|gateway token mismatch|gateway auth token mismatch|service token is stale"; then
+    openclaw gateway restart >/dev/null 2>&1 || true
+    sleep 2
+    success "已执行 gateway install --force 并重启服务"
+    return 0
+}
+
+
+hard_check_gateway_token_health() {
+    # 硬校验：gateway status 必须 RPC ok，doctor 不得出现 token stale/mismatch
+    local status_output doctor_output
+
+    # 先尝试自动修复 service token 漂移（不影响已健康场景）
+    repair_gateway_service_token_if_needed || true
+
+    step "Gateway RPC 探针校验..."
+    status_output="$(openclaw gateway status 2>&1 || true)"
+
+    if _status_has_token_mismatch "$status_output"; then
         error "检测到 Gateway token 不一致（gateway status）"
+        echo "$status_output"
+        return 1
+    fi
+
+    if ! echo "$status_output" | grep -q "RPC probe: ok"; then
+        error "Gateway RPC probe 未通过，请先修复后再继续"
         echo "$status_output"
         return 1
     fi
@@ -240,6 +274,36 @@ for agent in agents:
     if os.path.realpath(shared) != os.path.realpath(os.path.join(workspace, 'shared')):
         errors.append(f"{agent_id}: 共享目录路径异常: {shared}")
 
+    docker_cfg = sandbox.get('docker', {})
+    expected_src = os.path.realpath(shared)
+    expected_dst = '/workspace/shared'
+    mount_ok = False
+
+    for item in (docker_cfg.get('binds') or []):
+        if not isinstance(item, str):
+            continue
+        parts = item.split(':')
+        if len(parts) < 2:
+            continue
+        src = os.path.realpath(parts[0])
+        dst = parts[1]
+        if src == expected_src and dst == expected_dst:
+            mount_ok = True
+            break
+
+    if not mount_ok:
+        for item in (docker_cfg.get('mounts') or []):
+            if not isinstance(item, dict):
+                continue
+            src = os.path.realpath(str(item.get('source', '')))
+            dst = str(item.get('target', ''))
+            if src == expected_src and dst == expected_dst:
+                mount_ok = True
+                break
+
+    if not mount_ok:
+        errors.append(f"{agent_id}: 缺少共享目录挂载（需要 {shared} -> /workspace/shared）")
+
 if errors:
     print('SANDBOX_SHARED_CONTRACT_FAILED')
     for item in errors:
@@ -269,6 +333,28 @@ PYEOF
         if echo "$check_output" | grep -q "^- "; then
             echo "$check_output" | grep "^- "
         fi
+
+        if cmd_exists docker; then
+            local containers probe_failed=0
+            containers=$(openclaw sandbox list 2>/dev/null | grep -Eo 'openclaw-sbx-agent-[^[:space:]]+' | sort -u || true)
+            if [[ -n "$containers" ]]; then
+                while IFS= read -r c; do
+                    [[ -z "$c" ]] && continue
+                    if ! docker exec -w /workspace "$c" sh -lc 'mkdir -p /workspace/shared && touch /workspace/shared/.probe && rm -f /workspace/shared/.probe' >/dev/null 2>&1; then
+                        warn "运行时共享目录探针失败: ${c}"
+                        probe_failed=1
+                    fi
+                done <<< "$containers"
+                if [[ "$probe_failed" -eq 1 ]]; then
+                    error "沙箱运行时共享目录探针失败，请检查容器挂载状态"
+                    return 1
+                fi
+                success "沙箱运行时共享目录探针通过"
+            else
+                step "未检测到运行中的沙箱容器，跳过运行时共享目录探针"
+            fi
+        fi
+
         return 0
     fi
 
@@ -1013,6 +1099,8 @@ config_path = os.path.expanduser("~/.openclaw/openclaw.json")
 with open(config_path, "r") as f:
     config = json.loads(f.read())
 
+shared_dir = "${shared_dir}"
+
 agents_list = config.get("agents", {}).get("list", [])
 for agent in agents_list:
     if agent.get("id") == "${agent_id}":
@@ -1022,7 +1110,10 @@ for agent in agents_list:
             "workspaceAccess": "rw",
             "docker": {
                 "network": "bridge",
-                "readOnlyRoot": False
+                "readOnlyRoot": False,
+                "binds": [
+                    f"{shared_dir}:/workspace/shared:rw"
+                ]
             }
         }
         break
@@ -1234,6 +1325,17 @@ final_check() {
         success "OpenClaw Gateway 运行正常"
     else
         warn "OpenClaw Gateway 未运行。启动命令: openclaw gateway start"
+    fi
+
+    # 对于 --skip-install / --add-agent 模式，也要确保 token 配置对齐
+    step "同步 Gateway token 配置..."
+    sync_gateway_tokens
+    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
+        step "检测到 token 变更，重启 Gateway 使配置生效..."
+        openclaw gateway restart >/dev/null 2>&1 || {
+            warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
+        }
+        sleep 2
     fi
 
     # 硬校验：沙箱共享目录契约

@@ -269,7 +269,10 @@ Agent ID (英文标识, 如 development, testing, service): development
     "workspaceAccess": "rw",
     "docker": {
       "network": "bridge",
-      "readOnlyRoot": false
+      "readOnlyRoot": false,
+      "binds": [
+        "<workspace>/shared:/workspace/shared:rw"
+      ]
     }
   }
 }
@@ -279,6 +282,7 @@ Agent ID (英文标识, 如 development, testing, service): development
 |------|-----|------|
 | `network` | `bridge` | 容器需要联网（API 调用等） |
 | `readOnlyRoot` | `false` | 容器根文件系统可写 |
+| `binds` | `<workspace>/shared:/workspace/shared:rw` | 显式挂载共享目录，容器内固定路径 `/workspace/shared` |
 
 共享文件目录默认位于 `~/.openclaw/workspace-<agent_id>/shared`，容器内通过 `/workspace/shared` 访问。
 
