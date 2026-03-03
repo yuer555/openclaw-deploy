@@ -3,7 +3,7 @@ set -e
 
 # OpenClaw Gateway 自动化部署脚本
 # 用途: 在全新 Linux 服务器上一键部署 Gateway
-# 用法: sudo bash deploy/install.sh
+# 用法: sudo bash bin/02-install-gateway.sh
 
 echo "=========================================="
 echo "OpenClaw Gateway 自动化部署"
@@ -77,6 +77,7 @@ echo ""
 echo "📄 步骤 5/8: 复制代码文件..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cp -r "$SCRIPT_DIR/src" "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/bin" "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
 
 # 创建 .env 文件（如果不存在）
@@ -98,17 +99,6 @@ EOF
     fi
 else
     echo "   .env 已存在，跳过"
-fi
-
-# 创建顶层 manage-agent.sh 快捷入口
-if [ -f "$INSTALL_DIR/scripts/manage-agent.sh" ]; then
-    cp "$INSTALL_DIR/scripts/manage-agent.sh" "$INSTALL_DIR/manage-agent.sh"
-    chmod +x "$INSTALL_DIR/manage-agent.sh"
-elif [ -f "$SCRIPT_DIR/scripts/manage-agent.sh" ]; then
-    cp "$SCRIPT_DIR/scripts/manage-agent.sh" "$INSTALL_DIR/manage-agent.sh"
-    chmod +x "$INSTALL_DIR/manage-agent.sh"
-else
-    echo "   ⚠️  manage-agent.sh 未找到，跳过快捷入口创建"
 fi
 
 echo "   ✅ 代码文件复制完成"
@@ -135,12 +125,13 @@ chown -R "$USER:$GROUP" "$LOG_DIR"
 chmod 600 "$INSTALL_DIR/.env"
 chmod +x "$INSTALL_DIR/scripts/manage-agent.py"
 chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
+chmod +x "$INSTALL_DIR/bin/"*.sh 2>/dev/null || true
 echo "   ✅ 权限设置完成"
 
 # 步骤 8: 安装并启动 systemd 服务
 echo ""
 echo "⚙️  步骤 8/8: 配置 systemd 服务..."
-cp "$SCRIPT_DIR/deploy/openclaw-gateway.service" /etc/systemd/system/
+cp "$SCRIPT_DIR/scripts/openclaw-gateway.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable openclaw-gateway.service
 systemctl start openclaw-gateway.service
@@ -167,7 +158,7 @@ if systemctl is-active --quiet openclaw-gateway.service; then
     echo "下一步操作:"
     echo "  1. 编辑配置: sudo nano $INSTALL_DIR/.env"
     echo "  2. 重启服务: sudo systemctl restart openclaw-gateway"
-    echo "  3. 添加 Agent: sudo $INSTALL_DIR/manage-agent.sh add <name>"
+    echo "  3. 添加 Agent: sudo $INSTALL_DIR/bin/04-manage-agent.sh add <name>"
     echo "  4. 查看日志: sudo journalctl -u openclaw-gateway -f"
     echo "  5. 查看状态: sudo systemctl status openclaw-gateway"
     echo ""

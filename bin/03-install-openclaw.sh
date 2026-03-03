@@ -9,10 +9,10 @@
 #   4. 编辑 Agent 人格设定（用编辑器依次编辑 OpenClaw 初始化的文件）
 #
 # 用法：
-#   bash scripts/install-openclaw.sh            # 完整安装流程
-#   bash scripts/install-openclaw.sh --skip-install   # 跳过安装，只做配置
-#   bash scripts/install-openclaw.sh --add-agent      # 只添加新 Agent
-#   bash scripts/install-openclaw.sh --add-provider   # 只添加模型提供商
+#   bash bin/03-install-openclaw.sh            # 完整安装流程
+#   bash bin/03-install-openclaw.sh --skip-install   # 跳过安装，只做配置
+#   bash bin/03-install-openclaw.sh --add-agent      # 只添加新 Agent
+#   bash bin/03-install-openclaw.sh --add-provider   # 只添加模型提供商
 #
 # 要求：Node.js 22+, Docker（沙箱 agent 需要）
 # ============================================================================
@@ -980,7 +980,7 @@ configure_gateway_integration() {
         echo -e "  ${BOLD}OPENCLAW_URL${NC}=ws://localhost:${gw_port}"
         echo -e "  ${BOLD}OPENCLAW_TOKEN${NC}=${gw_token}"
         echo ""
-        echo "在 manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
+        echo "在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
         echo "不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。"
     else
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
@@ -988,7 +988,7 @@ configure_gateway_integration() {
         echo -e "  ${BOLD}OpenClaw Token${NC}: ${gw_token}"
         echo ""
         echo "添加 Gateway Agent 绑定时使用:"
-        echo -e "  ${DIM}sudo /opt/openclaw/gateway/manage-agent.sh add <name>${NC}"
+        echo -e "  ${DIM}sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
         echo "  在交互式提示中填入以上 URL 和 Token，以及对应的 openclaw_agent_id。"
     fi
 
@@ -1028,9 +1028,9 @@ final_check() {
     echo ""
     echo "后续操作:"
     echo -e "  ${CYAN}1.${NC} 启动 OpenClaw:       ${DIM}openclaw gateway start${NC}"
-    echo -e "  ${CYAN}2.${NC} 部署企微 Gateway:    ${DIM}sudo bash deploy/install.sh${NC}"
-    echo -e "  ${CYAN}3.${NC} 添加企微 Agent 绑定: ${DIM}sudo /opt/openclaw/gateway/manage-agent.sh add <name>${NC}"
-    echo -e "  ${CYAN}4.${NC} 查看 Agent 列表:     ${DIM}sudo /opt/openclaw/gateway/manage-agent.sh list${NC}"
+    echo -e "  ${CYAN}2.${NC} 部署企微 Gateway:    ${DIM}sudo bash bin/02-install-gateway.sh${NC}"
+    echo -e "  ${CYAN}3.${NC} 添加企微 Agent 绑定: ${DIM}sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
+    echo -e "  ${CYAN}4.${NC} 查看 Agent 列表:     ${DIM}sudo /opt/openclaw/gateway/bin/04-manage-agent.sh list${NC}"
     echo -e "  ${CYAN}5.${NC} 查看 OpenClaw 面板:  ${DIM}openclaw dashboard${NC}"
     echo ""
 }

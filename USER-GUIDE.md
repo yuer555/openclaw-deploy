@@ -4,6 +4,18 @@
 
 ---
 
+## 快速部署流程
+
+| 步骤 | 脚本 | 执行位置 | 说明 |
+|------|------|---------|------|
+| 1. 上传代码 | `bin/01-upload.sh` | 本地 | 打包项目文件并上传到服务器 |
+| 2. 安装 Gateway | `sudo bash bin/02-install-gateway.sh` | 服务器 | 安装 Python 依赖、配置 systemd 服务 |
+| 3. 安装 OpenClaw | `bash bin/03-install-openclaw.sh` | 服务器 | 安装 OpenClaw、配置模型和 Agent |
+| 4. 添加 Agent 绑定 | `sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add <name>` | 服务器 | 绑定企业微信机器人到 OpenClaw Agent |
+| 5. 清理环境 | `sudo bash bin/05-cleanup.sh` | 服务器 | 卸载服务 / 清空 OpenClaw / 全部重置 |
+
+---
+
 ## 📋 目录
 
 1. [快速开始](#1-快速开始)
@@ -31,7 +43,7 @@
 ### 1.2 你需要什么？
 
 - ✅ 一台 Linux 服务器（CentOS/Ubuntu）或 macOS
-- ✅ OpenClaw 已安装并运行（未安装？用 `bash scripts/install-openclaw.sh` 一键搞定，需要 Node.js 22+）
+- ✅ OpenClaw 已安装并运行（未安装？用 `bash bin/03-install-openclaw.sh` 一键搞定，需要 Node.js 22+）
 - ✅ 企业微信管理员权限（能创建机器人应用）
 - ✅ 基本的命令行操作能力（会复制粘贴命令即可）
 
@@ -53,20 +65,20 @@
 cd ~/openclaw-deploy
 
 # 一键安装 OpenClaw + 配置模型 + 创建 Agent + 编辑人格设定
-bash scripts/install-openclaw.sh
+bash bin/03-install-openclaw.sh
 ```
 
 **快捷模式**（已安装 OpenClaw 的情况下）：
 
 ```bash
 # 跳过安装，只做配置（OpenClaw 已安装）
-bash scripts/install-openclaw.sh --skip-install
+bash bin/03-install-openclaw.sh --skip-install
 
 # 只添加新 Agent
-bash scripts/install-openclaw.sh --add-agent
+bash bin/03-install-openclaw.sh --add-agent
 
 # 只添加模型提供商
-bash scripts/install-openclaw.sh --add-provider
+bash bin/03-install-openclaw.sh --add-provider
 ```
 
 ---
@@ -285,7 +297,7 @@ Agent ID (英文标识, 如 development, testing, service): development
   OPENCLAW_URL=ws://localhost:18789
   OPENCLAW_TOKEN=1e443bcba0ed1327...
 
-在 manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。
+在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。
 不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。
 ```
 
@@ -307,9 +319,9 @@ Agent ID (英文标识, 如 development, testing, service): development
 
 后续操作:
   1. 启动 OpenClaw:       openclaw gateway start
-  2. 部署企微 Gateway:    sudo bash deploy/install.sh
-  3. 添加企微 Agent 绑定: sudo /opt/openclaw/gateway/manage-agent.sh add <name>
-  4. 查看 Agent 列表:     sudo /opt/openclaw/gateway/manage-agent.sh list
+  2. 部署企微 Gateway:    sudo bash bin/02-install-gateway.sh
+  3. 添加企微 Agent 绑定: sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add <name>
+  4. 查看 Agent 列表:     sudo /opt/openclaw/gateway/bin/04-manage-agent.sh list
   5. 查看 OpenClaw 面板:  openclaw dashboard
 ```
 
@@ -365,7 +377,7 @@ Set up your first AI model provider:
 Select [1-3]: _
 ```
 
-选择提供商后输入 API Key。也可以选 3 跳过，后续通过 `install-openclaw.sh --add-provider` 添加。
+选择提供商后输入 API Key。也可以选 3 跳过，后续通过 `bin/03-install-openclaw.sh --add-provider` 添加。
 
 #### 步骤 4：安装 Daemon
 
@@ -474,7 +486,7 @@ cd ~/openclaw-deploy
 
 ```bash
 cd ~/openclaw-deploy
-sudo bash deploy/install.sh
+sudo bash bin/02-install-gateway.sh
 ```
 
 **安装过程**：
@@ -639,7 +651,7 @@ https://ai.yourcompany.com/team-dev/wecom/callback
 
 ```bash
 # 生产环境（systemd 服务）
-sudo /opt/openclaw/gateway/manage-agent.sh add team-dev
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add team-dev
 
 # 开发环境
 python3 scripts/manage-agent.py add team-dev
@@ -671,7 +683,7 @@ OpenClaw Agent ID（默认 main，按回车使用默认）: [直接回车]
 
 ```bash
 # 查看所有 Agent
-sudo /opt/openclaw/gateway/manage-agent.sh list
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh list
 
 # 或开发环境
 python3 scripts/manage-agent.py list
@@ -796,10 +808,10 @@ task_id_123|zhangsan|team-dev|你好|success|收到你的消息...|2026-03-02 10
 
 ```bash
 # 添加第二个 agent（运维团队）
-sudo /opt/openclaw/gateway/manage-agent.sh add team-ops
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add team-ops
 
 # 添加第三个 agent（产品团队）
-sudo /opt/openclaw/gateway/manage-agent.sh add team-product
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add team-product
 ```
 
 **每个 agent 对应一个企业微信机器人应用**，配置步骤和上面完全一样。
@@ -822,7 +834,7 @@ sudo /opt/openclaw/gateway/manage-agent.sh add team-product
 **步骤 2：添加 Gateway Agent 时指定**
 
 ```bash
-sudo /opt/openclaw/gateway/manage-agent.sh add team-work
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add team-work
 ```
 
 当提示输入 **OpenClaw Agent ID** 时，输入 `work`（而不是默认的 `main`）。
@@ -833,7 +845,7 @@ sudo /opt/openclaw/gateway/manage-agent.sh add team-work
 
 ```bash
 # 更新 agent 配置
-sudo /opt/openclaw/gateway/manage-agent.sh update team-dev
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh update team-dev
 ```
 
 **按提示修改**（不想改的直接回车保持原值）：
@@ -854,7 +866,7 @@ sudo /opt/openclaw/gateway/manage-agent.sh update team-dev
 ### 7.4 删除 Agent
 
 ```bash
-sudo /opt/openclaw/gateway/manage-agent.sh remove team-dev
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh remove team-dev
 ```
 
 **确认删除**：
@@ -976,7 +988,7 @@ sudo gateway-ctl logs
 
 3. **如果不一致，更新 agent**：
    ```bash
-   sudo /opt/openclaw/gateway/manage-agent.sh update team-dev
+   sudo /opt/openclaw/gateway/bin/04-manage-agent.sh update team-dev
    ```
 
 ---
@@ -1010,7 +1022,7 @@ sudo gateway-ctl logs
 4. **测试 OpenClaw 连接**：
    ```bash
    # 使用 Gateway 的测试脚本
-   python3 scripts/test-session-isolation.py
+   python3 testScripts/test-session-isolation.py
    ```
 
 ---
@@ -1116,7 +1128,7 @@ cd ~/openclaw-deploy
 git pull
 
 # 4. 重新安装
-sudo bash deploy/install.sh
+sudo bash bin/02-install-gateway.sh
 
 # 5. 启动服务
 sudo systemctl start openclaw-gateway
@@ -1128,14 +1140,15 @@ sudo systemctl start openclaw-gateway
 
 ```bash
 cd ~/openclaw-deploy
-sudo bash deploy/uninstall.sh
+sudo bash bin/05-cleanup.sh
 ```
 
-**卸载会删除**：
-- systemd 服务
-- `/opt/openclaw/gateway` 目录
+清理脚本提供三个选项：
+1. 卸载 Gateway 服务（停服务 + 删安装目录 + 删 systemd）
+2. 清空 OpenClaw（停 gateway + 删 ~/.openclaw）
+3. 全部清理（1+2 + 删数据目录）
 
-**不会删除**：
+**选项 1 不会删除**：
 - `/opt/openclaw/data/gateway` 目录（数据保留）
 
 **如果要完全删除（包括数据）**：
@@ -1231,11 +1244,11 @@ sudo rm -rf /opt/openclaw
 
 ```bash
 # 研发部使用 main agent
-sudo /opt/openclaw/gateway/manage-agent.sh add dept-dev
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add dept-dev
 # OpenClaw Agent ID: main
 
 # 运维部使用 work agent
-sudo /opt/openclaw/gateway/manage-agent.sh add dept-ops
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add dept-ops
 # OpenClaw Agent ID: work
 ```
 
@@ -1261,10 +1274,10 @@ Gateway
 
 2. **添加 agent 时使用不同的 OpenClaw URL**：
    ```bash
-   sudo /opt/openclaw/gateway/manage-agent.sh add dept-dev
+   sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add dept-dev
    # OpenClaw URL: http://server1:18789
    
-   sudo /opt/openclaw/gateway/manage-agent.sh add dept-ops
+   sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add dept-ops
    # OpenClaw URL: http://server2:18789
    ```
 
@@ -1367,17 +1380,15 @@ sudo crontab -e
 ```
 /opt/openclaw/
 ├── gateway/
-│   ├── wecom_gateway.py      # Gateway 主程序
-│   ├── manage-agent.sh       # Agent 管理脚本
-│   ├── requirements.txt      # Python 依赖
+│   ├── bin/                  # 部署步骤脚本
+│   ├── scripts/              # 工具脚本
+│   ├── src/                  # 应用代码
 │   └── .env                  # 环境变量
 ├── data/
 │   └── gateway/
 │       ├── gateway.db        # SQLite 数据库
 │       ├── gateway.log       # 日志文件
 │       └── files/            # 文件下载目录
-└── scripts/
-    └── health-check.sh       # 健康检查脚本
 ```
 
 ---
@@ -1435,7 +1446,7 @@ sudo systemctl status openclaw-gateway
 sudo journalctl -u openclaw-gateway -f
 
 # 查看所有 Agent
-sudo /opt/openclaw/gateway/manage-agent.sh list
+sudo /opt/openclaw/gateway/bin/04-manage-agent.sh list
 
 # 查看最近 10 条任务
 sqlite3 /opt/openclaw/data/gateway/gateway.db \
@@ -1468,5 +1479,5 @@ sudo systemctl restart openclaw-gateway
 
 ---
 
-**最后更新**: 2026-03-02  
-**版本**: v1.0
+**最后更新**: 2026-03-03
+**版本**: v1.1

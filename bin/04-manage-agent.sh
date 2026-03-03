@@ -1,19 +1,20 @@
 #!/bin/bash
-# manage-agent.sh — Agent 管理快捷脚本
+# 04-manage-agent.sh — Agent 管理快捷脚本
 # 自动检测运行环境（生产 venv / 开发直接 python3）
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MANAGE_PY="$SCRIPT_DIR/scripts/manage-agent.py"
+# 从 bin/ 找兄弟 scripts/ 目录
+MANAGE_PY="$(dirname "$SCRIPT_DIR")/scripts/manage-agent.py"
 
-# 如果从 /opt/openclaw/gateway/ 运行（install.sh 会将此脚本复制到此处）
+# 如果从 /opt/openclaw/gateway/ 运行（manage-agent.sh 快捷入口）
+if [ ! -f "$MANAGE_PY" ]; then
+    MANAGE_PY="$SCRIPT_DIR/scripts/manage-agent.py"
+fi
+# 也可能同目录下
 if [ ! -f "$MANAGE_PY" ]; then
     MANAGE_PY="$SCRIPT_DIR/manage-agent.py"
-fi
-# 也可能在 scripts/ 目录下
-if [ ! -f "$MANAGE_PY" ]; then
-    MANAGE_PY="$(dirname "$SCRIPT_DIR")/scripts/manage-agent.py"
 fi
 
 if [ ! -f "$MANAGE_PY" ]; then

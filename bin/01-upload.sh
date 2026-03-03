@@ -1,8 +1,8 @@
 #!/bin/bash
 #==============================================================================
-# 脚本名称: upload-to-server.sh
+# 脚本名称: 01-upload.sh
 # 功能描述: 从本地上传 OpenClaw 企业微信桥接网关项目文件到生产服务器
-# 使用方法: ./deploy/upload-to-server.sh
+# 使用方法: ./bin/01-upload.sh
 # 执行位置: 🏠 本地（项目根目录）
 # 分支:     20260302_feat_wecom_bridging
 # 版本: V1.0
@@ -113,13 +113,13 @@ echo ""
 echo "  src/gateway/                  — Gateway 主程序 + 依赖"
 echo "    ├── wecom_gateway.py"
 echo "    └── requirements.txt"
-echo "  scripts/                      — 管理工具"
+echo "  bin/                          — 部署步骤脚本"
+echo "    ├── 02-install-gateway.sh"
+echo "    ├── 03-install-openclaw.sh"
+echo "    ├── 04-manage-agent.sh"
+echo "    └── 05-cleanup.sh"
+echo "  scripts/                      — 工具脚本"
 echo "    ├── manage-agent.py"
-echo "    ├── manage-agent.sh"
-echo "    └── install-openclaw.sh"
-echo "  deploy/                       — 部署脚本 + systemd 服务"
-echo "    ├── install.sh"
-echo "    ├── uninstall.sh"
 echo "    ├── gateway-ctl.sh"
 echo "    └── openclaw-gateway.service"
 echo "  .env.example                  — 环境变量模板"
@@ -159,21 +159,19 @@ mkdir -p "${STAGING}/src/gateway"
 cp "${PROJECT_ROOT}/src/gateway/wecom_gateway.py" "${STAGING}/src/gateway/"
 cp "${PROJECT_ROOT}/src/gateway/requirements.txt" "${STAGING}/src/gateway/"
 
-# 复制管理脚本
-print_info "复制管理脚本..."
+# 复制部署步骤脚本
+print_info "复制部署步骤脚本..."
+mkdir -p "${STAGING}/bin"
+for f in "${PROJECT_ROOT}/bin/"*.sh; do
+    [ -f "$f" ] && cp "$f" "${STAGING}/bin/"
+done
+
+# 复制工具脚本
+print_info "复制工具脚本..."
 mkdir -p "${STAGING}/scripts"
 cp "${PROJECT_ROOT}/scripts/manage-agent.py" "${STAGING}/scripts/"
-cp "${PROJECT_ROOT}/scripts/manage-agent.sh" "${STAGING}/scripts/" 2>/dev/null || true
-cp "${PROJECT_ROOT}/scripts/install-openclaw.sh" "${STAGING}/scripts/" 2>/dev/null || true
-
-# 复制部署脚本
-print_info "复制部署脚本..."
-mkdir -p "${STAGING}/deploy"
-for f in install.sh uninstall.sh gateway-ctl.sh openclaw-gateway.service; do
-    cp "${PROJECT_ROOT}/deploy/${f}" "${STAGING}/deploy/" 2>/dev/null || true
-done
-# 包含本上传脚本本身（供参考）
-cp "${PROJECT_ROOT}/deploy/upload-to-server.sh" "${STAGING}/deploy/" 2>/dev/null || true
+cp "${PROJECT_ROOT}/scripts/gateway-ctl.sh" "${STAGING}/scripts/" 2>/dev/null || true
+cp "${PROJECT_ROOT}/scripts/openclaw-gateway.service" "${STAGING}/scripts/" 2>/dev/null || true
 
 # 复制配置模板
 print_info "复制配置文件..."
@@ -235,7 +233,7 @@ if [ -n "\$DB_PATH" ] && [ -f "\$DB_PATH" ]; then
 fi
 
 # 清除旧代码文件（保留运行时数据和配置）
-rm -rf src scripts deploy docs README.md USER-GUIDE.md AGENTS.md PROJECT-SUMMARY.md PHASE2-PLAN.md 2>/dev/null || true
+rm -rf src bin scripts deploy docs README.md USER-GUIDE.md AGENTS.md PROJECT-SUMMARY.md PHASE2-PLAN.md 2>/dev/null || true
 
 # 解压新文件
 tar -xzf ${PACKAGE_NAME}
@@ -250,7 +248,7 @@ if [ -f /tmp/.env.gateway.bak ]; then
 fi
 
 # 设置执行权限
-chmod +x deploy/*.sh 2>/dev/null || true
+chmod +x bin/*.sh 2>/dev/null || true
 chmod +x scripts/*.sh 2>/dev/null || true
 chmod +x scripts/*.py 2>/dev/null || true
 
@@ -280,16 +278,16 @@ echo -e "${YELLOW}1. 登录到服务器：${NC}"
 echo -e "   ${BLUE}ssh ${SERVER_USER}@${SERVER_IP}${NC}\n"
 
 echo -e "${YELLOW}2. 首次部署 — 运行安装脚本：${NC}"
-echo -e "   ${BLUE}cd ${REMOTE_DIR} && sudo bash deploy/install.sh${NC}\n"
+echo -e "   ${BLUE}cd ${REMOTE_DIR} && sudo bash bin/02-install-gateway.sh${NC}\n"
 
 echo -e "${YELLOW}3. 更新部署 — 重启 Gateway 服务：${NC}"
 echo -e "   ${BLUE}sudo systemctl restart openclaw-gateway${NC}\n"
 
 echo -e "${YELLOW}4. 安装配置 OpenClaw（如未安装）：${NC}"
-echo -e "   ${BLUE}cd ${REMOTE_DIR} && bash scripts/install-openclaw.sh${NC}\n"
+echo -e "   ${BLUE}cd ${REMOTE_DIR} && bash bin/03-install-openclaw.sh${NC}\n"
 
 echo -e "${YELLOW}5. 添加 Agent 绑定：${NC}"
-echo -e "   ${BLUE}sudo /opt/openclaw/gateway/manage-agent.sh add <name>${NC}\n"
+echo -e "   ${BLUE}sudo ${REMOTE_DIR}/gateway/bin/04-manage-agent.sh add <name>${NC}\n"
 
 echo -e "${YELLOW}6. 查看服务状态 / 日志：${NC}"
 echo -e "   ${BLUE}sudo systemctl status openclaw-gateway${NC}"
