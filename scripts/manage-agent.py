@@ -21,6 +21,12 @@ DB_PATH = os.getenv('DB_PATH', '/opt/openclaw/data/gateway/gateway.db')
 # Gateway 地址（用于通知重载）
 GATEWAY_URL = os.getenv('GATEWAY_URL', 'http://localhost:8000')
 
+# 默认 OpenClaw 地址
+DEFAULT_OPENCLAW_URL = 'http://localhost:18789'
+
+# 默认共享目录基础路径（位于 agent workspace 内，确保 Docker sandbox 能挂载）
+OPENCLAW_HOME = os.path.expanduser(os.getenv('OPENCLAW_HOME', '~/.openclaw'))
+
 NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9\-]{1,28}[a-z0-9]$')
 
 
@@ -36,9 +42,15 @@ def get_db():
         openclaw_url      TEXT NOT NULL,
         openclaw_token    TEXT NOT NULL,
         openclaw_agent_id TEXT DEFAULT '',
+        shared_dir        TEXT DEFAULT '',
         created_at        TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at        TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
+    # 兼容旧版数据库：如果 shared_dir 列不存在则添加
+    try:
+        conn.execute("SELECT shared_dir FROM agents LIMIT 0")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE agents ADD COLUMN shared_dir TEXT DEFAULT ''")
     conn.commit()
     return conn
 
@@ -96,10 +108,9 @@ def cmd_add(name):
         print("错误: AESKey 不能为空")
         sys.exit(1)
 
-    openclaw_url = input("openclaw 地址（如 http://10.0.1.5:18789）: ").strip()
+    openclaw_url = input(f"openclaw 地址（回车使用默认 {DEFAULT_OPENCLAW_URL}）: ").strip()
     if not openclaw_url:
-        print("错误: openclaw 地址不能为空")
-        sys.exit(1)
+        openclaw_url = DEFAULT_OPENCLAW_URL
     openclaw_url = openclaw_url.rstrip('/')
 
     openclaw_token = input("openclaw Token: ").strip()
@@ -109,12 +120,21 @@ def cmd_add(name):
 
     openclaw_agent_id = input("openclaw Agent ID（回车跳过，默认 main）: ").strip()
 
+    # 共享目录：Gateway 下载的文件保存到此目录，同时挂载到 Docker 沙箱容器的 /shared
+    # 共享目录位于 agent workspace 内，确保 Docker sandbox bind mount 安全检查通过
+    openclaw_agent = openclaw_agent_id or 'main'
+    default_shared = os.path.join(OPENCLAW_HOME, f'workspace-{openclaw_agent}', 'shared') if openclaw_agent != 'main' else os.path.join(OPENCLAW_HOME, 'workspace', 'shared')
+    shared_dir = input(f"共享文件目录（回车使用默认 {default_shared}）: ").strip()
+    if not shared_dir:
+        shared_dir = default_shared
+
     # 确认
     print(f"\n确认添加？")
     print(f"  路由名:     {name}")
     print(f"  显示名:     {display_name}")
     print(f"  企业微信:   Token={mask(wecom_token)} AESKey={mask(wecom_aes_key)}")
     print(f"  openclaw:   {openclaw_url} (agent: {openclaw_agent_id or 'main'})")
+    print(f"  共享目录:   {shared_dir}")
 
     confirm = input("\n[Y/n] ").strip().lower()
     if confirm and confirm != 'y':
@@ -123,12 +143,18 @@ def cmd_add(name):
         return
 
     conn.execute(
-        "INSERT INTO agents (name, display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token, openclaw_agent_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (name, display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token, openclaw_agent_id)
+        "INSERT INTO agents (name, display_name, wecom_token, wecom_aes_key, "
+        "openclaw_url, openclaw_token, openclaw_agent_id, shared_dir) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token,
+         openclaw_agent_id, shared_dir)
     )
     conn.commit()
     conn.close()
+
+    # 自动创建共享目录
+    os.makedirs(shared_dir, exist_ok=True)
+    print(f"已创建共享目录: {shared_dir}")
 
     print(f"已添加 agent '{name}'")
     print(f"企业微信回调地址: https://your-domain/{name}/wecom/callback")
@@ -139,7 +165,7 @@ def cmd_remove(name):
     """删除 agent 绑定"""
     conn = get_db()
     row = conn.execute(
-        "SELECT name, display_name, wecom_token, openclaw_url, openclaw_agent_id FROM agents WHERE name = ?",
+        "SELECT name, display_name, wecom_token, openclaw_url, openclaw_agent_id, shared_dir FROM agents WHERE name = ?",
         (name,)
     ).fetchone()
     if not row:
@@ -147,11 +173,12 @@ def cmd_remove(name):
         conn.close()
         sys.exit(1)
 
-    _, display, token, url, agent_id = row
+    _, display, token, url, agent_id, shared_dir = row
     print(f"\n即将删除:")
     print(f"  路由名: {name} ({display})")
     print(f"  企业微信: Token={mask(token)}")
     print(f"  openclaw: {url} (agent: {agent_id or 'main'})")
+    print(f"  共享目录: {shared_dir or '(未设置)'}")
 
     confirm = input("\n确认删除？此操作不可恢复。[y/N] ").strip().lower()
     if confirm != 'y':
@@ -164,6 +191,8 @@ def cmd_remove(name):
     conn.close()
 
     print(f"已删除 agent '{name}'")
+    if shared_dir:
+        print(f"注意: 共享目录 {shared_dir} 未删除，如需清理请手动删除")
     notify_reload()
 
 
@@ -171,7 +200,7 @@ def cmd_update(name):
     """更新 agent 绑定"""
     conn = get_db()
     row = conn.execute(
-        "SELECT name, display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token, openclaw_agent_id FROM agents WHERE name = ?",
+        "SELECT name, display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token, openclaw_agent_id, shared_dir FROM agents WHERE name = ?",
         (name,)
     ).fetchone()
     if not row:
@@ -179,13 +208,14 @@ def cmd_update(name):
         conn.close()
         sys.exit(1)
 
-    _, old_display, old_token, old_aes, old_url, old_oc_token, old_agent_id = row
+    _, old_display, old_token, old_aes, old_url, old_oc_token, old_agent_id, old_shared_dir = row
 
     print(f"\n更新 agent 绑定: {name}")
     print(f"当前配置:")
     print(f"  显示名:     {old_display}")
     print(f"  企业微信:   Token={mask(old_token)} AESKey={mask(old_aes)}")
     print(f"  openclaw:   {old_url} (agent: {old_agent_id or 'main'})")
+    print(f"  共享目录:   {old_shared_dir or '(未设置)'}")
 
     print(f"\n输入新值（回车保持不变）:")
 
@@ -199,12 +229,20 @@ def cmd_update(name):
     if not openclaw_agent_id:
         openclaw_agent_id = old_agent_id
 
+    openclaw_agent = openclaw_agent_id or old_agent_id or 'main'
+    if not old_shared_dir:
+        default_shared = os.path.join(OPENCLAW_HOME, f'workspace-{openclaw_agent}', 'shared') if openclaw_agent != 'main' else os.path.join(OPENCLAW_HOME, 'workspace', 'shared')
+    else:
+        default_shared = old_shared_dir
+    shared_dir = input(f"共享文件目录 [{default_shared}]: ").strip() or default_shared
+
     # 确认
     print(f"\n确认更新？")
     print(f"  路由名:     {name}")
     print(f"  显示名:     {display_name}")
     print(f"  企业微信:   Token={mask(wecom_token)} AESKey={mask(wecom_aes_key)}")
     print(f"  openclaw:   {openclaw_url} (agent: {openclaw_agent_id or 'main'})")
+    print(f"  共享目录:   {shared_dir}")
 
     confirm = input("\n[Y/n] ").strip().lower()
     if confirm and confirm != 'y':
@@ -214,12 +252,16 @@ def cmd_update(name):
 
     conn.execute(
         "UPDATE agents SET display_name=?, wecom_token=?, wecom_aes_key=?, "
-        "openclaw_url=?, openclaw_token=?, openclaw_agent_id=?, updated_at=CURRENT_TIMESTAMP "
+        "openclaw_url=?, openclaw_token=?, openclaw_agent_id=?, shared_dir=?, updated_at=CURRENT_TIMESTAMP "
         "WHERE name=?",
-        (display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token, openclaw_agent_id, name)
+        (display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token, openclaw_agent_id, shared_dir, name)
     )
     conn.commit()
     conn.close()
+
+    # 确保共享目录存在
+    if shared_dir:
+        os.makedirs(shared_dir, exist_ok=True)
 
     print(f"已更新 agent '{name}'")
     notify_reload()
@@ -229,7 +271,7 @@ def cmd_list():
     """列出所有 agent 绑定"""
     conn = get_db()
     rows = conn.execute(
-        "SELECT name, display_name, openclaw_url, openclaw_agent_id, created_at, updated_at FROM agents ORDER BY name"
+        "SELECT name, display_name, openclaw_url, openclaw_agent_id, shared_dir, created_at, updated_at FROM agents ORDER BY name"
     ).fetchall()
     conn.close()
 
@@ -239,12 +281,12 @@ def cmd_list():
         return
 
     print(f"\n共 {len(rows)} 个 agent 绑定:")
-    print("-" * 80)
-    print(f"{'名称':<12} {'显示名':<16} {'openclaw 地址':<30} {'Agent ID':<10} {'创建时间'}")
-    print("-" * 80)
-    for name, display, url, agent_id, created, updated in rows:
-        print(f"{name:<12} {display:<16} {url:<30} {(agent_id or 'main'):<10} {created}")
-    print("-" * 80)
+    print("-" * 100)
+    print(f"{'名称':<12} {'显示名':<16} {'openclaw 地址':<28} {'Agent ID':<10} {'共享目录':<30} {'创建时间'}")
+    print("-" * 100)
+    for name, display, url, agent_id, shared_dir, created, updated in rows:
+        print(f"{name:<12} {display:<16} {url:<28} {(agent_id or 'main'):<10} {(shared_dir or '-'):<30} {created}")
+    print("-" * 100)
     print(f"\n回调地址格式: https://your-domain/<name>/wecom/callback")
 
 

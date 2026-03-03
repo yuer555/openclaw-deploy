@@ -62,12 +62,18 @@ def load_agents_from_db():
     """从 SQLite 加载所有 agent 绑定"""
     _ensure_agents_table()
     conn = sqlite3.connect(DB_PATH)
+    # 兼容旧版数据库：如果 shared_dir 列不存在则添加
+    try:
+        conn.execute("SELECT shared_dir FROM agents LIMIT 0")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE agents ADD COLUMN shared_dir TEXT DEFAULT ''")
+        conn.commit()
     rows = conn.execute(
         "SELECT name, display_name, wecom_token, wecom_aes_key, "
-        "openclaw_url, openclaw_token, openclaw_agent_id FROM agents"
+        "openclaw_url, openclaw_token, openclaw_agent_id, shared_dir FROM agents"
     ).fetchall()
     agents = {}
-    for name, display, token, aes_key, url, oc_token, agent_id in rows:
+    for name, display, token, aes_key, url, oc_token, agent_id, shared_dir in rows:
         agents[name] = {
             'display_name': display,
             'wecom_token': token,
@@ -75,6 +81,7 @@ def load_agents_from_db():
             'openclaw_url': url,
             'openclaw_token': oc_token,
             'openclaw_agent_id': agent_id or 'main',
+            'shared_dir': shared_dir or '',
         }
     conn.close()
     return agents
@@ -438,6 +445,20 @@ def _get_today_dir():
     return path
 
 
+def _get_today_dir_for_agent(shared_dir):
+    """获取当日文件目录（按 agent 共享目录），自动创建"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    if shared_dir:
+        path = os.path.join(shared_dir, today)
+    else:
+        path = os.path.join(FILES_BASE, today)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+# 容器内共享目录挂载点
+CONTAINER_SHARED_MOUNT = '/shared'
+
+
 # ============= 多类型消息处理 =============
 
 TEXT_EXTENSIONS = {'.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml', '.py', '.js', '.ts',
@@ -513,10 +534,14 @@ def _decrypt_file(encrypted_data, encoding_aes_key):
         return None
 
 
-def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes_key=''):
-    """下载临时 COS URL 到文件目录（按日期分区），返回 (local_path, text_content_or_none)"""
+def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes_key='', shared_dir=''):
+    """下载临时 COS URL 到文件目录（按日期分区），返回 (local_path, text_content_or_none)
+    
+    如果 shared_dir 已设置，文件保存到共享目录（供 Docker 沙箱访问）。
+    返回的 local_path 为宿主机路径，调用者需根据需要转换为容器内路径。
+    """
     try:
-        today_dir = _get_today_dir()
+        today_dir = _get_today_dir_for_agent(shared_dir)
         resp = requests.get(url, timeout=30, stream=True)
         resp.raise_for_status()
 
@@ -571,8 +596,25 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
         return None, None
 
 
-def extract_single_content(item, user_id='', encoding_aes_key=''):
-    """提取单条消息内容（主消息或 quote 内的消息），返回文本描述"""
+def _to_container_path(host_path, shared_dir):
+    """将宿主机路径转换为容器内路径（/shared/...）
+    
+    如果 shared_dir 已配置且 host_path 在该目录下，将前缀替换为 /shared。
+    否则返回原始宿主机路径（适用于 main agent 等无沙箱场景）。
+    """
+    if shared_dir and host_path.startswith(shared_dir):
+        relative = host_path[len(shared_dir):]
+        if not relative.startswith('/'):
+            relative = '/' + relative
+        return CONTAINER_SHARED_MOUNT + relative
+    return host_path
+
+
+def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir=''):
+    """提取单条消息内容（主消息或 quote 内的消息），返回文本描述
+    
+    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，路径转为容器内路径 /shared/...
+    """
     msg_type = item.get('msgtype', '')
 
     if msg_type == 'text':
@@ -585,38 +627,46 @@ def extract_single_content(item, user_id='', encoding_aes_key=''):
         url = item.get('image', {}).get('url', '')
         if not url:
             return '[用户发送了一张图片，但无法获取]'
-        path, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image', encoding_aes_key=encoding_aes_key)
+        path, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image',
+                                     encoding_aes_key=encoding_aes_key, shared_dir=shared_dir)
         if path:
-            return f'[用户发送了一张图片，已保存到 {path}]'
+            display_path = _to_container_path(path, shared_dir)
+            return f'[用户发送了一张图片，已保存到 {display_path}]'
         return '[用户发送了一张图片，下载失败]'
 
     elif msg_type == 'file':
         url = item.get('file', {}).get('url', '')
         if not url:
             return '[用户发送了一个文件，但无法获取]'
-        path, text_content = download_temp_file(url, prefix='file', user_id=user_id, msg_type='file', encoding_aes_key=encoding_aes_key)
+        path, text_content = download_temp_file(url, prefix='file', user_id=user_id, msg_type='file',
+                                                encoding_aes_key=encoding_aes_key, shared_dir=shared_dir)
         if not path:
             return '[用户发送了一个文件，下载失败]'
         if text_content is not None:
-            return f'[用户发送了一个文本文件 {path}]\n文件内容：\n{text_content}'
-        return f'[用户发送了一个文件，已保存到 {path}]'
+            display_path = _to_container_path(path, shared_dir)
+            return f'[用户发送了一个文本文件 {display_path}]\n文件内容：\n{text_content}'
+        display_path = _to_container_path(path, shared_dir)
+        return f'[用户发送了一个文件，已保存到 {display_path}]'
 
     elif msg_type == 'mixed':
         parts = []
         for sub_item in item.get('mixed', {}).get('msg_item', []):
-            parts.append(extract_single_content(sub_item, user_id=user_id, encoding_aes_key=encoding_aes_key))
+            parts.append(extract_single_content(sub_item, user_id=user_id,
+                                                encoding_aes_key=encoding_aes_key, shared_dir=shared_dir))
         return '\n'.join(parts)
 
     return f'[不支持的消息类型: {msg_type}]'
 
 
-def extract_message_content(msg, user_id='', encoding_aes_key=''):
+def extract_message_content(msg, user_id='', encoding_aes_key='', shared_dir=''):
     """提取完整消息内容，返回文本内容"""
-    content = extract_single_content(msg, user_id=user_id, encoding_aes_key=encoding_aes_key)
+    content = extract_single_content(msg, user_id=user_id, encoding_aes_key=encoding_aes_key,
+                                     shared_dir=shared_dir)
 
     quote = msg.get('quote')
     if quote:
-        quote_content = extract_single_content(quote, user_id=user_id, encoding_aes_key=encoding_aes_key)
+        quote_content = extract_single_content(quote, user_id=user_id, encoding_aes_key=encoding_aes_key,
+                                               shared_dir=shared_dir)
         content = f"{content}\n\n[引用消息] {quote_content}"
 
     return content
@@ -789,7 +839,8 @@ def wecom_callback(agent_name):
 
             if msg_type in ('text', 'image', 'file', 'voice', 'mixed'):
                 content = extract_message_content(msg, user_id=from_user,
-                                                  encoding_aes_key=agent_cfg['wecom_encoding_aes_key'])
+                                                  encoding_aes_key=agent_cfg['wecom_encoding_aes_key'],
+                                                  shared_dir=agent_cfg.get('shared_dir', ''))
                 logger.info(f"[{agent_name}] 消息内容: {content[:200]}, from: {from_user}")
 
                 task_id = str(uuid.uuid4())

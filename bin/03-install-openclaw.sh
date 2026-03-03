@@ -793,6 +793,11 @@ PYEOF
 # 配置沙箱（内部函数）
 _configure_sandbox() {
     local agent_id="$1"
+    local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
+    local shared_dir="${workspace}/shared"
+
+    # 确保共享目录存在
+    mkdir -p "$shared_dir"
 
     if cmd_exists python3; then
         python3 << PYEOF
@@ -801,6 +806,8 @@ import json, os
 config_path = os.path.expanduser("~/.openclaw/openclaw.json")
 with open(config_path, "r") as f:
     config = json.loads(f.read())
+
+shared_dir = "${shared_dir}"
 
 agents_list = config.get("agents", {}).get("list", [])
 for agent in agents_list:
@@ -812,8 +819,9 @@ for agent in agents_list:
             "docker": {
                 "network": "bridge",
                 "readOnlyRoot": False,
-                "user": "0:0",
-                "setupCommand": "apt-get update && apt-get install -y git curl wget && rm -rf /var/lib/apt/lists/*"
+                "binds": [
+                    f"{shared_dir}:/shared:rw"
+                ]
             }
         }
         break
@@ -821,7 +829,7 @@ for agent in agents_list:
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 PYEOF
-        success "沙箱配置已写入"
+        success "沙箱配置已写入（共享目录: ${shared_dir} -> /shared）"
     else
         warn "未找到 python3，请手动配置沙箱"
     fi
@@ -977,19 +985,25 @@ configure_gateway_integration() {
         # 显示当前 Gateway 需要的 OpenClaw 连接信息
         echo ""
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
-        echo -e "  ${BOLD}OPENCLAW_URL${NC}=ws://localhost:${gw_port}"
+        echo -e "  ${BOLD}OPENCLAW_URL${NC}=http://localhost:${gw_port}"
         echo -e "  ${BOLD}OPENCLAW_TOKEN${NC}=${gw_token}"
         echo ""
         echo "在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
         echo "不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。"
+        echo ""
+        echo "共享文件目录（Gateway 下载的文件保存于此，同时挂载到 Docker 沙箱的 /shared）:"
+        echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
     else
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
-        echo -e "  ${BOLD}OpenClaw URL${NC}: ws://localhost:${gw_port}"
+        echo -e "  ${BOLD}OpenClaw URL${NC}: http://localhost:${gw_port}"
         echo -e "  ${BOLD}OpenClaw Token${NC}: ${gw_token}"
         echo ""
         echo "添加 Gateway Agent 绑定时使用:"
         echo -e "  ${DIM}sudo /opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
         echo "  在交互式提示中填入以上 URL 和 Token，以及对应的 openclaw_agent_id。"
+        echo ""
+        echo "共享文件目录（Gateway 下载的文件保存于此，同时挂载到 Docker 沙箱的 /shared）:"
+        echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
     fi
 
     echo ""
