@@ -157,13 +157,29 @@ select_option() {
         echo -e "  ${BOLD}$((i+1))${NC}) ${options[$i]}"
     done
     echo -en "\n请选择 [1-${#options[@]}]: "
-    read -r choice
+
+    # 确保从终端读取
+    if [[ -t 0 ]]; then
+        read -r choice
+    else
+        read -r choice </dev/tty 2>/dev/null || {
+            error "无法读取用户输入（非交互式环境）"
+            echo "0"
+            return 1
+        }
+    fi
 
     # 验证输入
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
+    if [[ -z "$choice" ]]; then
+        warn "输入为空，请重新输入"
+        echo "0"
+        return 1
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
         echo "$((choice-1))"
     else
+        warn "无效输入: $choice"
         echo "0"
+        return 1
     fi
 }
 
@@ -219,8 +235,14 @@ check_and_install_openclaw() {
 
         if confirm "是否更新到最新版?" "n"; then
             step "更新 OpenClaw..."
-            sudo npm install -g openclaw@latest
-            success "已更新到 $(openclaw --version)"
+            # 尝试不用 sudo，如果失败再用 sudo
+            if npm install -g openclaw@latest 2>/dev/null; then
+                success "已更新到 $(openclaw --version)"
+            elif sudo -n npm install -g openclaw@latest 2>/dev/null; then
+                success "已更新到 $(openclaw --version)"
+            else
+                warn "更新失败，请手动运行: sudo npm install -g openclaw@latest"
+            fi
         fi
     else
         step "安装 OpenClaw..."
@@ -229,9 +251,28 @@ check_and_install_openclaw() {
             "npm install -g openclaw@latest (推荐)" \
             "curl -fsSL https://openclaw.ai/install.sh | bash")
 
+        local select_status=$?
+
+        # 如果 select_option 失败，使用默认方法（curl）
+        if [[ $select_status -ne 0 ]]; then
+            warn "非交互式环境，使用默认安装方式（curl）"
+            install_method=1
+        fi
+
         case "$install_method" in
             0)
-                sudo npm install -g openclaw@latest
+                # 尝试不用 sudo，如果失败再提示
+                if npm install -g openclaw@latest 2>/dev/null; then
+                    success "OpenClaw 安装成功（用户级）"
+                else
+                    warn "用户级安装失败，需要 sudo 权限"
+                    if sudo -n true 2>/dev/null; then
+                        sudo npm install -g openclaw@latest
+                    else
+                        error "需要 sudo 权限但无法获取。请手动运行: sudo npm install -g openclaw@latest"
+                        exit 1
+                    fi
+                fi
                 ;;
             1)
                 curl -fsSL https://openclaw.ai/install.sh | bash
@@ -240,6 +281,9 @@ check_and_install_openclaw() {
 
         if ! cmd_exists openclaw; then
             error "安装失败，请检查输出并重试"
+            error "你可以手动安装："
+            echo "  方式1: sudo npm install -g openclaw@latest"
+            echo "  方式2: curl -fsSL https://openclaw.ai/install.sh | bash"
             exit 1
         fi
         success "OpenClaw $(openclaw --version) 安装成功"
@@ -449,12 +493,22 @@ configure_models() {
             "第三方流量池 (如 GMN)" \
             "完成，继续下一步")
 
+        local select_status=$?
+
+        # 如果 select_option 失败（非交互式环境），直接退出循环
+        if [[ $select_status -ne 0 ]]; then
+            warn "检测到非交互式环境或输入错误，跳过模型配置"
+            break
+        fi
+
         case "$provider_type" in
             0)
                 # 官方提供商选择
                 local idx
                 idx=$(select_option "选择提供商:" "${PROVIDER_NAMES[@]}")
-                setup_official_provider "${PROVIDER_IDS[$idx]}"
+                if [[ $? -eq 0 ]]; then
+                    setup_official_provider "${PROVIDER_IDS[$idx]}"
+                fi
                 ;;
             1)
                 setup_custom_provider
