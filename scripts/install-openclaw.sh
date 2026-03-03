@@ -91,9 +91,9 @@ read_input() {
     local result
 
     if [[ -n "$default" ]]; then
-        echo -en "${prompt} ${DIM}[${default}]${NC}: "
+        printf "%s" "${prompt} [${default}]: "
     else
-        echo -en "${prompt}: "
+        printf "%s" "${prompt}: "
     fi
 
     # 确保从终端读取
@@ -110,7 +110,7 @@ read_input() {
 read_secret() {
     local prompt="$1"
     local result
-    echo -en "${prompt}: "
+    printf "%s" "${prompt}: "
 
     # 确保从终端读取
     if [[ -t 0 ]]; then
@@ -130,9 +130,9 @@ confirm() {
     local yn
 
     if [[ "$default" == "y" ]]; then
-        echo -en "${prompt} ${DIM}[Y/n]${NC}: "
+        printf "%s" "${prompt} [Y/n]: "
     else
-        echo -en "${prompt} ${DIM}[y/N]${NC}: "
+        printf "%s" "${prompt} [y/N]: "
     fi
 
     # 确保从终端读取
@@ -373,6 +373,7 @@ setup_official_provider() {
 setup_custom_provider() {
     header "配置第三方模型提供商"
 
+    echo ""
     local provider_id
     provider_id=$(read_input "提供商 ID (英文, 如 gmn)")
 
