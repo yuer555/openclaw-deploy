@@ -95,7 +95,14 @@ read_input() {
     else
         echo -en "${prompt}: "
     fi
-    read -r result
+
+    # 确保从终端读取
+    if [[ -t 0 ]]; then
+        read -r result
+    else
+        read -r result </dev/tty 2>/dev/null || read -r result
+    fi
+
     echo "${result:-$default}"
 }
 
@@ -104,7 +111,14 @@ read_secret() {
     local prompt="$1"
     local result
     echo -en "${prompt}: "
-    read -rs result
+
+    # 确保从终端读取
+    if [[ -t 0 ]]; then
+        read -rs result
+    else
+        read -rs result </dev/tty 2>/dev/null || read -rs result
+    fi
+
     echo ""
     echo "$result"
 }
@@ -120,7 +134,14 @@ confirm() {
     else
         echo -en "${prompt} ${DIM}[y/N]${NC}: "
     fi
-    read -r yn
+
+    # 确保从终端读取
+    if [[ -t 0 ]]; then
+        read -r yn
+    else
+        read -r yn </dev/tty 2>/dev/null || read -r yn
+    fi
+
     yn="${yn:-$default}"
     [[ "$yn" =~ ^[Yy] ]]
 }
