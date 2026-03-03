@@ -100,6 +100,17 @@ else
     echo "   .env 已存在，跳过"
 fi
 
+# 创建顶层 manage-agent.sh 快捷入口
+if [ -f "$INSTALL_DIR/scripts/manage-agent.sh" ]; then
+    cp "$INSTALL_DIR/scripts/manage-agent.sh" "$INSTALL_DIR/manage-agent.sh"
+    chmod +x "$INSTALL_DIR/manage-agent.sh"
+elif [ -f "$SCRIPT_DIR/scripts/manage-agent.sh" ]; then
+    cp "$SCRIPT_DIR/scripts/manage-agent.sh" "$INSTALL_DIR/manage-agent.sh"
+    chmod +x "$INSTALL_DIR/manage-agent.sh"
+else
+    echo "   ⚠️  manage-agent.sh 未找到，跳过快捷入口创建"
+fi
+
 echo "   ✅ 代码文件复制完成"
 
 # 步骤 6: 创建 venv 并安装 Python 依赖
@@ -156,7 +167,7 @@ if systemctl is-active --quiet openclaw-gateway.service; then
     echo "下一步操作:"
     echo "  1. 编辑配置: sudo nano $INSTALL_DIR/.env"
     echo "  2. 重启服务: sudo systemctl restart openclaw-gateway"
-    echo "  3. 添加 Agent: cd $INSTALL_DIR && sudo -u $USER $VENV_DIR/bin/python scripts/manage-agent.py add <name>"
+    echo "  3. 添加 Agent: sudo $INSTALL_DIR/manage-agent.sh add <name>"
     echo "  4. 查看日志: sudo journalctl -u openclaw-gateway -f"
     echo "  5. 查看状态: sudo systemctl status openclaw-gateway"
     echo ""

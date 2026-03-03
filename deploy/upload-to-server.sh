@@ -115,6 +115,7 @@ echo "    ├── wecom_gateway.py"
 echo "    └── requirements.txt"
 echo "  scripts/                      — 管理工具"
 echo "    ├── manage-agent.py"
+echo "    ├── manage-agent.sh"
 echo "    └── install-openclaw.sh"
 echo "  deploy/                       — 部署脚本 + systemd 服务"
 echo "    ├── install.sh"
@@ -162,6 +163,7 @@ cp "${PROJECT_ROOT}/src/gateway/requirements.txt" "${STAGING}/src/gateway/"
 print_info "复制管理脚本..."
 mkdir -p "${STAGING}/scripts"
 cp "${PROJECT_ROOT}/scripts/manage-agent.py" "${STAGING}/scripts/"
+cp "${PROJECT_ROOT}/scripts/manage-agent.sh" "${STAGING}/scripts/" 2>/dev/null || true
 cp "${PROJECT_ROOT}/scripts/install-openclaw.sh" "${STAGING}/scripts/" 2>/dev/null || true
 
 # 复制部署脚本
@@ -287,7 +289,7 @@ echo -e "${YELLOW}4. 安装配置 OpenClaw（如未安装）：${NC}"
 echo -e "   ${BLUE}cd ${REMOTE_DIR} && bash scripts/install-openclaw.sh${NC}\n"
 
 echo -e "${YELLOW}5. 添加 Agent 绑定：${NC}"
-echo -e "   ${BLUE}cd ${REMOTE_DIR} && python3 scripts/manage-agent.py add <name>${NC}\n"
+echo -e "   ${BLUE}sudo /opt/openclaw/gateway/manage-agent.sh add <name>${NC}\n"
 
 echo -e "${YELLOW}6. 查看服务状态 / 日志：${NC}"
 echo -e "   ${BLUE}sudo systemctl status openclaw-gateway${NC}"

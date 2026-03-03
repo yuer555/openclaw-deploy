@@ -56,14 +56,6 @@ cd ~/openclaw-deploy
 bash scripts/install-openclaw.sh
 ```
 
-**脚本会自动完成五个步骤**：
-
-1. **检查环境 & 安装 OpenClaw**（需要 Node.js 22+）
-2. **配置模型提供商**（Anthropic/OpenAI/DeepSeek 等官方 API + GMN 等第三方流量池）
-3. **创建 Agent**（workspace、沙箱配置，用 `$EDITOR` 编辑人格设定文件）
-4. **输出 Gateway 集成信息**（URL/Token，用于后续 manage-agent.py 配置）
-5. **最终检查**（列出 Agent/模型，健康检查）
-
 **快捷模式**（已安装 OpenClaw 的情况下）：
 
 ```bash
@@ -77,7 +69,320 @@ bash scripts/install-openclaw.sh --add-agent
 bash scripts/install-openclaw.sh --add-provider
 ```
 
-**安装完成后**，脚本会输出 OpenClaw 地址和 Token，记下这两个值用于后续配置 Gateway Agent。
+---
+
+### 2.1.1 第一步：检查环境 & 安装 OpenClaw
+
+脚本会自动检测 Node.js (22+)、npm、Docker，然后进入安装流程。
+
+#### 场景 A：OpenClaw 未安装
+
+```
+选择安装方式:
+  1) npm install -g openclaw@latest (推荐)
+  2) curl -fsSL https://openclaw.ai/install.sh | bash
+
+请输入选项 [1-2, 默认 2]: _
+```
+
+| 选项 | 说明 |
+|------|------|
+| **1** | 通过 npm 全局安装，需要 Node.js 22+。如果无全局写权限会自动提示 sudo |
+| **2** | 官方安装脚本，自动处理依赖和 PATH 配置（**推荐新手使用**） |
+
+安装完成后会自动运行 `openclaw onboard --install-daemon` 进入 **OpenClaw 初始化向导**（见 [2.1.6](#216-openclaw-onboard-初始化向导)）。
+
+#### 场景 B：OpenClaw 已安装
+
+```
+✓ OpenClaw 已安装 (v2026.3.1)
+
+是否清理当前安装并重新配置? [y/N]: _
+```
+
+| 选项 | 说明 |
+|------|------|
+| **N（默认）** | 保留现有配置，直接进入下一步 |
+| **y** | 删除 `~/.openclaw` 目录并重新运行初始化向导。**会清除所有 Agent、模型配置、workspace** |
+
+---
+
+### 2.1.2 第二步：配置模型提供商
+
+```
+→ 当前已配置的模型:
+  gmn/gpt-5.3-codex  (默认)
+  ...
+
+是否需要添加或修改模型提供商? (直接回车默认 No) [y/N]: _
+```
+
+输入 `y` 后进入配置循环：
+
+```
+请选择提供商类型:
+  1) 官方 API 提供商 (Anthropic, OpenAI, DeepSeek 等)
+  2) 第三方流量池 (如 GMN)
+  3) 完成，继续下一步
+
+请输入选项 [1-3]: _
+```
+
+#### 选项 1：官方 API 提供商
+
+显示内置提供商列表：
+
+```
+官方提供商列表:
+  1) Anthropic (Claude) (anthropic)
+  2) OpenAI (GPT) (openai)
+  3) DeepSeek (deepseek)
+  4) Groq (groq)
+  5) Together AI (together)
+  6) Fireworks AI (fireworks)
+  7) OpenRouter (openrouter)
+  8) xAI (Grok) (xai)
+  9) MiniMax (minimax)
+  10) Moonshot AI (moonshot)
+
+请输入选项 [1-10]: _
+```
+
+选择后输入该提供商的 API Key：
+
+```
+请输入 Anthropic (Claude) API Key (输入时会显示): sk-ant-xxxxx
+```
+
+通过 `openclaw models auth set` 命令自动配置认证。
+
+#### 选项 2：第三方流量池（自定义提供商）
+
+依次填写以下信息：
+
+```
+提供商 ID (英文, 如 gmn): gmn
+API Base URL (如 https://gmn.chuangzuoli.com/v1): https://gmn.chuangzuoli.com/v1
+API Key (输入时会显示): sk-xxxxx
+
+API 协议格式:
+  1) OpenAI 兼容 (openai-responses) — GPT、DeepSeek、国产大模型等
+  2) Anthropic 兼容 (anthropic-messages) — Claude 系列
+  3) 其他 (跳过自动配置，需手动编辑 openclaw.json)
+
+请选择 [1-3, 默认 1]: _
+```
+
+| 选项 | 说明 | 自动配置 |
+|------|------|---------|
+| **1（默认）** | OpenAI 兼容协议，适用于 GPT、DeepSeek、通义千问、GLM 等 | `auth: api-key`, `authHeader: true`, 标准 headers |
+| **2** | Anthropic 原生协议，适用于 Claude 系列模型 | `auth: api-key`，openclaw 自动处理 `x-api-key` 头 |
+| **3** | 非标准协议，脚本只写入 baseUrl 和 apiKey | 需手动编辑 `~/.openclaw/openclaw.json` 补充 |
+
+选择协议后，循环添加模型：
+
+```
+模型 ID (留空结束添加): gpt-5.3-codex
+模型显示名称 (直接回车使用模型ID: gpt-5.3-codex): GPT-5.3 Codex
+上下文窗口大小 (直接回车默认 200000 tokens): 400000
+最大输出 Token (直接回车默认 128000 tokens): 128000
+是否支持推理 (reasoning)? (直接回车默认 Yes) [Y/n]: Y
+
+✓ 已添加模型: gmn/gpt-5.3-codex
+
+模型 ID (留空结束添加): _    ← 直接回车结束
+```
+
+- 如果只添加了 1 个模型，自动设为默认模型
+- 如果添加了多个模型，会询问是否修改默认模型
+
+---
+
+### 2.1.3 第三步：创建和配置 Agent
+
+```
+→ 当前已配置的 Agent:
+  - main
+  ...
+
+是否编辑主 Agent (main) 的人格设定? (直接回车默认 Yes) [Y/n]: _
+```
+
+#### 编辑人格设定
+
+选择 `Y` 后会用 `$EDITOR`（默认 nano）依次打开 5 个文件：
+
+| 文件 | 说明 | 编辑建议 |
+|------|------|---------|
+| `IDENTITY.md` | 身份定义 — 名字、物种、性格、Emoji | 给 Agent 一个名字和人设 |
+| `SOUL.md` | 灵魂设定 — 核心人格、行为准则 | 定义工作风格和角色定位 |
+| `USER.md` | 用户信息 — 关于你的基本信息 | 告诉 Agent 你是谁、你的偏好 |
+| `TOOLS.md` | 工具配置 — 环境相关信息 | 描述服务器环境、可用工具 |
+| `AGENTS.md` | 工作空间规则 — 流程和安全规则 | 设置 Session 流程、记忆管理 |
+
+每个文件编辑前会提示：
+
+```
+编辑 IDENTITY.md — 身份定义 — 名字、物种、性格、Emoji
+文件路径: /home/ubuntu/.openclaw/workspace/IDENTITY.md
+
+是否打开编辑器编辑此文件? [Y/n]: _
+```
+
+不想编辑的文件直接输入 `n` 跳过。
+
+#### 创建额外 Agent
+
+```
+是否创建新的 Agent? (直接回车默认 Yes) [Y/n]: y
+
+Agent ID (英文标识, 如 development, testing, service): development
+显示名称 (直接回车使用 Agent ID: development): 开发助手
+是否启用 Docker 沙箱? (直接回车默认 Yes) [Y/n]: _
+```
+
+| 选项 | 说明 |
+|------|------|
+| **Agent ID** | 英文标识符，用于 API 调用和配置引用 |
+| **显示名称** | 日志和统计中展示的名称，可以是中文 |
+| **Docker 沙箱** | 启用后 Agent 在 Docker 容器内执行代码。需要服务器已安装 Docker |
+
+启用沙箱后自动写入以下配置：
+
+```json
+{
+  "sandbox": {
+    "mode": "all",
+    "scope": "agent",
+    "workspaceAccess": "rw",
+    "docker": {
+      "network": "bridge",
+      "readOnlyRoot": false,
+      "user": "0:0",
+      "setupCommand": "apt-get update && apt-get install -y git curl wget && rm -rf /var/lib/apt/lists/*"
+    }
+  }
+}
+```
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| `network` | `bridge` | 容器需要联网（apt 下载、API 调用等） |
+| `readOnlyRoot` | `false` | 容器根文件系统可写（apt 需要写入） |
+| `user` | `0:0` | 以 root 运行（apt-get 需要） |
+| `setupCommand` | `apt-get update...` | 首次启动时预装 git/curl/wget |
+
+创建完成后同样会询问是否编辑人格设定。子 Agent 的模型配置（`auth-profiles.json`、`models.json`）会自动从主 Agent 同步。
+
+---
+
+### 2.1.4 第四步：Gateway 集成信息
+
+脚本自动读取 OpenClaw 配置并输出连接信息：
+
+```
+企业微信 Gateway 连接 OpenClaw 所需信息:
+  OPENCLAW_URL=ws://localhost:18789
+  OPENCLAW_TOKEN=1e443bcba0ed1327...
+
+在 manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。
+不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。
+```
+
+**记下这两个值**，后面添加企微 Agent 绑定时需要。
+
+---
+
+### 2.1.5 第五步：最终检查
+
+脚本自动执行：
+- 列出所有已配置的 Agent
+- 列出所有已配置的模型
+- OpenClaw Gateway 健康检查
+
+```
+╔══════════════════════════════════════╗
+║    OpenClaw 配置完成!                ║
+╚══════════════════════════════════════╝
+
+后续操作:
+  1. 启动 OpenClaw:       openclaw gateway start
+  2. 部署企微 Gateway:    sudo bash deploy/install.sh
+  3. 添加企微 Agent 绑定: sudo /opt/openclaw/gateway/manage-agent.sh add <name>
+  4. 查看 Agent 列表:     sudo /opt/openclaw/gateway/manage-agent.sh list
+  5. 查看 OpenClaw 面板:  openclaw dashboard
+```
+
+---
+
+### 2.1.6 OpenClaw onboard 初始化向导
+
+首次安装 OpenClaw 或选择"清理重新配置"时，会自动运行 `openclaw onboard --install-daemon`。这是 OpenClaw 官方的交互式初始化向导，主要完成以下配置：
+
+#### 步骤 1：选择运行模式
+
+```
+How would you like to run OpenClaw?
+
+  1) Local mode   — runs on this machine only (default)
+  2) Network mode — accessible from other machines
+
+Select [1-2]: _
+```
+
+| 选项 | 说明 |
+|------|------|
+| **1 Local（默认）** | Gateway 仅监听 `127.0.0.1:18789`，只有本机能访问 |
+| **2 Network** | Gateway 监听 `0.0.0.0:18789`，其他机器可通过 IP 访问。**如果企微 Gateway 和 OpenClaw 不在同一台机器上，选这个** |
+
+#### 步骤 2：配置认证
+
+```
+Gateway authentication:
+
+  1) Token auth  — use a shared secret token (recommended)
+  2) No auth     — no authentication required
+
+Select [1-2]: _
+```
+
+| 选项 | 说明 |
+|------|------|
+| **1 Token（推荐）** | 自动生成一个随机 Token，所有 API 请求需携带此 Token。**生产环境必选** |
+| **2 No auth** | 无认证，仅适合本地开发测试 |
+
+选择 Token auth 后会自动生成 Token 并显示，**务必记录下来**。
+
+#### 步骤 3：配置模型
+
+```
+Set up your first AI model provider:
+
+  1) Anthropic (Claude)
+  2) OpenAI (ChatGPT)
+  3) Skip for now
+
+Select [1-3]: _
+```
+
+选择提供商后输入 API Key。也可以选 3 跳过，后续通过 `install-openclaw.sh --add-provider` 添加。
+
+#### 步骤 4：安装 Daemon
+
+向导自动注册系统服务（Linux 下为 systemd，macOS 下为 launchd），使 OpenClaw Gateway 开机自启。
+
+#### 完成
+
+```
+OpenClaw is ready!
+
+  Gateway: http://127.0.0.1:18789
+  Token:   1e443bcba0ed1327699b31cdee8f6150e97226386c375f75
+
+  Run `openclaw health` to verify.
+```
+
+**重要**：记下 Gateway 地址和 Token，后续配置企微 Gateway 时需要。
 
 ---
 

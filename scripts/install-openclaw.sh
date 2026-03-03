@@ -254,16 +254,17 @@ check_and_install_openclaw() {
         current_version=$(openclaw --version 2>/dev/null || echo "unknown")
         success "OpenClaw 已安装 (v${current_version})"
 
-        if confirm "是否更新到最新版?" "n"; then
-            step "更新 OpenClaw..."
-            # 尝试不用 sudo，如果失败再用 sudo
-            if npm install -g openclaw@latest 2>/dev/null; then
-                success "已更新到 $(openclaw --version)"
-            elif sudo -n npm install -g openclaw@latest 2>/dev/null; then
-                success "已更新到 $(openclaw --version)"
-            else
-                warn "更新失败，请手动运行: sudo npm install -g openclaw@latest"
-            fi
+        echo ""
+        printf "%s" "是否清理当前安装并重新配置? [y/N]: "
+        read -r reinstall_yn </dev/tty
+        if [[ "$reinstall_yn" =~ ^[Yy] ]]; then
+            step "清理当前 OpenClaw 安装..."
+            openclaw gateway stop 2>/dev/null || true
+            rm -rf "$OPENCLAW_HOME"
+            success "清理完成，启动 OpenClaw 初始化向导..."
+            echo ""
+            openclaw onboard --install-daemon
+            success "OpenClaw 初始化完成"
         fi
     else
         step "安装 OpenClaw..."
@@ -320,6 +321,21 @@ check_and_install_openclaw() {
         success "OpenClaw 初始化完成"
     else
         success "OpenClaw 配置已存在: ${OPENCLAW_CONFIG}"
+    fi
+
+    # --- 确保 gateway 已启动 ---
+    step "检查 Gateway 状态..."
+    if openclaw health &>/dev/null; then
+        success "Gateway 已在运行"
+    else
+        step "启动 Gateway..."
+        openclaw gateway start &>/dev/null &
+        sleep 3
+        if openclaw health &>/dev/null; then
+            success "Gateway 启动成功"
+        else
+            warn "Gateway 启动失败，Agent 创建可能受影响，请稍后手动运行: openclaw gateway start"
+        fi
     fi
 }
 
@@ -389,13 +405,57 @@ setup_custom_provider() {
     printf "%s" "API Key (输入时会显示): "
     read -r api_key </dev/tty
 
-    printf "%s" "API 格式 [openai-responses]: "
-    read -r api_format </dev/tty
-    api_format="${api_format:-openai-responses}"
+    echo ""
+    echo "API 协议格式:"
+    echo "  1) OpenAI 兼容 (openai-responses) — GPT、DeepSeek、国产大模型等"
+    echo "  2) Anthropic 兼容 (anthropic-messages) — Claude 系列"
+    echo "  3) 其他 (跳过自动配置，需手动编辑 openclaw.json)"
+    echo ""
+    printf "%s" "请选择 [1-3, 默认 1]: "
+    read -r api_choice </dev/tty
+    api_choice="${api_choice:-1}"
+
+    local api_format=""
+    local auto_configure=true
+    case "$api_choice" in
+        1) api_format="openai-responses" ;;
+        2) api_format="anthropic-messages" ;;
+        3) auto_configure=false ;;
+        *) api_format="openai-responses" ;;
+    esac
 
     if [[ -z "$base_url" || -z "$api_key" ]]; then
         warn "信息不完整，跳过"
         return 1
+    fi
+
+    if [[ "$auto_configure" == "false" ]]; then
+        # 其他格式：只写入基础字段，提示用户手动配置
+        step "写入基础提供商配置..."
+        if cmd_exists python3; then
+            python3 << PYEOF
+import json, os
+
+config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+with open(config_path, "r") as f:
+    config = json.load(f)
+
+providers = config.setdefault("models", {}).setdefault("providers", {})
+provider = providers.setdefault("${provider_id}", {})
+provider["baseUrl"] = "${base_url}"
+provider["apiKey"] = "${api_key}"
+provider.setdefault("models", [])
+
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+PYEOF
+            success "基础配置已写入"
+            warn "请手动编辑 ${OPENCLAW_CONFIG} 补充 api、auth、headers 等字段"
+        else
+            error "未找到 python3，无法写入配置"
+            return 1
+        fi
+        return 0
     fi
 
     # 写入配置（使用 Python 直接修改 JSON）
@@ -412,11 +472,25 @@ with open(config_path, "r") as f:
 providers = config.setdefault("models", {}).setdefault("providers", {})
 provider = providers.setdefault("${provider_id}", {})
 
+api_format = "${api_format}"
+
 # 写入提供商配置
 provider["baseUrl"] = "${base_url}"
 provider["apiKey"] = "${api_key}"
 provider["auth"] = "api-key"
-provider["api"] = "${api_format}"
+provider["api"] = api_format
+
+if api_format == "openai-responses":
+    # OpenAI 兼容：需要 authHeader + 标准 headers
+    provider["authHeader"] = True
+    provider["headers"] = {
+        "User-Agent": "Mozilla/5.0 OpenClaw",
+        "Accept": "application/json"
+    }
+elif api_format == "anthropic-messages":
+    # Anthropic 兼容：openclaw 原生处理 x-api-key，无需额外配置
+    provider.pop("authHeader", None)
+    provider.pop("headers", None)
 
 # 确保 models 数组存在
 provider.setdefault("models", [])
@@ -434,24 +508,25 @@ PYEOF
     echo ""
     step "添加模型..."
     local last_model_id=""
+    local model_count=0
     while true; do
-        printf "%s" "模型 ID (如 gpt-5.3-codex, 留空结束): "
+        printf "%s" "模型 ID (留空结束添加): "
         read -r model_id </dev/tty
         [[ -z "$model_id" ]] && break
 
-        printf "%s" "模型显示名称 [${model_id}]: "
+        printf "%s" "模型显示名称 (直接回车使用模型ID: ${model_id}): "
         read -r model_name </dev/tty
         model_name="${model_name:-$model_id}"
 
-        printf "%s" "上下文窗口大小 [200000]: "
+        printf "%s" "上下文窗口大小 (直接回车默认 200000 tokens): "
         read -r context_window </dev/tty
         context_window="${context_window:-200000}"
 
-        printf "%s" "最大输出 Token [128000]: "
+        printf "%s" "最大输出 Token (直接回车默认 128000 tokens): "
         read -r max_tokens </dev/tty
         max_tokens="${max_tokens:-128000}"
 
-        printf "%s" "是否支持推理 (reasoning)? [Y/n]: "
+        printf "%s" "是否支持推理 (reasoning)? (直接回车默认 Yes) [Y/n]: "
         read -r reasoning_yn </dev/tty
         reasoning_yn="${reasoning_yn:-y}"
         if [[ "$reasoning_yn" =~ ^[Yy] ]]; then
@@ -460,29 +535,34 @@ PYEOF
             is_reasoning="false"
         fi
 
-        # 通过 python 生成 JSON 片段并追加到配置
-        # 这里用 openclaw config set 逐项写入
         step "添加模型: ${provider_id}/${model_id}"
 
-        # 模型需要以数组形式追加到 providers.<id>.models[]
-        # 由于 openclaw config set 不支持数组操作，直接编辑 JSON
         _append_model_to_config "$provider_id" "$model_id" "$model_name" \
             "$context_window" "$max_tokens" "$is_reasoning"
 
         success "已添加模型: ${provider_id}/${model_id}"
         last_model_id="$model_id"
+        model_count=$((model_count + 1))
         echo ""
     done
 
-    # 询问是否设为默认
+    # 第一个模型自动设为默认，后续模型询问
     if [[ -n "$last_model_id" ]]; then
-        printf "%s" "是否将此提供商的模型设为默认? [y/N]: "
-        read -r set_default </dev/tty
-        if [[ "$set_default" =~ ^[Yy] ]]; then
-            printf "%s" "默认模型 [${provider_id}/${last_model_id}]: "
-            read -r default_model </dev/tty
-            default_model="${default_model:-${provider_id}/${last_model_id}}"
-            if [[ -n "$default_model" ]]; then
+        if [[ $model_count -eq 1 ]]; then
+            # 只添加了一个模型，自动设为默认
+            local default_model="${provider_id}/${last_model_id}"
+            step "将 ${default_model} 设为默认模型..."
+            openclaw models set "$default_model" 2>/dev/null || \
+                config_set "agents.defaults.model.primary" "$default_model"
+            success "默认模型已设为: ${default_model}"
+        else
+            # 添加了多个模型，询问是否设为默认
+            printf "%s" "是否修改默认模型? (直接回车保持当前默认) [y/N]: "
+            read -r set_default </dev/tty
+            if [[ "$set_default" =~ ^[Yy] ]]; then
+                printf "%s" "默认模型 (直接回车使用 ${provider_id}/${last_model_id}): "
+                read -r default_model </dev/tty
+                default_model="${default_model:-${provider_id}/${last_model_id}}"
                 openclaw models set "$default_model" 2>/dev/null || \
                     config_set "agents.defaults.model.primary" "$default_model"
                 success "默认模型已设为: ${default_model}"
@@ -564,7 +644,7 @@ configure_models() {
     echo ""
 
     # 简化为 y/n 确认方式
-    if ! confirm "是否需要添加或修改模型提供商?" "n"; then
+    if ! confirm "是否需要添加或修改模型提供商? (直接回车默认 No)" "n"; then
         success "跳过模型配置"
         return 0
     fi
@@ -688,6 +768,20 @@ PYEOF
         openclaw agents set-identity --agent "$agent_id" --name "$agent_name" 2>/dev/null || true
     fi
 
+    # 同步主 Agent 的模型配置（auth-profiles.json, models.json）
+    if [[ "$agent_id" != "main" ]]; then
+        local main_agent_dir="${OPENCLAW_HOME}/agents/main/agent"
+        mkdir -p "$agent_dir"
+        if [[ -f "${main_agent_dir}/auth-profiles.json" ]]; then
+            cp "${main_agent_dir}/auth-profiles.json" "${agent_dir}/auth-profiles.json"
+            step "已同步主 Agent 的认证配置到 ${agent_id}"
+        fi
+        if [[ -f "${main_agent_dir}/models.json" ]]; then
+            cp "${main_agent_dir}/models.json" "${agent_dir}/models.json"
+            step "已同步主 Agent 的模型配置到 ${agent_id}"
+        fi
+    fi
+
     success "Agent '${agent_id}' 创建成功"
     echo -e "  ${DIM}Workspace: ${workspace}${NC}"
     echo -e "  ${DIM}Agent Dir: ${agent_dir}${NC}"
@@ -714,8 +808,12 @@ for agent in agents_list:
         agent["sandbox"] = {
             "mode": "all",
             "scope": "agent",
+            "workspaceAccess": "rw",
             "docker": {
-                "setupCommand": "apt-get update && apt-get install -y git curl wget"
+                "network": "bridge",
+                "readOnlyRoot": False,
+                "user": "0:0",
+                "setupCommand": "apt-get update && apt-get install -y git curl wget && rm -rf /var/lib/apt/lists/*"
             }
         }
         break
@@ -793,7 +891,7 @@ configure_agents() {
     echo ""
 
     # 配置 main agent 人格
-    printf "%s" "是否编辑主 Agent (main) 的人格设定? [Y/n]: "
+    printf "%s" "是否编辑主 Agent (main) 的人格设定? (直接回车默认 Yes) [Y/n]: "
     read -r edit_main_yn </dev/tty
     edit_main_yn="${edit_main_yn:-y}"
     if [[ "$edit_main_yn" =~ ^[Yy] ]]; then
@@ -803,7 +901,7 @@ configure_agents() {
     # 创建额外 Agent
     echo ""
     while true; do
-        printf "%s" "是否创建新的 Agent? [Y/n]: "
+        printf "%s" "是否创建新的 Agent? (直接回车默认 Yes) [Y/n]: "
         read -r create_agent_yn </dev/tty
         create_agent_yn="${create_agent_yn:-y}"
         if [[ ! "$create_agent_yn" =~ ^[Yy] ]]; then
@@ -811,18 +909,18 @@ configure_agents() {
         fi
 
         echo ""
-        printf "%s" "Agent ID (英文, 如 development, testing, service): "
+        printf "%s" "Agent ID (英文标识, 如 development, testing, service): "
         read -r agent_id </dev/tty
         if [[ -z "$agent_id" ]]; then
             warn "未输入 Agent ID，跳过"
             continue
         fi
 
-        printf "%s" "显示名称 (中文, 如 开发工程师) [${agent_id}]: "
+        printf "%s" "显示名称 (直接回车使用 Agent ID: ${agent_id}): "
         read -r agent_name </dev/tty
         agent_name="${agent_name:-$agent_id}"
 
-        printf "%s" "是否启用 Docker 沙箱? [Y/n]: "
+        printf "%s" "是否启用 Docker 沙箱? (直接回车默认 Yes) [Y/n]: "
         read -r sandbox_yn </dev/tty
         sandbox_yn="${sandbox_yn:-y}"
         if [[ "$sandbox_yn" =~ ^[Yy] ]]; then
@@ -835,7 +933,7 @@ configure_agents() {
         create_agent "$agent_id" "$agent_name" "$use_sandbox"
 
         # 编辑人格设定
-        printf "%s" "是否立即编辑此 Agent 的人格设定? [Y/n]: "
+        printf "%s" "是否立即编辑此 Agent 的人格设定? (直接回车默认 Yes) [Y/n]: "
         read -r edit_yn </dev/tty
         edit_yn="${edit_yn:-y}"
         if [[ "$edit_yn" =~ ^[Yy] ]]; then
@@ -882,7 +980,7 @@ configure_gateway_integration() {
         echo -e "  ${BOLD}OPENCLAW_URL${NC}=ws://localhost:${gw_port}"
         echo -e "  ${BOLD}OPENCLAW_TOKEN${NC}=${gw_token}"
         echo ""
-        echo "在 manage-agent.py add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
+        echo "在 manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
         echo "不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。"
     else
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
@@ -890,7 +988,7 @@ configure_gateway_integration() {
         echo -e "  ${BOLD}OpenClaw Token${NC}: ${gw_token}"
         echo ""
         echo "添加 Gateway Agent 绑定时使用:"
-        echo -e "  ${DIM}python3 scripts/manage-agent.py add <name>${NC}"
+        echo -e "  ${DIM}sudo /opt/openclaw/gateway/manage-agent.sh add <name>${NC}"
         echo "  在交互式提示中填入以上 URL 和 Token，以及对应的 openclaw_agent_id。"
     fi
 
@@ -930,10 +1028,10 @@ final_check() {
     echo ""
     echo "后续操作:"
     echo -e "  ${CYAN}1.${NC} 启动 OpenClaw:       ${DIM}openclaw gateway start${NC}"
-    echo -e "  ${CYAN}2.${NC} 添加企微 Agent 绑定: ${DIM}python3 scripts/manage-agent.py add <name>${NC}"
-    echo -e "  ${CYAN}3.${NC} 启动企微 Gateway:    ${DIM}python3 src/gateway/wecom_gateway.py${NC}"
-    echo -e "  ${CYAN}4.${NC} 查看 Agent 列表:     ${DIM}openclaw agents list --bindings${NC}"
-    echo -e "  ${CYAN}5.${NC} 查看控制面板:        ${DIM}openclaw dashboard${NC}"
+    echo -e "  ${CYAN}2.${NC} 部署企微 Gateway:    ${DIM}sudo bash deploy/install.sh${NC}"
+    echo -e "  ${CYAN}3.${NC} 添加企微 Agent 绑定: ${DIM}sudo /opt/openclaw/gateway/manage-agent.sh add <name>${NC}"
+    echo -e "  ${CYAN}4.${NC} 查看 Agent 列表:     ${DIM}sudo /opt/openclaw/gateway/manage-agent.sh list${NC}"
+    echo -e "  ${CYAN}5.${NC} 查看 OpenClaw 面板:  ${DIM}openclaw dashboard${NC}"
     echo ""
 }
 
