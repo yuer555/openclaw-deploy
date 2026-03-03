@@ -398,12 +398,37 @@ setup_custom_provider() {
         return 1
     fi
 
-    # 写入配置
+    # 写入配置（使用 Python 直接修改 JSON）
     step "写入提供商配置..."
-    config_set "models.providers.${provider_id}.baseUrl" "$base_url"
-    config_set "models.providers.${provider_id}.apiKey" "$api_key"
-    config_set "models.providers.${provider_id}.auth" "api-key"
-    config_set "models.providers.${provider_id}.api" "$api_format"
+    if cmd_exists python3; then
+        python3 << PYEOF
+import json, os
+
+config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+with open(config_path, "r") as f:
+    config = json.load(f)
+
+# 确保路径存在
+providers = config.setdefault("models", {}).setdefault("providers", {})
+provider = providers.setdefault("${provider_id}", {})
+
+# 写入提供商配置
+provider["baseUrl"] = "${base_url}"
+provider["apiKey"] = "${api_key}"
+provider["auth"] = "api-key"
+provider["api"] = "${api_format}"
+
+# 确保 models 数组存在
+provider.setdefault("models", [])
+
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+PYEOF
+        success "提供商配置已写入"
+    else
+        error "未找到 python3，无法写入配置"
+        return 1
+    fi
 
     # 配置模型
     echo ""
