@@ -412,6 +412,7 @@ setup_custom_provider() {
     # 配置模型
     echo ""
     step "添加模型..."
+    local last_model_id=""
     while true; do
         printf "%s" "模型 ID (如 gpt-5.3-codex, 留空结束): "
         read -r model_id </dev/tty
@@ -448,19 +449,23 @@ setup_custom_provider() {
             "$context_window" "$max_tokens" "$is_reasoning"
 
         success "已添加模型: ${provider_id}/${model_id}"
+        last_model_id="$model_id"
         echo ""
     done
 
     # 询问是否设为默认
-    printf "%s" "是否将此提供商的模型设为默认? [y/N]: "
-    read -r set_default </dev/tty
-    if [[ "$set_default" =~ ^[Yy] ]]; then
-        printf "%s" "默认模型 (如 ${provider_id}/${model_id}): "
-        read -r default_model </dev/tty
-        if [[ -n "$default_model" ]]; then
-            openclaw models set "$default_model" 2>/dev/null || \
-                config_set "agents.defaults.model.primary" "$default_model"
-            success "默认模型已设为: ${default_model}"
+    if [[ -n "$last_model_id" ]]; then
+        printf "%s" "是否将此提供商的模型设为默认? [y/N]: "
+        read -r set_default </dev/tty
+        if [[ "$set_default" =~ ^[Yy] ]]; then
+            printf "%s" "默认模型 [${provider_id}/${last_model_id}]: "
+            read -r default_model </dev/tty
+            default_model="${default_model:-${provider_id}/${last_model_id}}"
+            if [[ -n "$default_model" ]]; then
+                openclaw models set "$default_model" 2>/dev/null || \
+                    config_set "agents.defaults.model.primary" "$default_model"
+                success "默认模型已设为: ${default_model}"
+            fi
         fi
     fi
 
@@ -619,7 +624,14 @@ create_agent() {
             --workspace "$workspace" \
             --non-interactive 2>/dev/null || {
             warn "openclaw agents add 失败，尝试手动配置..."
+            # 手动创建 workspace 目录
+            mkdir -p "$workspace"
         }
+    fi
+
+    # 确保 workspace 存在
+    if [[ ! -d "$workspace" ]]; then
+        mkdir -p "$workspace"
     fi
 
     # 配置沙箱（非 main agent）
