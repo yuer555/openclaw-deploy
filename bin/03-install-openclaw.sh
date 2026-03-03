@@ -86,12 +86,45 @@ config_get() { openclaw config get "$1" 2>/dev/null || echo ""; }
 config_set() { openclaw config set "$1" "$2" 2>/dev/null || true; }
 
 
+_read_token_from_config_file() {
+    # 直接读配置文件中的 token 原文，避免 openclaw config get 对敏感值做掩码
+    local token_type="$1"  # auth | remote
+    if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
+        echo ""
+        return 0
+    fi
+
+    python3 - "$OPENCLAW_CONFIG" "$token_type" <<'PYEOF'
+import json
+import sys
+
+config_path = sys.argv[1]
+token_type = sys.argv[2]
+
+try:
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+except Exception:
+    print('')
+    sys.exit(0)
+
+gateway = config.get('gateway', {})
+if token_type == 'auth':
+    print(gateway.get('auth', {}).get('token', '') or '')
+elif token_type == 'remote':
+    print(gateway.get('remote', {}).get('token', '') or '')
+else:
+    print('')
+PYEOF
+}
+
+
 sync_gateway_tokens() {
     # 对齐 gateway.auth.token 与 gateway.remote.token，避免 token mismatch
     local auth_token remote_token desired_token
 
-    auth_token=$(config_get "gateway.auth.token")
-    remote_token=$(config_get "gateway.remote.token")
+    auth_token=$(_read_token_from_config_file "auth")
+    remote_token=$(_read_token_from_config_file "remote")
     desired_token="$auth_token"
 
     if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
@@ -1132,7 +1165,7 @@ configure_gateway_integration() {
     # 读取 Gateway 配置
     local gw_port gw_token
     gw_port=$(config_get "gateway.port" 2>/dev/null || echo "18789")
-    gw_token=$(config_get "gateway.auth.token" 2>/dev/null || echo "")
+    gw_token=$(_read_token_from_config_file "auth")
 
     echo "OpenClaw Gateway 配置:"
     echo -e "  端口: ${BOLD}${gw_port}${NC}"
