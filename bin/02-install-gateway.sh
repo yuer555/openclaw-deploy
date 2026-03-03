@@ -80,8 +80,12 @@ echo ""
 echo "📄 步骤 5/8: 复制代码文件..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cp -r "$SCRIPT_DIR/src" "$INSTALL_DIR/"
-cp -r "$SCRIPT_DIR/bin" "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
+
+# 仅安装 Gateway 运行必需的 bin 脚本，避免 /opt/openclaw/bin 与 /opt/openclaw/gateway/bin 双份脚本漂移
+rm -rf "$INSTALL_DIR/bin"
+mkdir -p "$INSTALL_DIR/bin"
+cp "$SCRIPT_DIR/bin/04-manage-agent.sh" "$INSTALL_DIR/bin/"
 
 # 创建 .env 文件（如果不存在）
 if [ ! -f "$INSTALL_DIR/.env" ]; then
