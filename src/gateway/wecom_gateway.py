@@ -14,6 +14,7 @@ from datetime import datetime
 import threading
 import queue
 import mimetypes
+import zipfile
 import websocket
 
 app = Flask(__name__)
@@ -500,8 +501,8 @@ DOWNLOAD_CHUNK_SIZE = 64 * 1024
 
 
 def _detect_file_type(local_path, content_type):
-    """当 Content-Type 为 octet-stream 时，通过文件头魔数和内容探测真实类型"""
-    if content_type != 'application/octet-stream':
+    """当 Content-Type 不可靠（octet-stream/zip）时，通过内容探测真实类型"""
+    if content_type not in {'application/octet-stream', 'application/zip'}:
         return content_type, mimetypes.guess_extension(content_type) or ''
 
     MAGIC_SIGNATURES = [
@@ -520,11 +521,17 @@ def _detect_file_type(local_path, content_type):
         for magic, ct, ext in MAGIC_SIGNATURES:
             if header.startswith(magic):
                 if magic == b'PK\x03\x04':
+                    ooxml = _detect_ooxml_type_from_zip(local_path)
+                    if ooxml is not None:
+                        return ooxml
+
                     name_lower = local_path.lower()
-                    if name_lower.endswith(('.docx', '.doc')):
+                    if name_lower.endswith('.docx'):
                         return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'
-                    if name_lower.endswith(('.xlsx', '.xls')):
+                    if name_lower.endswith('.xlsx'):
                         return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
+                    if name_lower.endswith('.pptx'):
+                        return 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
                 return ct, ext
     except Exception:
         pass
@@ -546,6 +553,36 @@ def _detect_file_type(local_path, content_type):
         pass
 
     return content_type, ''
+
+
+def _detect_ooxml_type_from_zip(local_path):
+    """从 zip 容器结构识别 OOXML 文件类型（docx/xlsx/pptx）"""
+    try:
+        if not zipfile.is_zipfile(local_path):
+            return None
+
+        with zipfile.ZipFile(local_path, 'r') as zf:
+            names = [name.lower() for name in zf.namelist()]
+
+            if any(name.startswith('word/') for name in names):
+                return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'
+            if any(name.startswith('xl/') for name in names):
+                return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
+            if any(name.startswith('ppt/') for name in names):
+                return 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
+
+            if '[content_types].xml' in names:
+                raw = zf.read('[content_types].xml').decode('utf-8', errors='ignore').lower()
+                if 'wordprocessingml' in raw:
+                    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'
+                if 'spreadsheetml' in raw:
+                    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
+                if 'presentationml' in raw:
+                    return 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
+    except Exception:
+        return None
+
+    return None
 
 
 def _decrypt_file(encrypted_data, encoding_aes_key):
