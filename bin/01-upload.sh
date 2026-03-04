@@ -130,6 +130,7 @@ echo "  AGENTS.md                     — AI 编码指南"
 echo ""
 
 print_warning "注意: .env、*.db、data/、logs/ 等敏感/运行时文件不会上传"
+print_warning "远端部署时将仅保留 .env 和 data/，其余文件会清理后再解压"
 echo ""
 read -p "确认上传？[Y/n] " CONFIRM
 CONFIRM=${CONFIRM:-Y}
@@ -232,12 +233,16 @@ if [ -n "\$DB_PATH" ] && [ -f "\$DB_PATH" ]; then
     echo "  已备份数据库: \$DB_PATH"
 fi
 
-# 清除旧代码文件（保留运行时数据和配置）
-rm -rf src bin scripts deploy docs README.md USER-GUIDE.md AGENTS.md PROJECT-SUMMARY.md PHASE2-PLAN.md 2>/dev/null || true
+# 全量清理旧文件（仅保留白名单：.env、data、当前上传包）
+find . -mindepth 1 -maxdepth 1 \
+    ! -name ".env" \
+    ! -name "data" \
+    ! -name "${PACKAGE_NAME}" \
+    -exec rm -rf {} +
 
 # 解压新文件
 tar -xzf ${PACKAGE_NAME}
-mv openclaw-gateway/* . 2>/dev/null || true
+cp -a openclaw-gateway/. .
 rmdir openclaw-gateway 2>/dev/null || true
 rm -f ${PACKAGE_NAME}
 

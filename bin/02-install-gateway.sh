@@ -143,9 +143,15 @@ sed -e "s/__RUN_USER__/$RUN_USER/g" -e "s/__RUN_GROUP__/$RUN_GROUP/g" \
     "$SCRIPT_DIR/scripts/openclaw-gateway.service" > /etc/systemd/system/openclaw-gateway.service
 systemctl daemon-reload
 systemctl enable openclaw-gateway.service
-systemctl start openclaw-gateway.service
+if systemctl is-active --quiet openclaw-gateway.service; then
+    systemctl restart openclaw-gateway.service
+    echo "   ✅ systemd 服务已重启（已加载最新代码）"
+else
+    systemctl start openclaw-gateway.service
+    echo "   ✅ systemd 服务已启动"
+fi
 
-echo "   ✅ systemd 服务已安装并启动"
+echo "   ✅ systemd 服务安装/更新完成"
 
 # 等待服务启动
 echo ""
