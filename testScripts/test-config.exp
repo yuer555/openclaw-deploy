@@ -1,0 +1,56 @@
+#!/usr/bin/expect -f
+# 测试配置流程（跳过安装）
+
+set timeout 60
+
+spawn bash scripts/install-openclaw.sh
+
+# 第一步：跳过更新
+expect "是否更新到最新版?" { send "n\r" }
+
+# 第二步：配置模型提供商
+expect "是否需要添加或修改模型提供商?" { send "y\r" }
+expect "请输入选项" { send "2\r" }
+
+# 配置第三方提供商
+expect "提供商 ID" { send "test-gmn\r" }
+expect "API Base URL" { send "https://test.example.com/v1\r" }
+expect "API Key:" { send "sk-test-key-12345\r" }
+expect "API 格式" { send "\r" }
+
+# 添加模型
+expect "模型 ID" { send "test-model\r" }
+expect "模型显示名称" { send "\r" }
+expect "上下文窗口大小" { send "\r" }
+expect "最大输出 Token" { send "\r" }
+expect "是否支持推理" { send "\r" }
+
+# 结束添加模型
+expect "模型 ID" { send "\r" }
+
+# 设置默认模型
+expect "是否将此提供商的模型设为默认?" { send "y\r" }
+expect "默认模型" { send "\r" }
+
+# 完成模型配置
+expect "请输入选项" { send "3\r" }
+
+# 第三步：创建和配置 Agent
+expect "是否编辑主 Agent" { send "n\r" }
+expect "是否创建新的 Agent?" { send "y\r" }
+
+# 创建 Agent
+expect "Agent ID" { send "test-agent\r" }
+expect "显示名称" { send "测试代理\r" }
+expect "是否启用 Docker 沙箱?" { send "n\r" }
+expect "是否立即编辑此 Agent 的人格设定?" { send "n\r" }
+
+# 不再创建更多 Agent
+expect "是否创建新的 Agent?" { send "n\r" }
+
+# 等待脚本完成
+expect {
+    "OpenClaw 配置完成" { puts "\n\n=== 测试成功 ===" }
+    timeout { puts "\n\n=== 测试超时 ===" }
+    eof { puts "\n\n=== 脚本结束 ===" }
+}
