@@ -27,7 +27,7 @@ GATEWAY_URL = os.getenv('GATEWAY_URL', 'http://localhost:8000')
 # 默认 OpenClaw 地址
 DEFAULT_OPENCLAW_URL = 'http://localhost:18789'
 
-# 默认共享目录基础路径（位于 agent workspace 内，容器内通过 /workspace/shared 访问）
+# 默认共享目录基础路径（位于 agent workspace 内，容器内通过 /app/shared 访问）
 # 如果以 sudo 运行，使用实际调用者的 home 目录（避免展开为 /root/.openclaw）
 _openclaw_home_env = os.getenv('OPENCLAW_HOME', '')
 if _openclaw_home_env:
@@ -40,7 +40,7 @@ else:
         OPENCLAW_HOME = os.path.expanduser('~/.openclaw')
 
 NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9\-]{1,28}[a-z0-9]$')
-CONTAINER_SHARED_PATH = '/workspace/shared'
+CONTAINER_SHARED_PATH = '/app/shared'
 
 
 def _agent_workspace(agent_id):
@@ -207,7 +207,7 @@ def cmd_add(name):
 
     openclaw_agent_id = input("openclaw Agent ID（回车跳过，默认 main）: ").strip()
 
-    # 共享目录：Gateway 下载的文件保存到此目录，容器内通过 /workspace/shared 访问
+    # 共享目录：Gateway 下载的文件保存到此目录，容器内通过 /app/shared 访问
     openclaw_agent = openclaw_agent_id or 'main'
     default_shared = _default_shared_dir(openclaw_agent)
     shared_dir = input(f"共享文件目录（回车使用默认 {default_shared}）: ").strip()

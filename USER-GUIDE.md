@@ -271,7 +271,7 @@ Agent ID (英文标识, 如 development, testing, service): development
       "network": "bridge",
       "readOnlyRoot": false,
       "binds": [
-        "<workspace>/shared:/workspace/shared:rw"
+        "<workspace>/shared:/app/shared:rw"
       ]
     }
   }
@@ -282,9 +282,9 @@ Agent ID (英文标识, 如 development, testing, service): development
 |------|-----|------|
 | `network` | `bridge` | 容器需要联网（API 调用等） |
 | `readOnlyRoot` | `false` | 容器根文件系统可写 |
-| `binds` | `<workspace>/shared:/workspace/shared:rw` | 显式挂载共享目录，容器内固定路径 `/workspace/shared` |
+| `binds` | `<workspace>/shared:/app/shared:rw` | 显式挂载共享目录，容器内固定路径 `/app/shared` |
 
-共享文件目录默认位于 `~/.openclaw/workspace-<agent_id>/shared`，容器内通过 `/workspace/shared` 访问。
+共享文件目录默认位于 `~/.openclaw/workspace-<agent_id>/shared`，容器内通过 `/app/shared` 访问。
 
 创建完成后同样会询问是否编辑人格设定。子 Agent 的模型配置（`auth-profiles.json`、`models.json`）会自动从主 Agent 同步。
 

@@ -483,8 +483,8 @@ def _get_today_dir_for_agent(shared_dir):
     os.makedirs(path, exist_ok=True)
     return path
 
-# 容器内共享目录路径（通过 workspace 挂载访问）
-CONTAINER_SHARED_MOUNT = '/workspace/shared'
+# 容器内共享目录路径（避免使用 /workspace 下的保留挂载前缀）
+CONTAINER_SHARED_MOUNT = '/app/shared'
 
 
 # ============= 多类型消息处理 =============
@@ -495,6 +495,8 @@ TEXT_EXTENSIONS = {'.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml', '.py
 TEXT_CONTENT_TYPES = {'text/', 'application/json', 'application/xml', 'application/yaml',
                       'application/x-yaml', 'application/toml', 'application/sql'}
 MAX_TEXT_EMBED_SIZE = 50 * 1024  # 50KB
+MAX_DOWNLOAD_FILE_SIZE = int(os.getenv('MAX_DOWNLOAD_FILE_SIZE', str(20 * 1024 * 1024)))  # 20MB
+DOWNLOAD_CHUNK_SIZE = 64 * 1024
 
 
 def _detect_file_type(local_path, content_type):
@@ -573,18 +575,30 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
         resp = requests.get(url, timeout=30, stream=True)
         resp.raise_for_status()
 
-        encrypted_data = resp.content
-
-        decrypted = _decrypt_file(encrypted_data, encoding_aes_key) if encoding_aes_key else None
-        if decrypted is None:
-            if encoding_aes_key:
-                logger.warning("文件解密失败，使用原始数据")
-            decrypted = encrypted_data
-
         tmp_filename = f"{prefix}-{uuid.uuid4().hex[:8]}.tmp"
         tmp_path = os.path.join(today_dir, tmp_filename)
+
+        total_size = 0
         with open(tmp_path, 'wb') as f:
-            f.write(decrypted)
+            for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                if not chunk:
+                    continue
+                total_size += len(chunk)
+                if total_size > MAX_DOWNLOAD_FILE_SIZE:
+                    raise Exception(f"文件过大，超过限制 {MAX_DOWNLOAD_FILE_SIZE} bytes")
+                f.write(chunk)
+
+        if encoding_aes_key:
+            with open(tmp_path, 'rb') as f:
+                encrypted_data = f.read()
+
+            decrypted = _decrypt_file(encrypted_data, encoding_aes_key)
+            if decrypted is None:
+                logger.warning("文件解密失败，使用原始数据")
+                decrypted = encrypted_data
+
+            with open(tmp_path, 'wb') as f:
+                f.write(decrypted)
 
         raw_content_type = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
         content_type, ext = _detect_file_type(tmp_path, raw_content_type)
@@ -625,9 +639,9 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
 
 
 def _to_container_path(host_path, shared_dir):
-    """将宿主机路径转换为容器内路径（/workspace/shared/...）
+    """将宿主机路径转换为容器内路径（/app/shared/...）
     
-    如果 shared_dir 已配置且 host_path 在该目录下，将前缀替换为 /workspace/shared。
+    如果 shared_dir 已配置且 host_path 在该目录下，将前缀替换为 /app/shared。
     否则返回原始宿主机路径（适用于 main agent 等无沙箱场景）。
     """
     if shared_dir:
@@ -644,7 +658,7 @@ def _to_container_path(host_path, shared_dir):
 def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir=''):
     """提取单条消息内容（主消息或 quote 内的消息），返回文本描述
     
-    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，路径转为容器内路径 /workspace/shared/...
+    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，路径转为容器内路径 /app/shared/...
     """
     msg_type = item.get('msgtype', '')
 

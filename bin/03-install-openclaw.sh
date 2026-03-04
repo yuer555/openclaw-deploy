@@ -94,8 +94,9 @@ _read_token_from_config_file() {
         return 0
     fi
 
-    python3 - "$OPENCLAW_CONFIG" "$token_type" <<'PYEOF'
+python3 - "$OPENCLAW_CONFIG" "$token_type" <<'PYEOF'
 import json
+import re
 import sys
 
 config_path = sys.argv[1]
@@ -103,7 +104,14 @@ token_type = sys.argv[2]
 
 try:
     with open(config_path, 'r') as f:
-        config = json.load(f)
+        content = f.read()
+    try:
+        config = json.loads(content)
+    except json.JSONDecodeError:
+        content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+        content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+        content = re.sub(r',\s*([}\]])', r'\1', content)
+        config = json.loads(content)
 except Exception:
     print('')
     sys.exit(0)
@@ -191,7 +199,10 @@ hard_check_gateway_token_health() {
     local status_output doctor_output
 
     # 先尝试自动修复 service token 漂移（不影响已健康场景）
-    repair_gateway_service_token_if_needed || true
+    if ! repair_gateway_service_token_if_needed; then
+        error "自动修复 service token 失败，请先处理后再重试"
+        return 1
+    fi
 
     step "Gateway RPC 探针校验..."
     status_output="$(openclaw gateway status 2>&1 || true)"
@@ -221,16 +232,17 @@ hard_check_gateway_token_health() {
 
 
 hard_check_sandbox_shared_contract() {
-    # 硬校验：沙箱 agent 的共享目录契约必须成立（<workspace>/shared -> /workspace/shared）
+    # 硬校验：沙箱 agent 的共享目录契约必须成立（<workspace>/shared -> /app/shared）
     if ! cmd_exists python3; then
         warn "未找到 python3，跳过共享目录契约校验"
         return 0
     fi
 
     local check_output
-    check_output="$(python3 <<'PYEOF'
+check_output="$(python3 <<'PYEOF'
 import json
 import os
+import re
 import sys
 
 config_path = os.path.expanduser('~/.openclaw/openclaw.json')
@@ -239,7 +251,15 @@ if not os.path.exists(config_path):
     sys.exit(1)
 
 with open(config_path, 'r') as f:
-    config = json.load(f)
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
 
 agents = config.get('agents', {}).get('list', [])
 errors = []
@@ -276,7 +296,7 @@ for agent in agents:
 
     docker_cfg = sandbox.get('docker', {})
     expected_src = os.path.realpath(shared)
-    expected_dst = '/workspace/shared'
+    expected_dst = '/app/shared'
     mount_ok = False
 
     for item in (docker_cfg.get('binds') or []):
@@ -302,7 +322,7 @@ for agent in agents:
                 break
 
     if not mount_ok:
-        errors.append(f"{agent_id}: 缺少共享目录挂载（需要 {shared} -> /workspace/shared）")
+        errors.append(f"{agent_id}: 缺少共享目录挂载（需要 {shared} -> /app/shared）")
 
 if errors:
     print('SANDBOX_SHARED_CONTRACT_FAILED')
@@ -329,7 +349,7 @@ PYEOF
     fi
 
     if [[ "$check_output" == *"SANDBOX_SHARED_CONTRACT_OK"* ]]; then
-        success "沙箱共享目录契约校验通过（容器内路径: /workspace/shared）"
+        success "沙箱共享目录契约校验通过（容器内路径: /app/shared）"
         if echo "$check_output" | grep -q "^- "; then
             echo "$check_output" | grep "^- "
         fi
@@ -340,7 +360,7 @@ PYEOF
             if [[ -n "$containers" ]]; then
                 while IFS= read -r c; do
                     [[ -z "$c" ]] && continue
-                    if ! docker exec -w /workspace "$c" sh -lc 'mkdir -p /workspace/shared && touch /workspace/shared/.probe && rm -f /workspace/shared/.probe' >/dev/null 2>&1; then
+                    if ! docker exec -w /workspace "$c" sh -lc 'mkdir -p /app/shared && touch /app/shared/.probe && rm -f /app/shared/.probe' >/dev/null 2>&1; then
                         warn "运行时共享目录探针失败: ${c}"
                         probe_failed=1
                     fi
@@ -725,11 +745,19 @@ setup_custom_provider() {
         step "写入基础提供商配置..."
         if cmd_exists python3; then
             python3 << PYEOF
-import json, os
+import json, os, re
 
 config_path = os.path.expanduser("~/.openclaw/openclaw.json")
 with open(config_path, "r") as f:
-    config = json.load(f)
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
 
 providers = config.setdefault("models", {}).setdefault("providers", {})
 provider = providers.setdefault("${provider_id}", {})
@@ -753,11 +781,19 @@ PYEOF
     step "写入提供商配置..."
     if cmd_exists python3; then
         python3 << PYEOF
-import json, os
+import json, os, re
 
 config_path = os.path.expanduser("~/.openclaw/openclaw.json")
 with open(config_path, "r") as f:
-    config = json.load(f)
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
 
 # 确保路径存在
 providers = config.setdefault("models", {}).setdefault("providers", {})
@@ -1022,11 +1058,19 @@ create_agent() {
                   "$workspace/USER.md" "$workspace/TOOLS.md" "$workspace/AGENTS.md"
             # 写入 agents.list
             python3 << PYEOF
-import json, os
+import json, os, re
 
 config_path = os.path.expanduser("~/.openclaw/openclaw.json")
 with open(config_path, "r") as f:
-    config = json.load(f)
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
 
 agents = config.setdefault("agents", {}).setdefault("list", [])
 existing_ids = [a.get("id") for a in agents]
@@ -1088,16 +1132,24 @@ _configure_sandbox() {
     local shared_dir="${workspace}/shared"
 
     # 确保共享目录存在。
-    # 约定：容器内通过 /workspace/shared 访问（workspaceAccess=rw 会挂载整个 workspace 到 /workspace）
+    # 约定：容器内通过 /app/shared 访问（避免 /workspace 保留挂载前缀冲突）
     mkdir -p "$shared_dir"
 
     if cmd_exists python3; then
         python3 << PYEOF
-import json, os
+import json, os, re
 
 config_path = os.path.expanduser("~/.openclaw/openclaw.json")
 with open(config_path, "r") as f:
-    config = json.loads(f.read())
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
 
 shared_dir = "${shared_dir}"
 
@@ -1112,7 +1164,7 @@ for agent in agents_list:
                 "network": "bridge",
                 "readOnlyRoot": False,
                 "binds": [
-                    f"{shared_dir}:/workspace/shared:rw"
+                    f"{shared_dir}:/app/shared:rw"
                 ]
             }
         }
@@ -1121,7 +1173,7 @@ for agent in agents_list:
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 PYEOF
-        success "沙箱配置已写入（共享目录: ${shared_dir}，容器内路径: /workspace/shared）"
+        success "沙箱配置已写入（共享目录: ${shared_dir}，容器内路径: /app/shared）"
     else
         warn "未找到 python3，请手动配置沙箱"
     fi
@@ -1283,7 +1335,7 @@ configure_gateway_integration() {
         echo "在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
         echo "不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。"
         echo ""
-        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /workspace/shared 访问）:"
+        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /app/shared 访问）:"
         echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
     else
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
@@ -1294,7 +1346,7 @@ configure_gateway_integration() {
         echo -e "  ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
         echo "  在交互式提示中填入以上 URL 和 Token，以及对应的 openclaw_agent_id。"
         echo ""
-        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /workspace/shared 访问）:"
+        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /app/shared 访问）:"
         echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
     fi
 
