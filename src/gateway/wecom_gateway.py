@@ -499,6 +499,32 @@ MAX_TEXT_EMBED_SIZE = 50 * 1024  # 50KB
 MAX_DOWNLOAD_FILE_SIZE = int(os.getenv('MAX_DOWNLOAD_FILE_SIZE', str(20 * 1024 * 1024)))  # 20MB
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 
+DEFAULT_RISKY_FILE_EXTENSIONS = {
+    '.docm', '.dotx', '.dotm',
+    '.xlsm', '.xltx', '.xltm', '.xlsb',
+    '.pptm', '.potx', '.potm', '.ppsx', '.ppsm',
+}
+
+
+def _load_risky_file_extensions():
+    """从环境变量加载高风险扩展名；为空时使用默认值"""
+    raw = os.getenv('RISKY_FILE_EXTENSIONS', '').strip()
+    if not raw:
+        return set(DEFAULT_RISKY_FILE_EXTENSIONS)
+
+    result = set()
+    for item in raw.split(','):
+        ext = item.strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith('.'):
+            ext = '.' + ext
+        result.add(ext)
+    return result or set(DEFAULT_RISKY_FILE_EXTENSIONS)
+
+
+RISKY_FILE_EXTENSIONS = _load_risky_file_extensions()
+
 
 def _detect_file_type(local_path, content_type):
     """当 Content-Type 不可靠（octet-stream/zip）时，通过内容探测真实类型"""
@@ -510,6 +536,9 @@ def _detect_file_type(local_path, content_type):
         (b'\xff\xd8\xff', 'image/jpeg', '.jpg'),
         (b'GIF87a', 'image/gif', '.gif'),
         (b'GIF89a', 'image/gif', '.gif'),
+        (b'BM', 'image/bmp', '.bmp'),
+        (b'II*\x00', 'image/tiff', '.tiff'),
+        (b'MM\x00*', 'image/tiff', '.tiff'),
         (b'%PDF', 'application/pdf', '.pdf'),
         (b'PK\x03\x04', 'application/zip', '.zip'),
         (b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1', 'application/x-ole-storage', '.doc'),
@@ -519,6 +548,19 @@ def _detect_file_type(local_path, content_type):
     try:
         with open(local_path, 'rb') as f:
             header = f.read(16)
+
+        if len(header) >= 12 and header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+            return 'image/webp', '.webp'
+
+        if len(header) >= 12 and header[4:8] == b'ftyp':
+            brand = header[8:12].decode('ascii', errors='ignore').lower()
+            if brand in {'avif', 'avis'}:
+                return 'image/avif', '.avif'
+            if brand in {'heif', 'mif3'}:
+                return 'image/heif', '.heif'
+            if brand in {'heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'}:
+                return 'image/heif', '.heic'
+
         for magic, ct, ext in MAGIC_SIGNATURES:
             if header.startswith(magic):
                 if magic == b'PK\x03\x04':
@@ -537,7 +579,7 @@ def _detect_file_type(local_path, content_type):
                     ole_type = _detect_ole_document_type(local_path)
                     if ole_type is not None:
                         return ole_type
-                    return 'application/x-ole-storage', '.doc'
+                    return 'application/x-ole-storage', '.ole'
                 return ct, ext
     except Exception:
         pass
@@ -548,6 +590,10 @@ def _detect_file_type(local_path, content_type):
         text = sample.decode('utf-8', errors='ignore').lower()
         if '<mxfile' in text:
             return 'application/vnd.jgraph.mxfile', '.drawio'
+        if '<svg' in text:
+            return 'image/svg+xml', '.svg'
+        if text.lstrip().startswith('{\\rtf'):
+            return 'application/rtf', '.rtf'
     except Exception:
         pass
 
@@ -577,7 +623,73 @@ def _detect_zip_package_type(local_path):
             return None
 
         with zipfile.ZipFile(local_path, 'r') as zf:
-            names = [name.lower() for name in zf.namelist()]
+            zip_names = zf.namelist()
+            names = [name.lower() for name in zip_names]
+
+            content_types_entry = None
+            for original_name in zip_names:
+                if original_name.lower() == '[content_types].xml':
+                    content_types_entry = original_name
+                    break
+
+            if content_types_entry is not None:
+                raw = zf.read(content_types_entry).decode('utf-8', errors='ignore').lower()
+
+                if 'ms-word.template.macroenabled' in raw:
+                    return 'application/vnd.ms-word.template.macroenabled.12', '.dotm'
+                if 'ms-word.document.macroenabled' in raw:
+                    return 'application/vnd.ms-word.document.macroenabled.12', '.docm'
+
+                if 'ms-excel.sheet.binary.macroenabled' in raw:
+                    return 'application/vnd.ms-excel.sheet.binary.macroenabled.12', '.xlsb'
+                if 'ms-excel.template.macroenabled' in raw:
+                    return 'application/vnd.ms-excel.template.macroenabled.12', '.xltm'
+                if 'ms-excel.sheet.macroenabled' in raw:
+                    return 'application/vnd.ms-excel.sheet.macroenabled.12', '.xlsm'
+
+                if 'ms-powerpoint.slideshow.macroenabled' in raw:
+                    return 'application/vnd.ms-powerpoint.slideshow.macroenabled.12', '.ppsm'
+                if 'ms-powerpoint.template.macroenabled' in raw:
+                    return 'application/vnd.ms-powerpoint.template.macroenabled.12', '.potm'
+                if 'ms-powerpoint.presentation.macroenabled' in raw:
+                    return 'application/vnd.ms-powerpoint.presentation.macroenabled.12', '.pptm'
+
+                has_macro = 'macroenabled' in raw
+                if 'wordprocessingml.template' in raw:
+                    if has_macro:
+                        return 'application/vnd.ms-word.template.macroenabled.12', '.dotm'
+                    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.template', '.dotx'
+                if 'wordprocessingml.document' in raw:
+                    if has_macro:
+                        return 'application/vnd.ms-word.document.macroenabled.12', '.docm'
+                    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'
+
+                if 'sheet.binary' in raw and has_macro:
+                    return 'application/vnd.ms-excel.sheet.binary.macroenabled.12', '.xlsb'
+                if 'spreadsheetml.template' in raw:
+                    if has_macro:
+                        return 'application/vnd.ms-excel.template.macroenabled.12', '.xltm'
+                    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.template', '.xltx'
+                if 'spreadsheetml.sheet' in raw:
+                    if has_macro:
+                        return 'application/vnd.ms-excel.sheet.macroenabled.12', '.xlsm'
+                    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
+
+                if 'presentationml.slideshow' in raw:
+                    if has_macro:
+                        return 'application/vnd.ms-powerpoint.slideshow.macroenabled.12', '.ppsm'
+                    return 'application/vnd.openxmlformats-officedocument.presentationml.slideshow', '.ppsx'
+                if 'presentationml.template' in raw:
+                    if has_macro:
+                        return 'application/vnd.ms-powerpoint.template.macroenabled.12', '.potm'
+                    return 'application/vnd.openxmlformats-officedocument.presentationml.template', '.potx'
+                if 'presentationml.presentation' in raw:
+                    if has_macro:
+                        return 'application/vnd.ms-powerpoint.presentation.macroenabled.12', '.pptm'
+                    return 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
+
+                if 'visio' in raw:
+                    return 'application/vnd.visio', '.vsdx'
 
             if any(name.startswith('word/') for name in names):
                 return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'
@@ -607,21 +719,72 @@ def _detect_zip_package_type(local_path):
                 return 'application/vnd.apple.keynote', '.key'
             if 'index/document.iwa' in names and any(name.startswith('metadata/') for name in names):
                 return 'application/vnd.apple.pages', '.pages'
-
-            if '[content_types].xml' in names:
-                raw = zf.read('[content_types].xml').decode('utf-8', errors='ignore').lower()
-                if 'wordprocessingml' in raw:
-                    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'
-                if 'spreadsheetml' in raw:
-                    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
-                if 'presentationml' in raw:
-                    return 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
-                if 'visio' in raw:
-                    return 'application/vnd.visio', '.vsdx'
     except Exception:
         return None
 
     return None
+
+
+def _get_ole_stream_names(raw):
+    """最小化解析 OLE CFB 目录，提取流名称集合"""
+    try:
+        if len(raw) < 512 or raw[:8] != b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+            return set()
+
+        FREESECT = 0xFFFFFFFF
+        ENDOFCHAIN = 0xFFFFFFFE
+
+        sector_shift = struct.unpack_from('<H', raw, 30)[0]
+        sector_size = 1 << sector_shift
+        if sector_size <= 0 or sector_size > 4096:
+            return set()
+
+        first_dir_sector = struct.unpack_from('<I', raw, 48)[0]
+        difat = list(struct.unpack_from('<109I', raw, 76))
+        fat_sectors = [x for x in difat if x not in (FREESECT, ENDOFCHAIN)]
+
+        fat = []
+        for sec in fat_sectors:
+            off = (sec + 1) * sector_size
+            if off < 0 or off + sector_size > len(raw):
+                continue
+            chunk = raw[off:off + sector_size]
+            fat.extend(struct.unpack('<%dI' % (sector_size // 4), chunk))
+
+        if not fat:
+            return set()
+
+        chain = []
+        cur = first_dir_sector
+        visited = set()
+        while cur not in (ENDOFCHAIN, FREESECT) and cur < len(fat) and cur not in visited:
+            visited.add(cur)
+            chain.append(cur)
+            cur = fat[cur]
+
+        directory = bytearray()
+        for sec in chain:
+            off = (sec + 1) * sector_size
+            if off < 0 or off + sector_size > len(raw):
+                continue
+            directory.extend(raw[off:off + sector_size])
+
+        names = set()
+        for i in range(0, len(directory), 128):
+            entry = directory[i:i + 128]
+            if len(entry) < 128:
+                break
+            name_len = struct.unpack_from('<H', entry, 64)[0]
+            obj_type = entry[66]
+            if obj_type == 0 or name_len < 2:
+                continue
+            name_raw = entry[:max(0, name_len - 2)]
+            name = name_raw.decode('utf-16le', errors='ignore')
+            if name:
+                names.add(name)
+        return names
+    except Exception:
+        return set()
 
 
 def _detect_ole_document_type(local_path):
@@ -632,6 +795,18 @@ def _detect_ole_document_type(local_path):
     except Exception:
         return None
 
+    stream_names = _get_ole_stream_names(raw)
+    if 'VisioDocument' in stream_names:
+        return 'application/vnd.visio', '.vsd'
+    if 'WordDocument' in stream_names:
+        return 'application/msword', '.doc'
+    if 'Workbook' in stream_names or 'Book' in stream_names:
+        return 'application/vnd.ms-excel', '.xls'
+    if 'PowerPoint Document' in stream_names:
+        return 'application/vnd.ms-powerpoint', '.ppt'
+    if {'MatOST', 'MM', 'MN0'}.issubset(stream_names):
+        return 'application/vnd.ms-works', '.wps'
+
     markers = [
         (b'WordDocument', b'W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00',
          ('application/msword', '.doc')),
@@ -639,6 +814,8 @@ def _detect_ole_document_type(local_path):
          ('application/vnd.ms-excel', '.xls')),
         (b'Book', b'B\x00o\x00o\x00k\x00',
          ('application/vnd.ms-excel', '.xls')),
+        (b'VisioDocument', b'V\x00i\x00s\x00i\x00o\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00',
+         ('application/vnd.visio', '.vsd')),
         (b'PowerPoint Document', b'P\x00o\x00w\x00e\x00r\x00P\x00o\x00i\x00n\x00t\x00 \x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00',
          ('application/vnd.ms-powerpoint', '.ppt')),
     ]
@@ -647,6 +824,13 @@ def _detect_ole_document_type(local_path):
         if ascii_marker in raw or utf16_marker in raw:
             return result
     return None
+
+
+def _is_risky_file_extension(ext):
+    """判断文件扩展名是否属于高风险类型"""
+    if not ext:
+        return False
+    return ext.lower() in RISKY_FILE_EXTENSIONS
 
 
 def _decrypt_file(encrypted_data, encoding_aes_key):
@@ -666,11 +850,14 @@ def _decrypt_file(encrypted_data, encoding_aes_key):
 
 
 def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes_key='', shared_dir=''):
-    """下载临时 COS URL 到文件目录（按日期分区），返回 (local_path, text_content_or_none)
+    """下载临时 COS URL 到文件目录（按日期分区）
+    返回 (local_path, text_content_or_none, status)
     
     如果 shared_dir 已设置，文件保存到共享目录（供 Docker 沙箱访问）。
     返回的 local_path 为宿主机路径，调用者需根据需要转换为容器内路径。
+    status: ok | risky_deleted
     """
+    tmp_path = None
     try:
         today_dir = _get_today_dir_for_agent(shared_dir)
         resp = requests.get(url, timeout=30, stream=True)
@@ -706,6 +893,14 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
         if ext == '.jpe':
             ext = '.jpg'
 
+        if _is_risky_file_extension(ext):
+            logger.warning(f"检测到高风险文件类型 {ext}，已删除: {tmp_path}")
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            return None, None, 'risky_deleted'
+
         filename = f"{prefix}-{uuid.uuid4().hex[:8]}{ext}"
         local_path = os.path.join(today_dir, filename)
         os.rename(tmp_path, local_path)
@@ -733,10 +928,15 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
         log_file_record(user_id, local_path, filename, file_type, content_type, file_size, url, msg_type)
 
         logger.info(f"文件已下载: {local_path} (type={content_type}, text={text_content is not None})")
-        return local_path, text_content
+        return local_path, text_content, 'ok'
     except Exception as e:
         logger.error(f"下载文件失败: {e}")
-        return None, None
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return None, None, 'error'
 
 
 def _to_container_path(host_path, shared_dir):
@@ -773,8 +973,8 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='')
         url = item.get('image', {}).get('url', '')
         if not url:
             return '[用户发送了一张图片，但无法获取]'
-        path, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image',
-                                     encoding_aes_key=encoding_aes_key, shared_dir=shared_dir)
+        path, _, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image',
+                                        encoding_aes_key=encoding_aes_key, shared_dir=shared_dir)
         if path:
             display_path = _to_container_path(path, shared_dir)
             return f'[用户发送了一张图片，已保存到 {display_path}]'
@@ -784,8 +984,10 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='')
         url = item.get('file', {}).get('url', '')
         if not url:
             return '[用户发送了一个文件，但无法获取]'
-        path, text_content = download_temp_file(url, prefix='file', user_id=user_id, msg_type='file',
-                                                encoding_aes_key=encoding_aes_key, shared_dir=shared_dir)
+        path, text_content, status = download_temp_file(url, prefix='file', user_id=user_id, msg_type='file',
+                                                        encoding_aes_key=encoding_aes_key, shared_dir=shared_dir)
+        if status == 'risky_deleted':
+            return '[用户发送了一个文件，文件有风险，已删除]'
         if not path:
             return '[用户发送了一个文件，下载失败]'
         if text_content is not None:
