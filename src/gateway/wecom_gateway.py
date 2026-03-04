@@ -512,6 +512,7 @@ def _detect_file_type(local_path, content_type):
         (b'GIF89a', 'image/gif', '.gif'),
         (b'%PDF', 'application/pdf', '.pdf'),
         (b'PK\x03\x04', 'application/zip', '.zip'),
+        (b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1', 'application/x-ole-storage', '.doc'),
         (b'\x1f\x8b', 'application/gzip', '.gz'),
         (b'Rar!\x1a\x07', 'application/x-rar', '.rar'),
     ]
@@ -521,9 +522,9 @@ def _detect_file_type(local_path, content_type):
         for magic, ct, ext in MAGIC_SIGNATURES:
             if header.startswith(magic):
                 if magic == b'PK\x03\x04':
-                    ooxml = _detect_ooxml_type_from_zip(local_path)
-                    if ooxml is not None:
-                        return ooxml
+                    package_type = _detect_zip_package_type(local_path)
+                    if package_type is not None:
+                        return package_type
 
                     name_lower = local_path.lower()
                     if name_lower.endswith('.docx'):
@@ -532,7 +533,21 @@ def _detect_file_type(local_path, content_type):
                         return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
                     if name_lower.endswith('.pptx'):
                         return 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
+                if magic == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+                    ole_type = _detect_ole_document_type(local_path)
+                    if ole_type is not None:
+                        return ole_type
+                    return 'application/x-ole-storage', '.doc'
                 return ct, ext
+    except Exception:
+        pass
+
+    try:
+        with open(local_path, 'rb') as f:
+            sample = f.read(8192)
+        text = sample.decode('utf-8', errors='ignore').lower()
+        if '<mxfile' in text:
+            return 'application/vnd.jgraph.mxfile', '.drawio'
     except Exception:
         pass
 
@@ -555,8 +570,8 @@ def _detect_file_type(local_path, content_type):
     return content_type, ''
 
 
-def _detect_ooxml_type_from_zip(local_path):
-    """从 zip 容器结构识别 OOXML 文件类型（docx/xlsx/pptx）"""
+def _detect_zip_package_type(local_path):
+    """从 zip 容器结构识别常见文档包类型（OOXML/Visio/iWork/OpenDocument）"""
     try:
         if not zipfile.is_zipfile(local_path):
             return None
@@ -570,6 +585,28 @@ def _detect_ooxml_type_from_zip(local_path):
                 return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
             if any(name.startswith('ppt/') for name in names):
                 return 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
+            if any(name.startswith('visio/') for name in names):
+                return 'application/vnd.visio', '.vsdx'
+
+            if 'mimetype' in names:
+                try:
+                    mimetype_raw = zf.read('mimetype').decode('utf-8', errors='ignore').strip().lower()
+                    odf_map = {
+                        'application/vnd.oasis.opendocument.text': ('application/vnd.oasis.opendocument.text', '.odt'),
+                        'application/vnd.oasis.opendocument.spreadsheet': ('application/vnd.oasis.opendocument.spreadsheet', '.ods'),
+                        'application/vnd.oasis.opendocument.presentation': ('application/vnd.oasis.opendocument.presentation', '.odp'),
+                    }
+                    if mimetype_raw in odf_map:
+                        return odf_map[mimetype_raw]
+                except Exception:
+                    pass
+
+            if any(name.startswith('index/tables/') for name in names):
+                return 'application/vnd.apple.numbers', '.numbers'
+            if any(name.startswith('index/templateslide') for name in names) or any(name.startswith('index/slide-') for name in names):
+                return 'application/vnd.apple.keynote', '.key'
+            if 'index/document.iwa' in names and any(name.startswith('metadata/') for name in names):
+                return 'application/vnd.apple.pages', '.pages'
 
             if '[content_types].xml' in names:
                 raw = zf.read('[content_types].xml').decode('utf-8', errors='ignore').lower()
@@ -579,9 +616,36 @@ def _detect_ooxml_type_from_zip(local_path):
                     return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
                 if 'presentationml' in raw:
                     return 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
+                if 'visio' in raw:
+                    return 'application/vnd.visio', '.vsdx'
     except Exception:
         return None
 
+    return None
+
+
+def _detect_ole_document_type(local_path):
+    """识别 OLE 复合文档（doc/xls/ppt）"""
+    try:
+        with open(local_path, 'rb') as f:
+            raw = f.read()
+    except Exception:
+        return None
+
+    markers = [
+        (b'WordDocument', b'W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00',
+         ('application/msword', '.doc')),
+        (b'Workbook', b'W\x00o\x00r\x00k\x00b\x00o\x00o\x00k\x00',
+         ('application/vnd.ms-excel', '.xls')),
+        (b'Book', b'B\x00o\x00o\x00k\x00',
+         ('application/vnd.ms-excel', '.xls')),
+        (b'PowerPoint Document', b'P\x00o\x00w\x00e\x00r\x00P\x00o\x00i\x00n\x00t\x00 \x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00',
+         ('application/vnd.ms-powerpoint', '.ppt')),
+    ]
+
+    for ascii_marker, utf16_marker, result in markers:
+        if ascii_marker in raw or utf16_marker in raw:
+            return result
     return None
 
 

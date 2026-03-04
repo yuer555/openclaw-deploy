@@ -280,7 +280,10 @@ echo -e "   ${BLUE}ssh ${SERVER_USER}@${SERVER_IP}${NC}\n"
 echo -e "${YELLOW}2. 首次部署 — 运行安装脚本：${NC}"
 echo -e "   ${BLUE}cd ${REMOTE_DIR} && sudo bash bin/02-install-gateway.sh${NC}\n"
 
-echo -e "${YELLOW}3. 更新部署 — 重启 Gateway 服务：${NC}"
+echo -e "${YELLOW}3. 更新部署 — 同步代码并重启服务：${NC}"
+echo -e "   ${BLUE}cd ${REMOTE_DIR} && sudo bash bin/02-install-gateway.sh${NC}\n"
+
+echo -e "${YELLOW}   （仅修改 .env 时才只需重启服务）${NC}"
 echo -e "   ${BLUE}sudo systemctl restart openclaw-gateway${NC}\n"
 
 echo -e "${YELLOW}4. 安装配置 OpenClaw（如未安装）：${NC}"

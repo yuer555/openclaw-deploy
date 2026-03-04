@@ -1412,9 +1412,10 @@ final_check() {
     echo "后续操作:"
     echo -e "  ${CYAN}1.${NC} 启动 OpenClaw:       ${DIM}openclaw gateway start${NC}"
     echo -e "  ${CYAN}2.${NC} 部署企微 Gateway:    ${DIM}sudo bash bin/02-install-gateway.sh${NC}"
-    echo -e "  ${CYAN}3.${NC} 添加企微 Agent 绑定: ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
-    echo -e "  ${CYAN}4.${NC} 查看 Agent 列表:     ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh list${NC}"
-    echo -e "  ${CYAN}5.${NC} 查看 OpenClaw 面板:  ${DIM}openclaw dashboard${NC}"
+    echo -e "  ${CYAN}3.${NC} 更新代码后同步部署: ${DIM}sudo bash bin/02-install-gateway.sh${NC}"
+    echo -e "  ${CYAN}4.${NC} 添加企微 Agent 绑定: ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
+    echo -e "  ${CYAN}5.${NC} 查看 Agent 列表:     ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh list${NC}"
+    echo -e "  ${CYAN}6.${NC} 查看 OpenClaw 面板:  ${DIM}openclaw dashboard${NC}"
     echo ""
 }
 

@@ -4,7 +4,6 @@
 # 快速执行常见运维操作
 
 INSTALL_DIR="/opt/openclaw/gateway"
-USER="openclaw"
 
 case "$1" in
     start)
@@ -17,7 +16,7 @@ case "$1" in
         sudo systemctl stop openclaw-gateway
         ;;
     restart)
-        echo "🔄 重启 Gateway..."
+        echo "🔄 重启 Gateway（仅重启，不同步代码）..."
         sudo systemctl restart openclaw-gateway
         sudo systemctl status openclaw-gateway --no-pager
         ;;
@@ -46,24 +45,24 @@ case "$1" in
             echo "❌ 用法: $0 add-agent <agent_name>"
             exit 1
         fi
-        cd "$INSTALL_DIR" && sudo -u "$USER" python3 scripts/manage-agent.py add "$2"
+        "$INSTALL_DIR/bin/04-manage-agent.sh" add "$2"
         ;;
     list-agents)
-        cd "$INSTALL_DIR" && sudo -u "$USER" python3 scripts/manage-agent.py list
+        "$INSTALL_DIR/bin/04-manage-agent.sh" list
         ;;
     update-agent)
         if [ -z "$2" ]; then
             echo "❌ 用法: $0 update-agent <agent_name>"
             exit 1
         fi
-        cd "$INSTALL_DIR" && sudo -u "$USER" python3 scripts/manage-agent.py update "$2"
+        "$INSTALL_DIR/bin/04-manage-agent.sh" update "$2"
         ;;
     remove-agent)
         if [ -z "$2" ]; then
             echo "❌ 用法: $0 remove-agent <agent_name>"
             exit 1
         fi
-        cd "$INSTALL_DIR" && sudo -u "$USER" python3 scripts/manage-agent.py remove "$2"
+        "$INSTALL_DIR/bin/04-manage-agent.sh" remove "$2"
         ;;
     db)
         echo "🗄️  打开数据库 (输入 .quit 退出):"
@@ -79,6 +78,8 @@ case "$1" in
         echo "  start              启动服务"
         echo "  stop               停止服务"
         echo "  restart            重启服务"
+        echo "                     (仅重启，不会同步新代码)"
+        echo "                     更新代码后请执行: sudo bash /opt/openclaw/bin/02-install-gateway.sh"
         echo "  status             查看服务状态"
         echo "  logs               实时查看日志"
         echo ""

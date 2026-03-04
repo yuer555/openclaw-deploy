@@ -1,12 +1,12 @@
 #!/bin/bash
 set -e
 
-# OpenClaw Gateway 自动化部署脚本
-# 用途: 在全新 Linux 服务器上一键部署 Gateway
+# OpenClaw Gateway 自动化部署/更新脚本
+# 用途: 在 Linux 服务器安装或更新 Gateway 运行目录
 # 用法: sudo bash bin/02-install-gateway.sh
 
 echo "=========================================="
-echo "OpenClaw Gateway 自动化部署"
+echo "OpenClaw Gateway 自动化部署/更新"
 echo "=========================================="
 echo ""
 
@@ -164,9 +164,12 @@ if systemctl is-active --quiet openclaw-gateway.service; then
     echo "数据目录: $DATA_DIR"
     echo "日志目录: $LOG_DIR"
     echo ""
+    echo "说明: 本脚本会将当前仓库代码同步到 $INSTALL_DIR"
+    echo "      更新代码后请重新执行本脚本；仅重启服务不会同步新代码"
+    echo ""
     echo "下一步操作:"
     echo "  1. 编辑配置: sudo nano $INSTALL_DIR/.env"
-    echo "  2. 重启服务: sudo systemctl restart openclaw-gateway"
+    echo "  2. 仅配置变更时重启: sudo systemctl restart openclaw-gateway"
     echo "  3. 添加 Agent: $INSTALL_DIR/bin/04-manage-agent.sh add <name>"
     echo "  4. 查看日志: tail -f /var/log/openclaw/gateway.log"
     echo "  5. 查看状态: sudo systemctl status openclaw-gateway"
