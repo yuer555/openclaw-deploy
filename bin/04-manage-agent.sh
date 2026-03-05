@@ -15,6 +15,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 从 bin/ 找兄弟 scripts/ 目录
 MANAGE_PY="$(dirname "$SCRIPT_DIR")/scripts/manage-agent.py"
 
+# 读取 Gateway 配置（优先 /opt/openclaw/gateway/.env，回退 /opt/openclaw/.env）
+ENV_FILE="/opt/openclaw/gateway/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    ENV_FILE="/opt/openclaw/.env"
+fi
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 # 如果从 /opt/openclaw/gateway/ 运行（manage-agent.sh 快捷入口）
 if [ ! -f "$MANAGE_PY" ]; then
     MANAGE_PY="$SCRIPT_DIR/scripts/manage-agent.py"

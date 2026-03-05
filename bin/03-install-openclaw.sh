@@ -508,6 +508,52 @@ select_option() {
 }
 
 
+cleanup_openclaw_sandbox_containers() {
+    # 清理历史沙箱容器（重装时使用）
+    if ! cmd_exists docker; then
+        warn "未找到 Docker，跳过历史沙箱容器清理"
+        return 0
+    fi
+
+    local existing
+    existing=$(docker ps -a --format '{{.Names}}' | grep -E '^openclaw-sbx-' || true)
+    if [[ -z "$existing" ]]; then
+        step "未检测到历史 OpenClaw 沙箱容器"
+        return 0
+    fi
+
+    step "清理历史 OpenClaw 沙箱容器..."
+
+    # 优先使用 openclaw 官方命令
+    if cmd_exists openclaw; then
+        if openclaw sandbox recreate --all --force >/dev/null 2>&1; then
+            success "已通过 openclaw sandbox recreate 清理历史容器"
+            return 0
+        fi
+        warn "openclaw sandbox recreate 执行失败，回退 docker rm -f"
+    fi
+
+    local removed=0 failed=0 container
+    while IFS= read -r container; do
+        [[ -z "$container" ]] && continue
+        if docker rm -f "$container" >/dev/null 2>&1; then
+            removed=$((removed + 1))
+        else
+            warn "删除沙箱容器失败: ${container}"
+            failed=$((failed + 1))
+        fi
+    done <<< "$existing"
+
+    if [[ "$failed" -gt 0 ]]; then
+        warn "历史沙箱容器清理完成（成功 ${removed}，失败 ${failed}）"
+        return 1
+    fi
+
+    success "历史沙箱容器清理完成（共 ${removed} 个）"
+    return 0
+}
+
+
 _read_env_file_value() {
     local env_file="$1"
     local key="$2"
@@ -547,7 +593,7 @@ _detect_gateway_env_file() {
         return 0
     fi
 
-    for candidate in "/opt/openclaw/gateway/.env" "${REPO_ROOT}/.env" "$(pwd)/.env"; do
+    for candidate in "/opt/openclaw/gateway/.env" "/opt/openclaw/.env" "${REPO_ROOT}/.env" "$(pwd)/.env"; do
         if [[ -f "$candidate" ]]; then
             echo "$candidate"
             return 0
@@ -580,28 +626,149 @@ _resolve_file_storage_mode() {
 }
 
 
+UPLOAD_SKILL_GATEWAY_URL=""
+UPLOAD_SKILL_TOKEN=""
+UPLOAD_SKILL_EXPIRES=""
+
+
+_resolve_gateway_skill_runtime_values() {
+    local env_file
+    env_file="$(_detect_gateway_env_file)"
+
+    UPLOAD_SKILL_GATEWAY_URL="${OPENCLAW_FILE_UPLOAD_GATEWAY_URL:-}"
+    UPLOAD_SKILL_TOKEN="${OPENCLAW_FILE_UPLOAD_TOKEN:-}"
+    UPLOAD_SKILL_EXPIRES="${OPENCLAW_FILE_UPLOAD_EXPIRES:-}"
+
+    if [[ -z "$UPLOAD_SKILL_GATEWAY_URL" ]]; then
+        UPLOAD_SKILL_GATEWAY_URL="$(_read_env_file_value "$env_file" "GATEWAY_URL")"
+    fi
+    if [[ -z "$UPLOAD_SKILL_TOKEN" ]]; then
+        UPLOAD_SKILL_TOKEN="$(_read_env_file_value "$env_file" "FILE_UPLOAD_INTERNAL_TOKEN")"
+    fi
+    if [[ -z "$UPLOAD_SKILL_EXPIRES" ]]; then
+        UPLOAD_SKILL_EXPIRES="$(_read_env_file_value "$env_file" "FILE_STORAGE_PRESIGN_EXPIRES")"
+    fi
+
+    UPLOAD_SKILL_GATEWAY_URL="${UPLOAD_SKILL_GATEWAY_URL:-http://localhost:8000}"
+    UPLOAD_SKILL_EXPIRES="${UPLOAD_SKILL_EXPIRES:-86400}"
+}
+
+
+_list_openclaw_agent_workspaces() {
+    if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
+        return 0
+    fi
+
+python3 - "$OPENCLAW_CONFIG" "$OPENCLAW_HOME" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+config_path, openclaw_home = sys.argv[1:3]
+
+with open(config_path, 'r', encoding='utf-8') as f:
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
+
+agents_cfg = config.get('agents', {})
+defaults = agents_cfg.get('defaults', {})
+default_workspace = defaults.get('workspace') or os.path.join(openclaw_home, 'workspace')
+
+seen = set()
+for agent in agents_cfg.get('list', []):
+    agent_id = (agent.get('id') or '').strip()
+    if not agent_id:
+        continue
+    workspace = (agent.get('workspace') or '').strip()
+    if not workspace:
+        if agent_id == 'main':
+            workspace = default_workspace
+        else:
+            workspace = os.path.join(openclaw_home, f'workspace-{agent_id}')
+    workspace = os.path.abspath(os.path.expanduser(workspace))
+    print(f"{agent_id}\t{workspace}")
+    seen.add(agent_id)
+
+if 'main' not in seen:
+    workspace = os.path.abspath(os.path.expanduser(default_workspace))
+    print(f"main\t{workspace}")
+PYEOF
+}
+
+
+_sync_gateway_skill_to_workspace() {
+    local mode="$1"
+    local agent_id="$2"
+    local workspace="$3"
+
+    if [[ -z "$workspace" ]]; then
+        return 0
+    fi
+
+    local target_dir="${workspace}/skills/${GATEWAY_SKILL_NAME}"
+    if [[ "$mode" == "local" ]]; then
+        rm -rf "$target_dir" 2>/dev/null || true
+        return 0
+    fi
+
+    mkdir -p "${workspace}/skills"
+    rm -rf "$target_dir"
+    cp -R "$GATEWAY_SKILL_SOURCE_DIR" "$target_dir"
+    chmod +x "$target_dir/upload_to_gateway.py" 2>/dev/null || true
+    step "已同步 Skill 到 agent=${agent_id} 的 workspace"
+}
+
+
+_sync_gateway_skill_to_all_workspaces() {
+    local mode="$1"
+    local count=0
+    local line agent_id workspace
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        agent_id="${line%%$'\t'*}"
+        workspace="${line#*$'\t'}"
+        if [[ "$workspace" == "$line" ]]; then
+            continue
+        fi
+        _sync_gateway_skill_to_workspace "$mode" "$agent_id" "$workspace"
+        count=$((count + 1))
+    done < <(_list_openclaw_agent_workspaces)
+
+    if [[ "$mode" == "local" ]]; then
+        step "已从 ${count} 个 workspace 清理上传 Skill"
+    else
+        success "已向 ${count} 个 workspace 安装上传 Skill"
+    fi
+}
+
+
 _configure_gateway_skill_runtime_env() {
     local enabled="$1"
     local gateway_url="$2"
     local upload_token="$3"
     local expires_seconds="$4"
-    local skills_dir="$5"
 
     if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
         warn "未找到 OpenClaw 配置文件或 python3，跳过 Skill 环境写入"
         return 0
     fi
 
-python3 - "$OPENCLAW_CONFIG" "$GATEWAY_SKILL_NAME" "$enabled" "$gateway_url" "$upload_token" "$expires_seconds" "$skills_dir" <<'PYEOF'
+python3 - "$OPENCLAW_CONFIG" "$GATEWAY_SKILL_NAME" "$enabled" "$gateway_url" "$upload_token" "$expires_seconds" <<'PYEOF'
 import json
-import os
 import re
 import sys
 
-config_path, skill_key, enabled_raw, gateway_url, upload_token, expires_seconds, skills_dir_raw = sys.argv[1:8]
+config_path, skill_key, enabled_raw, gateway_url, upload_token, expires_seconds = sys.argv[1:7]
 enabled = enabled_raw.lower() == 'true'
-skills_dir = os.path.abspath(os.path.expanduser(skills_dir_raw or '~/.openclaw/skills'))
-skills_bind = f"{skills_dir}:{skills_dir}:ro"
 
 with open(config_path, 'r', encoding='utf-8') as f:
     content = f.read()
@@ -633,45 +800,6 @@ def apply_env(target):
         else:
             target.pop(k, None)
 
-
-def _parse_bind_item(item):
-    if isinstance(item, str):
-        parts = item.split(':')
-        if len(parts) >= 2:
-            return parts[0], parts[1]
-        return '', ''
-    if isinstance(item, dict):
-        src = item.get('source') or item.get('src') or ''
-        dst = item.get('target') or item.get('dst') or ''
-        return str(src), str(dst)
-    return '', ''
-
-
-def apply_skill_bind(docker_cfg):
-    if not isinstance(docker_cfg, dict):
-        return
-
-    binds = docker_cfg.get('binds')
-    if not isinstance(binds, list):
-        binds = []
-
-    cleaned = []
-    exists = False
-    for item in binds:
-        src, dst = _parse_bind_item(item)
-        is_skill_bind = (src == skills_dir and dst == skills_dir)
-        if is_skill_bind:
-            exists = True
-            if enabled:
-                cleaned.append(skills_bind)
-            continue
-        cleaned.append(item)
-
-    if enabled and not exists:
-        cleaned.append(skills_bind)
-
-    docker_cfg['binds'] = cleaned
-
 apply_env(entry_env)
 
 agents = config.setdefault('agents', {})
@@ -680,7 +808,6 @@ default_sandbox = defaults.setdefault('sandbox', {})
 default_docker = default_sandbox.setdefault('docker', {})
 default_env = default_docker.setdefault('env', {})
 apply_env(default_env)
-apply_skill_bind(default_docker)
 
 for agent in agents.get('list', []):
     sandbox = agent.get('sandbox')
@@ -689,7 +816,6 @@ for agent in agents.get('list', []):
     docker = sandbox.setdefault('docker', {})
     agent_env = docker.setdefault('env', {})
     apply_env(agent_env)
-    apply_skill_bind(docker)
 
 with open(config_path, 'w', encoding='utf-8') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
@@ -700,13 +826,14 @@ PYEOF
 
 
 setup_gateway_file_upload_skill() {
-    local mode env_file gateway_url upload_token upload_expires
+    local mode
     mode="$(_resolve_file_storage_mode)"
 
     if [[ "$mode" == "local" ]]; then
         step "FILE_STORAGE_MODE=local，跳过全局上传 Skill 安装"
         rm -rf "$GATEWAY_SKILL_TARGET_DIR" 2>/dev/null || true
-        _configure_gateway_skill_runtime_env "false" "" "" "" "${OPENCLAW_HOME}/skills"
+        _configure_gateway_skill_runtime_env "false" "" "" ""
+        _sync_gateway_skill_to_all_workspaces "local"
         return 0
     fi
 
@@ -721,30 +848,15 @@ setup_gateway_file_upload_skill() {
     chmod +x "$GATEWAY_SKILL_TARGET_DIR/upload_to_gateway.py" 2>/dev/null || true
     success "已安装全局 Skill: ${GATEWAY_SKILL_NAME}"
 
-    env_file="$(_detect_gateway_env_file)"
-    gateway_url="${OPENCLAW_FILE_UPLOAD_GATEWAY_URL:-}"
-    upload_token="${OPENCLAW_FILE_UPLOAD_TOKEN:-}"
-    upload_expires="${OPENCLAW_FILE_UPLOAD_EXPIRES:-}"
+    _resolve_gateway_skill_runtime_values
 
-    if [[ -z "$gateway_url" ]]; then
-        gateway_url="$(_read_env_file_value "$env_file" "GATEWAY_URL")"
-    fi
-    if [[ -z "$upload_token" ]]; then
-        upload_token="$(_read_env_file_value "$env_file" "FILE_UPLOAD_INTERNAL_TOKEN")"
-    fi
-    if [[ -z "$upload_expires" ]]; then
-        upload_expires="$(_read_env_file_value "$env_file" "FILE_STORAGE_PRESIGN_EXPIRES")"
-    fi
-
-    gateway_url="${gateway_url:-http://localhost:8000}"
-    upload_expires="${upload_expires:-86400}"
-
-    if [[ -z "$upload_token" ]]; then
+    if [[ -z "$UPLOAD_SKILL_TOKEN" ]]; then
         warn "未配置 OPENCLAW_FILE_UPLOAD_TOKEN / FILE_UPLOAD_INTERNAL_TOKEN，Skill 调用会失败"
     fi
 
-    _configure_gateway_skill_runtime_env "true" "$gateway_url" "$upload_token" "$upload_expires" "${OPENCLAW_HOME}/skills"
-    step "已写入 Skill 运行环境（Gateway: ${gateway_url}，Expires: ${upload_expires}s）"
+    _configure_gateway_skill_runtime_env "true" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES"
+    _sync_gateway_skill_to_all_workspaces "$mode"
+    step "已写入 Skill 运行环境（Gateway: ${UPLOAD_SKILL_GATEWAY_URL}，Expires: ${UPLOAD_SKILL_EXPIRES}s）"
     echo -e "  ${DIM}若沙箱容器已存在，请执行: openclaw sandbox recreate --agent <agent_id>${NC}"
 }
 
@@ -804,6 +916,7 @@ check_and_install_openclaw() {
         if [[ "$reinstall_yn" =~ ^[Yy] ]]; then
             step "清理当前 OpenClaw 安装..."
             openclaw gateway stop 2>/dev/null || true
+            cleanup_openclaw_sandbox_containers || warn "历史沙箱容器未完全清理，请稍后手动执行: openclaw sandbox recreate --all --force"
             rm -rf "$OPENCLAW_HOME"
             success "清理完成，启动 OpenClaw 初始化向导..."
             echo ""
@@ -1317,13 +1430,17 @@ except json.JSONDecodeError:
     content = re.sub(r',\s*([}\]])', r'\1', content)
     config = json.loads(content)
 
-agents = config.setdefault("agents", {}).setdefault("list", [])
+            agents = config.setdefault("agents", {}).setdefault("list", [])
 existing_ids = [a.get("id") for a in agents]
 if "${agent_id}" not in existing_ids:
     agents.append({
         "id": "${agent_id}",
         "name": "${agent_name}",
-        "workspace": "${workspace}"
+        "workspace": "${workspace}",
+        "agentDir": "${agent_dir}",
+        "identity": {
+            "name": "${agent_name}"
+        }
     })
 
 with open(config_path, "w") as f:
@@ -1337,10 +1454,14 @@ PYEOF
         mkdir -p "$workspace"
     fi
 
+    local storage_mode
+    storage_mode="$(_resolve_file_storage_mode)"
+    _sync_gateway_skill_to_workspace "$storage_mode" "$agent_id" "$workspace"
+
     # 配置沙箱（非 main agent）
     if [[ "$use_sandbox" == "true" && "$agent_id" != "main" ]]; then
         step "配置 Docker 沙箱..."
-        _configure_sandbox "$agent_id"
+        _configure_sandbox "$agent_id" "$agent_name"
     fi
 
     # 设置 agent 名称和身份
@@ -1373,20 +1494,29 @@ PYEOF
 # 配置沙箱（内部函数）
 _configure_sandbox() {
     local agent_id="$1"
+    local agent_name_input="${2:-$1}"
     local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
+    local agent_dir="${OPENCLAW_HOME}/agents/${agent_id}/agent"
     local shared_dir="${workspace}/shared"
-    local skills_dir="${OPENCLAW_HOME}/skills"
+    local storage_mode
+    storage_mode="$(_resolve_file_storage_mode)"
+    _resolve_gateway_skill_runtime_values
 
     # 确保共享目录存在。
     # 约定：容器内通过 /app/shared 访问（避免 /workspace 保留挂载前缀冲突）
     mkdir -p "$shared_dir"
-    mkdir -p "$skills_dir"
+    mkdir -p "$agent_dir"
 
     if cmd_exists python3; then
-        python3 << PYEOF
-import json, os, re
+        python3 - "$OPENCLAW_CONFIG" "$agent_id" "$agent_name_input" "$workspace" "$agent_dir" "$shared_dir" "$storage_mode" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES" <<'PYEOF'
+import json
+import os
+import re
+import sys
 
-config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+config_path, agent_id, agent_name_raw, workspace, agent_dir, shared_dir, storage_mode, gateway_url, upload_token, upload_expires = sys.argv[1:11]
+agent_name = (agent_name_raw or agent_id or '').strip() or agent_id
+
 with open(config_path, "r") as f:
     content = f.read()
 
@@ -1398,31 +1528,64 @@ except json.JSONDecodeError:
     content = re.sub(r',\s*([}\]])', r'\1', content)
     config = json.loads(content)
 
-shared_dir = "${shared_dir}"
-skills_dir = "${skills_dir}"
+agents_cfg = config.setdefault("agents", {})
+agents_list = agents_cfg.setdefault("list", [])
 
-agents_list = config.get("agents", {}).get("list", [])
+target = None
 for agent in agents_list:
-    if agent.get("id") == "${agent_id}":
-        agent["sandbox"] = {
-            "mode": "all",
-            "scope": "agent",
-            "workspaceAccess": "rw",
-            "docker": {
-                "network": "bridge",
-                "readOnlyRoot": False,
-                "binds": [
-                    f"{shared_dir}:/app/shared:rw",
-                    f"{skills_dir}:{skills_dir}:ro"
-                ]
-            }
-        }
+    if agent.get("id") == agent_id:
+        target = agent
         break
+
+if target is None:
+    target = {"id": agent_id}
+    agents_list.append(target)
+
+target["id"] = agent_id
+target["name"] = agent_name
+target["workspace"] = workspace
+target["agentDir"] = agent_dir
+target["identity"] = {"name": agent_name}
+
+docker_cfg = {
+    "readOnlyRoot": False,
+    "network": "bridge",
+    "binds": [
+        f"{shared_dir}:/app/shared:rw"
+    ],
+    "setupCommand": "apt-get update && apt-get install -y git curl"
+}
+
+if storage_mode != "local":
+    docker_cfg["env"] = {
+        "OPENCLAW_FILE_UPLOAD_GATEWAY_URL": gateway_url,
+        "OPENCLAW_FILE_UPLOAD_TOKEN": upload_token,
+        "OPENCLAW_FILE_UPLOAD_EXPIRES": str(upload_expires),
+    }
+
+target["sandbox"] = {
+    "mode": "all",
+    "workspaceAccess": "rw",
+    "scope": "agent",
+    "docker": docker_cfg,
+}
+
+target["tools"] = {
+    "allow": [
+        "group:fs",
+        "group:runtime",
+        "group:memory",
+        "group:sessions",
+    ],
+    "deny": [
+        "apply_patch"
+    ],
+}
 
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 PYEOF
-        success "沙箱配置已写入（共享目录: ${shared_dir}，容器内路径: /app/shared）"
+        success "沙箱模板配置已写入（共享目录: ${shared_dir}，容器内路径: /app/shared）"
     else
         warn "未找到 python3，请手动配置沙箱"
     fi
@@ -1566,11 +1729,7 @@ configure_gateway_integration() {
 
     # 检查 .env 文件
     local env_file
-    env_file="$(dirname "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")")/.env"
-
-    if [[ ! -f "$env_file" ]]; then
-        env_file="$(pwd)/.env"
-    fi
+    env_file="$(_detect_gateway_env_file)"
 
     if [[ -f "$env_file" ]]; then
         step "检测到 Gateway .env 文件: ${env_file}"

@@ -334,7 +334,7 @@ agent:main:wecom:dev-main:user001
 
 4. **添加 Agent**
    ```bash
-   sudo /opt/openclaw/gateway/manage-agent.sh add team-dev
+   /opt/openclaw/gateway/bin/04-manage-agent.sh add team-dev
    ```
 
 5. **验证配置**

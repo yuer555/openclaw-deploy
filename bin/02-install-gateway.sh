@@ -21,6 +21,7 @@ INSTALL_DIR="/opt/openclaw/gateway"
 DATA_DIR="/opt/openclaw/data"
 LOG_DIR="/var/log/openclaw"
 VENV_DIR="/opt/openclaw/gateway/venv"
+FALLBACK_ENV_FILE="/opt/openclaw/.env"
 
 # 使用调用 sudo 的实际用户运行 Gateway（与 OpenClaw 共用同一用户，避免权限问题）
 RUN_USER="${SUDO_USER:-$(whoami)}"
@@ -79,17 +80,25 @@ echo "   ✅ 目录创建完成"
 echo ""
 echo "📄 步骤 5/8: 复制代码文件..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cp -r "$SCRIPT_DIR/src" "$INSTALL_DIR/"
-cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
 
-# 仅安装 Gateway 运行必需的 bin 脚本，避免 /opt/openclaw/bin 与 /opt/openclaw/gateway/bin 双份脚本漂移
-rm -rf "$INSTALL_DIR/bin"
-mkdir -p "$INSTALL_DIR/bin"
-cp "$SCRIPT_DIR/bin/04-manage-agent.sh" "$INSTALL_DIR/bin/"
+if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
+    cp -r "$SCRIPT_DIR/src" "$INSTALL_DIR/"
+    cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
+
+    # 仅安装 Gateway 运行必需的 bin 脚本，避免双份脚本漂移
+    rm -rf "$INSTALL_DIR/bin"
+    mkdir -p "$INSTALL_DIR/bin"
+    cp "$SCRIPT_DIR/bin/04-manage-agent.sh" "$INSTALL_DIR/bin/"
+else
+    echo "   检测到当前目录即安装目录，跳过代码复制"
+fi
 
 # 创建 .env 文件（如果不存在）
 if [ ! -f "$INSTALL_DIR/.env" ]; then
-    if [ -f "$SCRIPT_DIR/.env.example" ]; then
+    if [ -f "$FALLBACK_ENV_FILE" ]; then
+        echo "   检测到回退配置文件: $FALLBACK_ENV_FILE"
+        echo "   ℹ️  将优先使用 $FALLBACK_ENV_FILE（直到创建 $INSTALL_DIR/.env）"
+    elif [ -f "$SCRIPT_DIR/.env.example" ]; then
         cp "$SCRIPT_DIR/.env.example" "$INSTALL_DIR/.env"
         echo "   ✅ 已创建 .env 配置文件"
         echo "   ⚠️  请编辑 $INSTALL_DIR/.env 修改配置"
@@ -144,7 +153,12 @@ echo "🔐 步骤 7/8: 设置文件权限..."
 chown -R "$RUN_USER:$RUN_GROUP" "$INSTALL_DIR"
 chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
 chown -R "$RUN_USER:$RUN_GROUP" "$LOG_DIR"
-chmod 600 "$INSTALL_DIR/.env"
+if [ -f "$INSTALL_DIR/.env" ]; then
+    chmod 600 "$INSTALL_DIR/.env"
+fi
+if [ -f "$FALLBACK_ENV_FILE" ]; then
+    chmod 600 "$FALLBACK_ENV_FILE" 2>/dev/null || true
+fi
 chmod +x "$INSTALL_DIR/scripts/manage-agent.py"
 chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
 chmod +x "$INSTALL_DIR/bin/"*.sh 2>/dev/null || true
