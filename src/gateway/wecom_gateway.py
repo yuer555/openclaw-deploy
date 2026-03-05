@@ -7,15 +7,26 @@ import os
 import logging
 import json
 import base64
+import tempfile
 from Crypto.Cipher import AES
 import struct
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import threading
 import queue
 import mimetypes
 import zipfile
 import websocket
+
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+    from botocore.exceptions import BotoCoreError, ClientError
+except Exception:
+    boto3 = None
+    BotoConfig = None
+    BotoCoreError = Exception
+    ClientError = Exception
 
 app = Flask(__name__)
 
@@ -37,6 +48,44 @@ OPENCLAW_PROTOCOL = os.getenv('OPENCLAW_PROTOCOL', 'ws')
 
 # Gateway 端口
 GATEWAY_PORT = int(os.getenv('GATEWAY_PORT', '8000'))
+
+# 文件存储模式（local | s3）
+FILE_STORAGE_MODE = os.getenv('FILE_STORAGE_MODE', 'local').strip().lower()
+VALID_FILE_STORAGE_MODES = {'local', 's3'}
+if FILE_STORAGE_MODE not in VALID_FILE_STORAGE_MODES:
+    logger.warning(f"未知 FILE_STORAGE_MODE={FILE_STORAGE_MODE}，回退 local")
+    FILE_STORAGE_MODE = 'local'
+
+# 预签名下载默认有效期（秒）
+try:
+    FILE_STORAGE_PRESIGN_EXPIRES = int(os.getenv('FILE_STORAGE_PRESIGN_EXPIRES', '86400'))
+except ValueError:
+    logger.warning("FILE_STORAGE_PRESIGN_EXPIRES 非法，使用默认 86400")
+    FILE_STORAGE_PRESIGN_EXPIRES = 86400
+FILE_STORAGE_PRESIGN_EXPIRES = max(1, FILE_STORAGE_PRESIGN_EXPIRES)
+
+# Gateway 内部上传接口鉴权 Token（供 OpenClaw skill 调用）
+FILE_UPLOAD_INTERNAL_TOKEN = os.getenv('FILE_UPLOAD_INTERNAL_TOKEN', '').strip()
+
+# S3 配置（仅 FILE_STORAGE_MODE=s3 时生效）
+S3_BUCKET = os.getenv('S3_BUCKET', '').strip()
+S3_REGION = os.getenv('S3_REGION', 'us-east-1').strip()
+S3_ENDPOINT_URL = os.getenv('S3_ENDPOINT_URL', '').strip()
+S3_ACCESS_KEY_ID = os.getenv('S3_ACCESS_KEY_ID', '').strip()
+S3_SECRET_ACCESS_KEY = os.getenv('S3_SECRET_ACCESS_KEY', '').strip()
+S3_KEY_PREFIX = os.getenv('S3_KEY_PREFIX', 'openclaw-gateway').strip().strip('/')
+FILE_STORAGE_KEY_PREFIX = os.getenv('FILE_STORAGE_KEY_PREFIX', S3_KEY_PREFIX or 'openclaw-gateway').strip().strip('/')
+S3_SIGNATURE_VERSION = os.getenv('S3_SIGNATURE_VERSION', 's3').strip()
+S3_ADDRESSING_STYLE = os.getenv('S3_ADDRESSING_STYLE', 'path').strip()
+S3_SSE_MODE = os.getenv('S3_SSE_MODE', '').strip()
+S3_SSE_KMS_KEY_ID = os.getenv('S3_SSE_KMS_KEY_ID', '').strip()
+
+# OpenClaw skill 经 Gateway 上传时的文件大小限制（默认 50MB）
+try:
+    MAX_INTERNAL_UPLOAD_FILE_SIZE = int(os.getenv('MAX_INTERNAL_UPLOAD_FILE_SIZE', str(50 * 1024 * 1024)))
+except ValueError:
+    logger.warning("MAX_INTERNAL_UPLOAD_FILE_SIZE 非法，使用默认 50MB")
+    MAX_INTERNAL_UPLOAD_FILE_SIZE = 50 * 1024 * 1024
 
 # ============= Agent 绑定（从 SQLite 加载）=============
 
@@ -157,6 +206,50 @@ def _call_openclaw_http(url, message, session_key, timeout=2700, token='', agent
     return _extract_reply_text(resp.json())
 
 
+def _extract_ws_chat_text(message_obj):
+    """从 WS chat message 中提取文本内容"""
+    texts = []
+    if not isinstance(message_obj, dict):
+        return ''
+
+    for item in message_obj.get('content', []):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get('type')
+        if item_type in ('text', 'output_text') and item.get('text'):
+            texts.append(item['text'])
+            continue
+        if item_type == 'input_text' and item.get('text'):
+            texts.append(item['text'])
+
+    return '\n'.join(texts).strip()
+
+
+def _merge_ws_stream_text(accumulated_text, last_piece, current_piece):
+    """合并 WS 流式分段文本，兼容快照模式与增量模式"""
+    current_piece = (current_piece or '').strip()
+    if not current_piece:
+        return accumulated_text
+
+    if not accumulated_text:
+        return current_piece
+
+    # 快照模式：当前分段是此前内容的扩展
+    if current_piece.startswith(accumulated_text):
+        return current_piece
+
+    # 回退/重复片段，忽略
+    if accumulated_text.startswith(current_piece):
+        return accumulated_text
+    if current_piece == (last_piece or '').strip():
+        return accumulated_text
+    if accumulated_text.endswith(current_piece) or current_piece in accumulated_text:
+        return accumulated_text
+
+    # 增量模式：按顺序追加
+    return accumulated_text + current_piece
+
+
 def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_id='main'):
     """WebSocket 协议调用：connect 握手 + chat.send，监听 chat state=final 获取回复"""
     ws_url = url.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
@@ -195,6 +288,8 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_i
         }))
 
         # 监听事件流，chat state=final 包含完整回复
+        accumulated_text = ''
+        last_piece = ''
         while True:
             raw = ws.recv()
             evt = json.loads(raw)
@@ -204,13 +299,19 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_i
                 evt_sk = (payload.get('sessionKey') or '').lower()
                 if evt_sk and session_key.lower() not in evt_sk:
                     continue
+                msg = payload.get('message', {})
+                piece_text = _extract_ws_chat_text(msg)
+                if piece_text:
+                    accumulated_text = _merge_ws_stream_text(accumulated_text, last_piece, piece_text)
+                    last_piece = piece_text
                 if payload.get('state') == 'final':
-                    msg = payload.get('message', {})
-                    texts = []
-                    for c in msg.get('content', []):
-                        if c.get('type') == 'text' and c.get('text'):
-                            texts.append(c['text'])
-                    return '\n'.join(texts).strip()
+                    final_text = piece_text.strip() if piece_text else ''
+                    if final_text:
+                        return final_text
+                    if accumulated_text:
+                        logger.warning("WS final 事件未携带完整文本，使用分段累计兜底")
+                        return accumulated_text.strip()
+                    return ''
             # RPC 错误
             if evt.get('type') == 'res' and evt.get('id') == req_id and not evt.get('ok'):
                 raise Exception(f"WS RPC 错误: {evt.get('error')}")
@@ -426,7 +527,12 @@ def log_file_record(user_id, file_path, file_name, file_type, content_type, file
 
 # ============= 长消息截断 =============
 
-WECOM_MSG_MAX_LEN = 20000  # 企业微信 markdown 消息限制 20480 字节，留余量
+WECOM_MSG_MAX_LEN = 20000  # 企业微信 markdown 消息限制 20480 字节，预留安全余量
+
+
+def _utf8_len(text):
+    """返回 UTF-8 字节长度"""
+    return len((text or '').encode('utf-8'))
 
 
 def truncate_message(text, max_len=WECOM_MSG_MAX_LEN):
@@ -486,6 +592,156 @@ def _get_today_dir_for_agent(shared_dir):
 
 # 容器内共享目录路径（避免使用 /workspace 下的保留挂载前缀）
 CONTAINER_SHARED_MOUNT = '/app/shared'
+
+
+# ============= 文件发布（local / s3） =============
+
+_s3_client = None
+_s3_client_lock = threading.Lock()
+
+
+def _sanitize_storage_segment(value, fallback='unknown'):
+    """规范化对象存储 key 片段"""
+    if not value:
+        return fallback
+    cleaned = ''.join(ch if (ch.isalnum() or ch in ('-', '_', '.')) else '-' for ch in str(value))
+    cleaned = cleaned.strip('-_.')
+    return cleaned or fallback
+
+
+def _resolve_presign_expires(expires_seconds=None):
+    """解析预签名有效期，AWS S3 最大 7 天"""
+    value = FILE_STORAGE_PRESIGN_EXPIRES if expires_seconds is None else expires_seconds
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = FILE_STORAGE_PRESIGN_EXPIRES
+    value = max(1, value)
+    return min(value, 604800)
+
+
+def _format_expires_at(expires_seconds):
+    """将有效期秒数转换为 ISO8601 UTC 时间"""
+    dt = datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)
+    return dt.isoformat()
+
+
+def _build_storage_object_key(local_path, source='wecom', agent_name='default'):
+    """构建对象存储 key"""
+    ext = os.path.splitext(local_path)[1].lower() or '.bin'
+    now = datetime.now().strftime('%Y/%m/%d')
+    source_part = _sanitize_storage_segment(source, 'source')
+    agent_part = _sanitize_storage_segment(agent_name, 'default')
+    object_name = f"{uuid.uuid4().hex[:24]}{ext}"
+
+    parts = []
+    if FILE_STORAGE_KEY_PREFIX:
+        parts.append(FILE_STORAGE_KEY_PREFIX)
+    parts.extend([source_part, agent_part, now, object_name])
+    return '/'.join(parts)
+
+
+def _get_s3_client():
+    """懒加载 S3 client"""
+    global _s3_client
+
+    if boto3 is None:
+        raise RuntimeError('boto3 未安装，无法使用 S3 模式')
+
+    with _s3_client_lock:
+        if _s3_client is not None:
+            return _s3_client
+
+        if not S3_BUCKET:
+            raise RuntimeError('S3_BUCKET 未配置')
+
+        kwargs = {}
+        if S3_REGION:
+            kwargs['region_name'] = S3_REGION
+        if S3_ENDPOINT_URL:
+            kwargs['endpoint_url'] = S3_ENDPOINT_URL
+        if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+            kwargs['aws_access_key_id'] = S3_ACCESS_KEY_ID
+            kwargs['aws_secret_access_key'] = S3_SECRET_ACCESS_KEY
+
+        if BotoConfig is not None:
+            kwargs['config'] = BotoConfig(
+                signature_version=S3_SIGNATURE_VERSION or 's3v4',
+                s3={'addressing_style': S3_ADDRESSING_STYLE or 'virtual'}
+            )
+
+        _s3_client = boto3.client('s3', **kwargs)
+        return _s3_client
+
+
+def _publish_file_local(local_path, shared_dir=''):
+    """local 模式：返回容器内可访问路径（或宿主机路径）"""
+    host_path = os.path.abspath(local_path)
+    display_path = _to_container_path(host_path, shared_dir)
+    return {
+        'storage_mode': 'local',
+        'storage_uri': f"file://{host_path}",
+        'download_url': '',
+        'expires_at': '',
+        'display_value': display_path,
+    }
+
+
+def _publish_file_s3(local_path, object_key, content_type='', expires_seconds=None):
+    """s3 模式：上传并返回预签名下载链接"""
+    client = _get_s3_client()
+    expires_seconds = _resolve_presign_expires(expires_seconds)
+    extra_args = {}
+    if content_type:
+        extra_args['ContentType'] = content_type
+    if S3_SSE_MODE:
+        extra_args['ServerSideEncryption'] = S3_SSE_MODE
+        if S3_SSE_MODE.lower() == 'aws:kms' and S3_SSE_KMS_KEY_ID:
+            extra_args['SSEKMSKeyId'] = S3_SSE_KMS_KEY_ID
+
+    if extra_args:
+        client.upload_file(local_path, S3_BUCKET, object_key, ExtraArgs=extra_args)
+    else:
+        client.upload_file(local_path, S3_BUCKET, object_key)
+
+    download_url = client.generate_presigned_url(
+        ClientMethod='get_object',
+        Params={'Bucket': S3_BUCKET, 'Key': object_key},
+        ExpiresIn=expires_seconds,
+        HttpMethod='GET',
+    )
+
+    return {
+        'storage_mode': 's3',
+        'storage_uri': f"s3://{S3_BUCKET}/{object_key}",
+        'download_url': download_url,
+        'expires_at': _format_expires_at(expires_seconds),
+        'display_value': download_url,
+    }
+
+
+def publish_file(local_path, shared_dir='', user_id='', msg_type='', source_url='', agent_name='',
+                 content_type='', source='wecom', expires_seconds=None):
+    """统一文件发布入口：按模式发布并返回引用信息"""
+    object_key = _build_storage_object_key(local_path, source=source, agent_name=agent_name or 'default')
+
+    if FILE_STORAGE_MODE == 'local':
+        return _publish_file_local(local_path, shared_dir=shared_dir)
+    if FILE_STORAGE_MODE == 's3':
+        return _publish_file_s3(local_path, object_key=object_key,
+                                content_type=content_type, expires_seconds=expires_seconds)
+    raise RuntimeError(f'不支持的 FILE_STORAGE_MODE: {FILE_STORAGE_MODE}')
+
+
+def _format_link_with_expire(publish_result):
+    """格式化带过期时间提示的下载链接"""
+    download_url = publish_result.get('download_url', '')
+    expires_at = publish_result.get('expires_at', '')
+    if not download_url:
+        return publish_result.get('display_value', '')
+    if expires_at:
+        return f"{download_url}（过期时间: {expires_at}）"
+    return download_url
 
 
 # ============= 多类型消息处理 =============
@@ -956,7 +1212,7 @@ def _to_container_path(host_path, shared_dir):
     return host_path
 
 
-def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir=''):
+def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='', agent_name=''):
     """提取单条消息内容（主消息或 quote 内的消息），返回文本描述
     
     shared_dir: agent 的共享文件目录。设置后文件保存到此目录，路径转为容器内路径 /app/shared/...
@@ -976,8 +1232,28 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='')
         path, _, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image',
                                         encoding_aes_key=encoding_aes_key, shared_dir=shared_dir)
         if path:
-            display_path = _to_container_path(path, shared_dir)
-            return f'[用户发送了一张图片，已保存到 {display_path}]'
+            try:
+                raw_content_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+                content_type, _ = _detect_file_type(path, raw_content_type)
+                publish_result = publish_file(
+                    path,
+                    shared_dir=shared_dir,
+                    user_id=user_id,
+                    msg_type='image',
+                    source_url=url,
+                    agent_name=agent_name,
+                    content_type=content_type,
+                    source='wecom-image',
+                )
+            except Exception as e:
+                logger.error(f"图片发布失败: {e}")
+                return '[用户发送了一张图片，上传失败]'
+
+            if FILE_STORAGE_MODE == 'local':
+                return f"[用户发送了一张图片，已保存到 {publish_result.get('display_value', path)}]"
+
+            link_text = _format_link_with_expire(publish_result)
+            return f"[用户发送了一张图片，下载链接: {link_text}]"
         return '[用户发送了一张图片，下载失败]'
 
     elif msg_type == 'file':
@@ -990,31 +1266,61 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='')
             return '[用户发送了一个文件，文件有风险，已删除]'
         if not path:
             return '[用户发送了一个文件，下载失败]'
+
+        try:
+            raw_content_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+            content_type, _ = _detect_file_type(path, raw_content_type)
+            publish_result = publish_file(
+                path,
+                shared_dir=shared_dir,
+                user_id=user_id,
+                msg_type='file',
+                source_url=url,
+                agent_name=agent_name,
+                content_type=content_type,
+                source='wecom-file',
+            )
+        except Exception as e:
+            logger.error(f"文件发布失败: {e}")
+            return '[用户发送了一个文件，上传失败]'
+
         if text_content is not None:
-            display_path = _to_container_path(path, shared_dir)
-            return f'[用户发送了一个文本文件 {display_path}]\n文件内容：\n{text_content}'
-        display_path = _to_container_path(path, shared_dir)
-        return f'[用户发送了一个文件，已保存到 {display_path}]'
+            if FILE_STORAGE_MODE == 'local':
+                return f"[用户发送了一个文本文件 {publish_result.get('display_value', path)}]\n文件内容：\n{text_content}"
+            link_text = _format_link_with_expire(publish_result)
+            return f"[用户发送了一个文本文件，下载链接: {link_text}]\n文件内容：\n{text_content}"
+
+        if FILE_STORAGE_MODE == 'local':
+            return f"[用户发送了一个文件，已保存到 {publish_result.get('display_value', path)}]"
+
+        link_text = _format_link_with_expire(publish_result)
+        return f"[用户发送了一个文件，下载链接: {link_text}]"
 
     elif msg_type == 'mixed':
         parts = []
         for sub_item in item.get('mixed', {}).get('msg_item', []):
             parts.append(extract_single_content(sub_item, user_id=user_id,
-                                                encoding_aes_key=encoding_aes_key, shared_dir=shared_dir))
+                                                encoding_aes_key=encoding_aes_key,
+                                                shared_dir=shared_dir,
+                                                agent_name=agent_name))
         return '\n'.join(parts)
 
     return f'[不支持的消息类型: {msg_type}]'
 
 
-def extract_message_content(msg, user_id='', encoding_aes_key='', shared_dir=''):
+def extract_message_content(msg, user_id='', encoding_aes_key='', shared_dir='', agent_name=''):
     """提取完整消息内容，返回文本内容"""
-    content = extract_single_content(msg, user_id=user_id, encoding_aes_key=encoding_aes_key,
-                                     shared_dir=shared_dir)
+    content = extract_single_content(msg, user_id=user_id,
+                                     encoding_aes_key=encoding_aes_key,
+                                     shared_dir=shared_dir,
+                                     agent_name=agent_name)
 
     quote = msg.get('quote')
     if quote:
-        quote_content = extract_single_content(quote, user_id=user_id, encoding_aes_key=encoding_aes_key,
-                                               shared_dir=shared_dir)
+        quote_content = extract_single_content(quote, user_id=user_id,
+                                               encoding_aes_key=encoding_aes_key,
+                                               shared_dir=shared_dir,
+                                               agent_name=agent_name)
         content = f"{content}\n\n[引用消息] {quote_content}"
 
     return content
@@ -1047,6 +1353,7 @@ def _user_worker(queue_key):
             logger.error(f"处理消息失败 ({queue_key}): {e}")
         finally:
             q.task_done()
+
 
 def _process_single_message(user_id, content, task_id, response_url, agent_name):
     """处理单条消息：调用对应 agent -> 回复"""
@@ -1087,11 +1394,12 @@ def _process_single_message(user_id, content, task_id, response_url, agent_name)
         reply = '系统异常，请联系管理员。'
         update_task_status(task_id, 'error', str(e)[:500])
 
-    reply = truncate_message(reply)
-    payload = {"msgtype": "markdown", "markdown": {"content": reply}}
+    wecom_reply = truncate_message(reply, max_len=WECOM_MSG_MAX_LEN)
+
+    payload = {"msgtype": "markdown", "markdown": {"content": wecom_reply}}
     try:
         resp = requests.post(response_url, json=payload, timeout=10)
-        logger.info(f"[{agent_name}] 主动回复: {resp.status_code}, 长度: {len(reply)}")
+        logger.info(f"[{agent_name}] 主动回复: {resp.status_code}, 长度: {_utf8_len(wecom_reply)} bytes")
     except Exception as e:
         logger.error(f"[{agent_name}] 主动回复失败: {e}")
 
@@ -1134,6 +1442,78 @@ def is_duplicate_msg(msgid):
         return True
     _processed_msgs[msgid] = now
     return False
+
+
+def _verify_internal_upload_auth(req):
+    """校验内部上传接口鉴权"""
+    if not FILE_UPLOAD_INTERNAL_TOKEN:
+        return False, 'FILE_UPLOAD_INTERNAL_TOKEN 未配置，内部上传接口已禁用'
+
+    auth = req.headers.get('Authorization', '').strip()
+    if not auth.startswith('Bearer '):
+        return False, '缺少 Bearer Token'
+
+    token = auth[7:].strip()
+    if token != FILE_UPLOAD_INTERNAL_TOKEN:
+        return False, '鉴权失败'
+
+    return True, ''
+
+
+def _safe_ext_from_filename(filename):
+    """从文件名提取安全扩展名"""
+    ext = os.path.splitext(filename or '')[1].lower()
+    if not ext:
+        return ''
+    ext = ''.join(ch for ch in ext if (ch.isalnum() or ch == '.'))
+    if not ext.startswith('.'):
+        return ''
+    if len(ext) > 16:
+        return ''
+    return ext
+
+
+def _save_internal_uploaded_file(file_storage):
+    """保存 OpenClaw skill 上传文件到本地临时目录，返回 (local_path, content_type, file_size)"""
+    tmp_path = None
+    try:
+        today_dir = _get_today_dir()
+        with tempfile.NamedTemporaryFile(dir=today_dir, prefix='upload-', suffix='.tmp', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            total_size = 0
+            while True:
+                chunk = file_storage.stream.read(DOWNLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_INTERNAL_UPLOAD_FILE_SIZE:
+                    raise ValueError(f"文件过大，超过限制 {MAX_INTERNAL_UPLOAD_FILE_SIZE} bytes")
+                tmp_file.write(chunk)
+
+        raw_content_type = (file_storage.content_type or 'application/octet-stream').split(';')[0].strip()
+        content_type, ext = _detect_file_type(tmp_path, raw_content_type)
+        if ext == '.jpe':
+            ext = '.jpg'
+        if not ext:
+            ext = _safe_ext_from_filename(file_storage.filename)
+        if not ext:
+            ext = '.bin'
+
+        if _is_risky_file_extension(ext):
+            raise ValueError(f"检测到高风险文件类型 {ext}，拒绝上传")
+
+        local_path = os.path.join(today_dir, f"upload-{uuid.uuid4().hex[:8]}{ext}")
+        os.rename(tmp_path, local_path)
+        tmp_path = None
+
+        file_size = os.path.getsize(local_path)
+        return local_path, content_type, file_size
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 # ============= Flask 路由 =============
@@ -1200,7 +1580,8 @@ def wecom_callback(agent_name):
             if msg_type in ('text', 'image', 'file', 'voice', 'mixed'):
                 content = extract_message_content(msg, user_id=from_user,
                                                   encoding_aes_key=agent_cfg['wecom_encoding_aes_key'],
-                                                  shared_dir=agent_cfg.get('shared_dir', ''))
+                                                  shared_dir=agent_cfg.get('shared_dir', ''),
+                                                  agent_name=agent_name)
                 logger.info(f"[{agent_name}] 消息内容: {content[:200]}, from: {from_user}")
 
                 task_id = str(uuid.uuid4())
@@ -1261,6 +1642,87 @@ def admin_list_agents():
     })
 
 
+@app.route('/internal/files/upload', methods=['POST'])
+def internal_upload_file():
+    """内部文件上传接口（供 OpenClaw skill 调用）"""
+    authorized, reason = _verify_internal_upload_auth(request)
+    if not authorized:
+        status_code = 503 if '未配置' in reason else 401
+        return jsonify({'error': reason}), status_code
+
+    upload = request.files.get('file')
+    if upload is None:
+        return jsonify({'error': '缺少文件字段 file'}), 400
+
+    agent_name = request.form.get('agent_name', '').strip()
+    user_id = request.form.get('user_id', '').strip()
+    source = request.form.get('source', 'openclaw-skill').strip() or 'openclaw-skill'
+    msg_type = request.form.get('msg_type', 'internal_upload').strip() or 'internal_upload'
+
+    expires_seconds = None
+    expires_raw = request.form.get('expires_seconds', '').strip()
+    if expires_raw:
+        try:
+            expires_seconds = int(expires_raw)
+        except ValueError:
+            return jsonify({'error': 'expires_seconds 必须是整数'}), 400
+
+    shared_dir = ''
+    if agent_name:
+        agent_cfg = AGENTS.get(agent_name)
+        if not agent_cfg:
+            return jsonify({'error': f'unknown agent: {agent_name}'}), 404
+        shared_dir = agent_cfg.get('shared_dir', '')
+
+    try:
+        local_path, content_type, file_size = _save_internal_uploaded_file(upload)
+
+        publish_result = publish_file(
+            local_path,
+            shared_dir=shared_dir,
+            user_id=user_id,
+            msg_type=msg_type,
+            source_url='internal_upload',
+            agent_name=agent_name,
+            content_type=content_type,
+            source=source,
+            expires_seconds=expires_seconds,
+        )
+
+        file_type = content_type.split('/')[0] if '/' in content_type else content_type
+        log_file_record(
+            user_id,
+            publish_result.get('storage_uri', local_path),
+            os.path.basename(local_path),
+            file_type,
+            content_type,
+            file_size,
+            'internal_upload',
+            msg_type,
+        )
+
+        return jsonify({
+            'status': 'ok',
+            'storage_mode': publish_result.get('storage_mode', FILE_STORAGE_MODE),
+            'storage_uri': publish_result.get('storage_uri', ''),
+            'download_url': publish_result.get('download_url', ''),
+            'expires_at': publish_result.get('expires_at', ''),
+            'display_value': publish_result.get('display_value', ''),
+            'file_name': os.path.basename(local_path),
+            'file_size': file_size,
+            'agent_name': agent_name,
+        })
+    except ValueError as e:
+        logger.warning(f"内部上传参数错误: {e}")
+        return jsonify({'error': str(e)}), 400
+    except (BotoCoreError, ClientError) as e:
+        logger.error(f"内部上传 S3 失败: {e}")
+        return jsonify({'error': '上传到 S3 失败'}), 500
+    except Exception as e:
+        logger.error(f"内部上传失败: {e}")
+        return jsonify({'error': f'上传失败: {e}'}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """健康检查接口"""
@@ -1269,6 +1731,7 @@ def health():
         'timestamp': int(time.time()),
         'service': 'openclaw-wecom-gateway',
         'protocol': OPENCLAW_PROTOCOL,
+        'file_storage_mode': FILE_STORAGE_MODE,
         'agents': len(AGENTS),
         'agent_names': list(AGENTS.keys()),
     })
@@ -1311,6 +1774,9 @@ if __name__ == '__main__':
     logger.info(f"数据库路径: {DB_PATH}")
     logger.info(f"通信协议: {OPENCLAW_PROTOCOL}")
     logger.info(f"超时时间: {OPENCLAW_TIMEOUT}s")
+    logger.info(f"文件存储模式: {FILE_STORAGE_MODE}")
+    if FILE_STORAGE_MODE == 's3':
+        logger.info(f"S3 Bucket: {S3_BUCKET or '(未配置)'}")
     if AGENTS:
         logger.info(f"已加载 {len(AGENTS)} 个 Agent 绑定:")
         for name, cfg in AGENTS.items():

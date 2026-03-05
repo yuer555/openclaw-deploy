@@ -2,3 +2,4 @@ flask==3.0.0
 requests==2.31.0
 pycryptodome==3.19.0
 websocket-client==1.8.0
+boto3==1.37.10

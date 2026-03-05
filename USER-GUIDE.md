@@ -1426,15 +1426,37 @@ sudo crontab -e
 
 ---
 
-### 10.3 环境变量说明
+### 10.3 环境变量说明（必填 / 选填）
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `DB_PATH` | `/opt/openclaw/data/gateway/gateway.db` | SQLite 数据库路径 |
-| `GATEWAY_PORT` | `8000` | Gateway 监听端口 |
-| `OPENCLAW_PROTOCOL` | `ws` | 通信协议（ws/sse/http） |
-| `OPENCLAW_TIMEOUT` | `2700` | OpenClaw 超时时间（秒） |
-| `GATEWAY_URL` | `http://localhost:8000` | Gateway 外部访问地址 |
+#### 通用配置
+
+| 变量 | 默认值 | 是否必填 | 说明 |
+|------|--------|----------|------|
+| `DB_PATH` | `/opt/openclaw/data/gateway/gateway.db` | 是 | SQLite 数据库路径 |
+| `GATEWAY_PORT` | `8000` | 是 | Gateway 监听端口 |
+| `OPENCLAW_PROTOCOL` | `ws` | 否 | 通信协议（ws/sse/http） |
+| `OPENCLAW_TIMEOUT` | `2700` | 否 | OpenClaw 超时时间（秒） |
+| `GATEWAY_URL` | `http://localhost:8000` | 是 | Gateway 对外访问地址（OpenClaw skill 回调依赖） |
+| `FILE_STORAGE_MODE` | `local` | 是 | 文件存储模式（`local` / `s3`） |
+| `FILE_STORAGE_PRESIGN_EXPIRES` | `86400` | 否 | 预签名下载链接有效期（秒） |
+| `MAX_INTERNAL_UPLOAD_FILE_SIZE` | `52428800` | 否 | OpenClaw skill 通过内部接口上传时的大小限制 |
+| `FILE_UPLOAD_INTERNAL_TOKEN` | 空 | 条件必填 | 仅当使用 OpenClaw 上传 skill 时必填 |
+
+#### S3 模式配置（`FILE_STORAGE_MODE=s3`）
+
+| 变量 | 默认值 | 是否必填 | 说明 |
+|------|--------|----------|------|
+| `S3_BUCKET` | 空 | 是 | 目标桶名称 |
+| `S3_ENDPOINT_URL` | 空 | 自建 S3 时是 | 自建 S3/兼容服务地址（例如 `http://minio.xxx:9000`） |
+| `S3_ACCESS_KEY_ID` | 空 | 条件必填 | 无 IAM Role/实例角色时必填 |
+| `S3_SECRET_ACCESS_KEY` | 空 | 条件必填 | 无 IAM Role/实例角色时必填 |
+| `S3_REGION` | `us-east-1` | 建议 | 签名区域，建议与服务端配置一致 |
+| `S3_SIGNATURE_VERSION` | `s3` | 建议 | 自建兼容模式建议 `s3`（等价 Java `S3SignerType`） |
+| `S3_ADDRESSING_STYLE` | `path` | 建议 | 自建兼容模式建议 `path`（等价 Java `withPathStyleAccess(true)`） |
+| `FILE_STORAGE_KEY_PREFIX` | `openclaw-gateway` | 否 | 统一对象 key 前缀 |
+| `S3_KEY_PREFIX` | `openclaw-gateway` | 否 | 兼容旧配置（建议优先用 `FILE_STORAGE_KEY_PREFIX`） |
+| `S3_SSE_MODE` | 空 | 否 | 服务端加密模式（如 `AES256` / `aws:kms`） |
+| `S3_SSE_KMS_KEY_ID` | 空 | 条件必填 | 当 `S3_SSE_MODE=aws:kms` 时必填 |
 
 ---
 
@@ -1481,5 +1503,53 @@ sudo systemctl restart openclaw-gateway
 
 ---
 
-**最后更新**: 2026-03-03
-**版本**: v1.1
+### 10.6 文件存储模式与上传 Skill
+
+默认模式：`FILE_STORAGE_MODE=local`（保持原有本地共享目录行为）。
+
+#### 企业微信回复策略（markdown.content 限制）
+
+- 企业微信主动回复 `markdown.content` 最大为 `20480` 字节（UTF-8）。
+- Gateway 统一按 `20000` 字节阈值做安全截断后再回复。
+- 无论 `local` 还是 `s3`，超长文本都不自动转下载链接。
+
+#### 启用 S3 模式
+
+1. 在 Gateway `.env` 中设置（与 Java 代码兼容推荐）：
+
+```bash
+FILE_STORAGE_MODE=s3
+S3_BUCKET=your-private-bucket
+S3_ENDPOINT_URL=http://your-s3-endpoint:9000
+S3_ACCESS_KEY_ID=your-ak
+S3_SECRET_ACCESS_KEY=your-sk
+S3_REGION=us-east-1
+S3_SIGNATURE_VERSION=s3
+S3_ADDRESSING_STYLE=path
+S3_SSE_MODE=
+
+# 仅当使用 OpenClaw 上传 skill 时需要
+FILE_UPLOAD_INTERNAL_TOKEN=your-random-token
+```
+
+2. 重新执行安装脚本并重启服务：
+
+```bash
+sudo bash bin/02-install-gateway.sh
+bash bin/03-install-openclaw.sh --skip-install
+```
+
+说明：
+- 微信文件会上传到 S3，并把预签名下载链接发给 Agent。
+- OpenClaw 全局 Skill `gateway-file-upload` 会自动安装并启用。
+- 当用户明确要求“上传文件并给下载链接”时，Agent 会调用 `gateway-file-upload` 执行上传。
+- 如果不使用上传 skill，可以不配置 `FILE_UPLOAD_INTERNAL_TOKEN`。
+
+#### local 模式行为
+
+- `FILE_STORAGE_MODE=local` 时，不安装上传 Skill，继续使用本地文件路径。
+
+---
+
+**最后更新**: 2026-03-05
+**版本**: v1.6

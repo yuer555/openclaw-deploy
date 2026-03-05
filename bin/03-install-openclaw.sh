@@ -43,6 +43,10 @@ success() { echo -e "${GREEN}✓${NC} $*"; }
 # ---------------------------------------------------------------------------
 OPENCLAW_HOME="${HOME}/.openclaw"
 OPENCLAW_CONFIG="${OPENCLAW_HOME}/openclaw.json"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GATEWAY_SKILL_NAME="gateway-file-upload"
+GATEWAY_SKILL_SOURCE_DIR="${REPO_ROOT}/openclaw-skills/${GATEWAY_SKILL_NAME}"
+GATEWAY_SKILL_TARGET_DIR="${OPENCLAW_HOME}/skills/${GATEWAY_SKILL_NAME}"
 EDITOR="${EDITOR:-${VISUAL:-nano}}"
 MIN_NODE_VERSION=22
 SKIP_INSTALL=false
@@ -501,6 +505,202 @@ select_option() {
         echo "0"
         return 1
     fi
+}
+
+
+_read_env_file_value() {
+    local env_file="$1"
+    local key="$2"
+    if [[ -z "$env_file" || ! -f "$env_file" ]]; then
+        echo ""
+        return 0
+    fi
+
+python3 - "$env_file" "$key" <<'PYEOF'
+import sys
+
+env_file = sys.argv[1]
+key = sys.argv[2]
+
+try:
+    with open(env_file, 'r', encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            if k.strip() != key:
+                continue
+            value = v.strip().strip('"').strip("'")
+            print(value)
+            break
+except Exception:
+    print('')
+PYEOF
+}
+
+
+_detect_gateway_env_file() {
+    local candidate
+    if [[ -n "${OPENCLAW_GATEWAY_ENV_FILE:-}" && -f "${OPENCLAW_GATEWAY_ENV_FILE}" ]]; then
+        echo "${OPENCLAW_GATEWAY_ENV_FILE}"
+        return 0
+    fi
+
+    for candidate in "/opt/openclaw/gateway/.env" "${REPO_ROOT}/.env" "$(pwd)/.env"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    echo ""
+}
+
+
+_resolve_file_storage_mode() {
+    local mode env_file
+    mode="${FILE_STORAGE_MODE:-}"
+    if [[ -z "$mode" ]]; then
+        env_file="$(_detect_gateway_env_file)"
+        mode="$(_read_env_file_value "$env_file" "FILE_STORAGE_MODE")"
+    fi
+    mode="${mode:-local}"
+    mode="$(echo "$mode" | tr 'A-Z' 'a-z')"
+
+    case "$mode" in
+        local|s3)
+            echo "$mode"
+            ;;
+        *)
+            warn "检测到未知 FILE_STORAGE_MODE=${mode}，回退 local"
+            echo "local"
+            ;;
+    esac
+}
+
+
+_configure_gateway_skill_runtime_env() {
+    local enabled="$1"
+    local gateway_url="$2"
+    local upload_token="$3"
+    local expires_seconds="$4"
+
+    if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
+        warn "未找到 OpenClaw 配置文件或 python3，跳过 Skill 环境写入"
+        return 0
+    fi
+
+python3 - "$OPENCLAW_CONFIG" "$GATEWAY_SKILL_NAME" "$enabled" "$gateway_url" "$upload_token" "$expires_seconds" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+config_path, skill_key, enabled_raw, gateway_url, upload_token, expires_seconds = sys.argv[1:7]
+enabled = enabled_raw.lower() == 'true'
+
+with open(config_path, 'r', encoding='utf-8') as f:
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
+
+skills = config.setdefault('skills', {})
+entries = skills.setdefault('entries', {})
+entry = entries.setdefault(skill_key, {})
+entry['enabled'] = bool(enabled)
+entry_env = entry.setdefault('env', {})
+
+updates = {
+    'OPENCLAW_FILE_UPLOAD_GATEWAY_URL': gateway_url,
+    'OPENCLAW_FILE_UPLOAD_TOKEN': upload_token,
+    'OPENCLAW_FILE_UPLOAD_EXPIRES': expires_seconds,
+}
+
+def apply_env(target):
+    for k, v in updates.items():
+        if enabled and v:
+            target[k] = v
+        else:
+            target.pop(k, None)
+
+apply_env(entry_env)
+
+agents = config.setdefault('agents', {})
+defaults = agents.setdefault('defaults', {})
+default_sandbox = defaults.setdefault('sandbox', {})
+default_docker = default_sandbox.setdefault('docker', {})
+default_env = default_docker.setdefault('env', {})
+apply_env(default_env)
+
+for agent in agents.get('list', []):
+    sandbox = agent.get('sandbox')
+    if not isinstance(sandbox, dict):
+        continue
+    docker = sandbox.setdefault('docker', {})
+    agent_env = docker.setdefault('env', {})
+    apply_env(agent_env)
+
+with open(config_path, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+
+print('ok')
+PYEOF
+}
+
+
+setup_gateway_file_upload_skill() {
+    local mode env_file gateway_url upload_token upload_expires
+    mode="$(_resolve_file_storage_mode)"
+
+    if [[ "$mode" == "local" ]]; then
+        step "FILE_STORAGE_MODE=local，跳过全局上传 Skill 安装"
+        rm -rf "$GATEWAY_SKILL_TARGET_DIR" 2>/dev/null || true
+        _configure_gateway_skill_runtime_env "false" "" "" ""
+        return 0
+    fi
+
+    if [[ ! -d "$GATEWAY_SKILL_SOURCE_DIR" ]]; then
+        error "未找到 Skill 模板目录: $GATEWAY_SKILL_SOURCE_DIR"
+        return 1
+    fi
+
+    mkdir -p "${OPENCLAW_HOME}/skills"
+    rm -rf "$GATEWAY_SKILL_TARGET_DIR"
+    cp -R "$GATEWAY_SKILL_SOURCE_DIR" "$GATEWAY_SKILL_TARGET_DIR"
+    chmod +x "$GATEWAY_SKILL_TARGET_DIR/upload_to_gateway.py" 2>/dev/null || true
+    success "已安装全局 Skill: ${GATEWAY_SKILL_NAME}"
+
+    env_file="$(_detect_gateway_env_file)"
+    gateway_url="${OPENCLAW_FILE_UPLOAD_GATEWAY_URL:-}"
+    upload_token="${OPENCLAW_FILE_UPLOAD_TOKEN:-}"
+    upload_expires="${OPENCLAW_FILE_UPLOAD_EXPIRES:-}"
+
+    if [[ -z "$gateway_url" ]]; then
+        gateway_url="$(_read_env_file_value "$env_file" "GATEWAY_URL")"
+    fi
+    if [[ -z "$upload_token" ]]; then
+        upload_token="$(_read_env_file_value "$env_file" "FILE_UPLOAD_INTERNAL_TOKEN")"
+    fi
+    if [[ -z "$upload_expires" ]]; then
+        upload_expires="$(_read_env_file_value "$env_file" "FILE_STORAGE_PRESIGN_EXPIRES")"
+    fi
+
+    gateway_url="${gateway_url:-http://localhost:8000}"
+    upload_expires="${upload_expires:-86400}"
+
+    if [[ -z "$upload_token" ]]; then
+        warn "未配置 OPENCLAW_FILE_UPLOAD_TOKEN / FILE_UPLOAD_INTERNAL_TOKEN，Skill 调用会失败"
+    fi
+
+    _configure_gateway_skill_runtime_env "true" "$gateway_url" "$upload_token" "$upload_expires"
+    step "已写入 Skill 运行环境（Gateway: ${gateway_url}，Expires: ${upload_expires}s）"
 }
 
 # ============================================================================
@@ -1388,6 +1588,12 @@ final_check() {
             warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
         }
         sleep 2
+    fi
+
+    step "按 FILE_STORAGE_MODE 安装/刷新文件上传 Skill..."
+    if ! setup_gateway_file_upload_skill; then
+        error "文件上传 Skill 配置失败"
+        exit 1
     fi
 
     # 硬校验：沙箱共享目录契约
