@@ -585,20 +585,23 @@ _configure_gateway_skill_runtime_env() {
     local gateway_url="$2"
     local upload_token="$3"
     local expires_seconds="$4"
+    local skills_dir="$5"
 
     if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
         warn "未找到 OpenClaw 配置文件或 python3，跳过 Skill 环境写入"
         return 0
     fi
 
-python3 - "$OPENCLAW_CONFIG" "$GATEWAY_SKILL_NAME" "$enabled" "$gateway_url" "$upload_token" "$expires_seconds" <<'PYEOF'
+python3 - "$OPENCLAW_CONFIG" "$GATEWAY_SKILL_NAME" "$enabled" "$gateway_url" "$upload_token" "$expires_seconds" "$skills_dir" <<'PYEOF'
 import json
 import os
 import re
 import sys
 
-config_path, skill_key, enabled_raw, gateway_url, upload_token, expires_seconds = sys.argv[1:7]
+config_path, skill_key, enabled_raw, gateway_url, upload_token, expires_seconds, skills_dir_raw = sys.argv[1:8]
 enabled = enabled_raw.lower() == 'true'
+skills_dir = os.path.abspath(os.path.expanduser(skills_dir_raw or '~/.openclaw/skills'))
+skills_bind = f"{skills_dir}:{skills_dir}:ro"
 
 with open(config_path, 'r', encoding='utf-8') as f:
     content = f.read()
@@ -630,6 +633,45 @@ def apply_env(target):
         else:
             target.pop(k, None)
 
+
+def _parse_bind_item(item):
+    if isinstance(item, str):
+        parts = item.split(':')
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+        return '', ''
+    if isinstance(item, dict):
+        src = item.get('source') or item.get('src') or ''
+        dst = item.get('target') or item.get('dst') or ''
+        return str(src), str(dst)
+    return '', ''
+
+
+def apply_skill_bind(docker_cfg):
+    if not isinstance(docker_cfg, dict):
+        return
+
+    binds = docker_cfg.get('binds')
+    if not isinstance(binds, list):
+        binds = []
+
+    cleaned = []
+    exists = False
+    for item in binds:
+        src, dst = _parse_bind_item(item)
+        is_skill_bind = (src == skills_dir and dst == skills_dir)
+        if is_skill_bind:
+            exists = True
+            if enabled:
+                cleaned.append(skills_bind)
+            continue
+        cleaned.append(item)
+
+    if enabled and not exists:
+        cleaned.append(skills_bind)
+
+    docker_cfg['binds'] = cleaned
+
 apply_env(entry_env)
 
 agents = config.setdefault('agents', {})
@@ -638,6 +680,7 @@ default_sandbox = defaults.setdefault('sandbox', {})
 default_docker = default_sandbox.setdefault('docker', {})
 default_env = default_docker.setdefault('env', {})
 apply_env(default_env)
+apply_skill_bind(default_docker)
 
 for agent in agents.get('list', []):
     sandbox = agent.get('sandbox')
@@ -646,6 +689,7 @@ for agent in agents.get('list', []):
     docker = sandbox.setdefault('docker', {})
     agent_env = docker.setdefault('env', {})
     apply_env(agent_env)
+    apply_skill_bind(docker)
 
 with open(config_path, 'w', encoding='utf-8') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
@@ -662,7 +706,7 @@ setup_gateway_file_upload_skill() {
     if [[ "$mode" == "local" ]]; then
         step "FILE_STORAGE_MODE=local，跳过全局上传 Skill 安装"
         rm -rf "$GATEWAY_SKILL_TARGET_DIR" 2>/dev/null || true
-        _configure_gateway_skill_runtime_env "false" "" "" ""
+        _configure_gateway_skill_runtime_env "false" "" "" "" "${OPENCLAW_HOME}/skills"
         return 0
     fi
 
@@ -699,8 +743,9 @@ setup_gateway_file_upload_skill() {
         warn "未配置 OPENCLAW_FILE_UPLOAD_TOKEN / FILE_UPLOAD_INTERNAL_TOKEN，Skill 调用会失败"
     fi
 
-    _configure_gateway_skill_runtime_env "true" "$gateway_url" "$upload_token" "$upload_expires"
+    _configure_gateway_skill_runtime_env "true" "$gateway_url" "$upload_token" "$upload_expires" "${OPENCLAW_HOME}/skills"
     step "已写入 Skill 运行环境（Gateway: ${gateway_url}，Expires: ${upload_expires}s）"
+    echo -e "  ${DIM}若沙箱容器已存在，请执行: openclaw sandbox recreate --agent <agent_id>${NC}"
 }
 
 # ============================================================================
@@ -1330,10 +1375,12 @@ _configure_sandbox() {
     local agent_id="$1"
     local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
     local shared_dir="${workspace}/shared"
+    local skills_dir="${OPENCLAW_HOME}/skills"
 
     # 确保共享目录存在。
     # 约定：容器内通过 /app/shared 访问（避免 /workspace 保留挂载前缀冲突）
     mkdir -p "$shared_dir"
+    mkdir -p "$skills_dir"
 
     if cmd_exists python3; then
         python3 << PYEOF
@@ -1352,6 +1399,7 @@ except json.JSONDecodeError:
     config = json.loads(content)
 
 shared_dir = "${shared_dir}"
+skills_dir = "${skills_dir}"
 
 agents_list = config.get("agents", {}).get("list", [])
 for agent in agents_list:
@@ -1364,7 +1412,8 @@ for agent in agents_list:
                 "network": "bridge",
                 "readOnlyRoot": False,
                 "binds": [
-                    f"{shared_dir}:/app/shared:rw"
+                    f"{shared_dir}:/app/shared:rw",
+                    f"{skills_dir}:{skills_dir}:ro"
                 ]
             }
         }

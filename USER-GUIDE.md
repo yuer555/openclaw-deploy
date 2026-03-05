@@ -1542,8 +1542,10 @@ bash bin/03-install-openclaw.sh --skip-install
 说明：
 - 微信文件会上传到 S3，并把预签名下载链接发给 Agent。
 - OpenClaw 全局 Skill `gateway-file-upload` 会自动安装并启用。
+- 对沙箱 Agent，会自动写入 `~/.openclaw/skills` 挂载（`~/.openclaw/skills:~/.openclaw/skills:ro`）。
 - 当用户明确要求“上传文件并给下载链接”时，Agent 会调用 `gateway-file-upload` 执行上传。
 - 如果不使用上传 skill，可以不配置 `FILE_UPLOAD_INTERNAL_TOKEN`。
+- 若该 Agent 的沙箱容器已在运行，需执行 `openclaw sandbox recreate --agent <agent_id>` 使新挂载生效。
 
 #### local 模式行为
 
@@ -1552,4 +1554,4 @@ bash bin/03-install-openclaw.sh --skip-install
 ---
 
 **最后更新**: 2026-03-05
-**版本**: v1.6
+**版本**: v1.7
