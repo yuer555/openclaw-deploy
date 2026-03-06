@@ -88,6 +88,215 @@ done
 # 检查命令是否存在
 cmd_exists() { command -v "$1" &>/dev/null; }
 
+# 打印前置依赖安装指南
+_print_prereq_instructions() {
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  前置依赖安装指南${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${CYAN}▸ cmake / 构建工具${NC}（必须，OpenClaw 原生模块编译依赖）"
+    echo ""
+    if cmd_exists apt-get; then
+        echo "  sudo apt-get install -y cmake build-essential"
+    elif cmd_exists dnf; then
+        echo "  sudo dnf install -y cmake gcc-c++ make"
+    elif cmd_exists yum; then
+        echo "  sudo yum install -y cmake gcc-c++ make"
+    else
+        echo "  # Ubuntu/Debian:"
+        echo "  sudo apt-get install -y cmake build-essential"
+        echo "  # RHEL/Rocky/CentOS:"
+        echo "  sudo dnf install -y cmake gcc-c++ make"
+    fi
+    echo ""
+    echo -e "${CYAN}▸ Node.js ${MIN_NODE_VERSION}+${NC}（OpenClaw 运行时，必须）"
+    echo ""
+    echo "  # 方式一：nvm via Gitee 镜像（国内推荐）"
+    echo "  git clone https://gitee.com/mirrors/nvm.git ~/.nvm"
+    echo "  echo 'export NVM_DIR=\"\$HOME/.nvm\"' >> ~/.bashrc"
+    echo "  echo '[ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"' >> ~/.bashrc"
+    echo "  source ~/.bashrc"
+    echo "  NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node nvm install ${MIN_NODE_VERSION}"
+    echo ""
+    echo "  # 方式二：NodeSource 官方源"
+    if cmd_exists apt-get; then
+        echo "  curl -fsSL https://deb.nodesource.com/setup_${MIN_NODE_VERSION}.x | sudo bash -"
+        echo "  sudo apt-get install -y nodejs"
+    elif cmd_exists dnf || cmd_exists yum; then
+        echo "  curl -fsSL https://rpm.nodesource.com/setup_${MIN_NODE_VERSION}.x | sudo bash -"
+        echo "  sudo yum install -y nodejs"
+    else
+        echo "  # Ubuntu/Debian:"
+        echo "  curl -fsSL https://deb.nodesource.com/setup_${MIN_NODE_VERSION}.x | sudo bash -"
+        echo "  sudo apt-get install -y nodejs"
+        echo "  # RHEL/Rocky/CentOS:"
+        echo "  curl -fsSL https://rpm.nodesource.com/setup_${MIN_NODE_VERSION}.x | sudo bash -"
+        echo "  sudo yum install -y nodejs"
+    fi
+    echo ""
+    echo "  # 国内镜像（阿里云）："
+    echo "  Node.js 二进制: https://mirrors.aliyun.com/nodejs-release/"
+    echo "  安装后配置 npm 镜像: npm config set registry https://registry.npmmirror.com"
+    echo ""
+    echo -e "${CYAN}▸ OpenClaw${NC}（必须）"
+    echo ""
+    echo "  # 方式一：官方安装脚本"
+    echo "  curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash"
+    echo ""
+    echo "  # 方式二：npm 安装（国内可用 npmmirror 加速）"
+    echo "  npm install -g openclaw@2026.02.26"
+    echo "  npm install -g openclaw@2026.02.26 --registry=https://registry.npmmirror.com"
+    echo ""
+    echo -e "${CYAN}▸ Docker${NC}（必须，沙箱 Agent 运行时依赖）"
+    echo ""
+    if cmd_exists apt-get; then
+        echo "  sudo apt-get install -y ca-certificates curl"
+        echo "  sudo install -m 0755 -d /etc/apt/keyrings"
+        echo "  curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg \\"
+        echo "    | sudo tee /etc/apt/keyrings/docker.asc > /dev/null"
+        echo "  echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \\"
+        echo "    https://mirrors.aliyun.com/docker-ce/linux/ubuntu \\"
+        echo "    \$(. /etc/os-release && echo \$VERSION_CODENAME) stable\" \\"
+        echo "    | sudo tee /etc/apt/sources.list.d/docker.list"
+        echo "  sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io"
+        echo "  sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
+        echo "  # 注意：usermod 需重新登录生效，或临时执行: newgrp docker"
+        echo "  sudo yum install -y yum-utils"
+        echo "  sudo yum-config-manager --add-repo \\"
+        echo "    https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo"
+        echo "  sudo yum install -y docker-ce docker-ce-cli containerd.io"
+        echo "  sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
+        echo "  # 注意：usermod 需重新登录生效，或临时执行: newgrp docker"
+    else
+        echo "  # Ubuntu/Debian（阿里云镜像源）:"
+        echo "  sudo apt-get install -y ca-certificates curl"
+        echo "  sudo install -m 0755 -d /etc/apt/keyrings"
+        echo "  curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg \\"
+        echo "    | sudo tee /etc/apt/keyrings/docker.asc > /dev/null"
+        echo "  echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \\"
+        echo "    https://mirrors.aliyun.com/docker-ce/linux/ubuntu \\"
+        echo "    \$(. /etc/os-release && echo \$VERSION_CODENAME) stable\" \\"
+        echo "    | sudo tee /etc/apt/sources.list.d/docker.list"
+        echo "  sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io"
+        echo "  sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
+        echo ""
+        echo "  # RHEL/Rocky/CentOS（阿里云镜像源）:"
+        echo "  sudo yum install -y yum-utils"
+        echo "  sudo yum-config-manager --add-repo \\"
+        echo "    https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo"
+        echo "  sudo yum install -y docker-ce docker-ce-cli containerd.io"
+        echo "  sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
+    fi
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+# 检查前置依赖
+check_prerequisites() {
+    header "第一步：检查前置环境"
+
+    local missing=false
+
+    # --- cmake / 构建工具 ---
+    if cmd_exists cmake; then
+        success "cmake $(cmake --version | head -1 | awk '{print $3}')"
+    else
+        error "未找到 cmake（OpenClaw 原生模块编译依赖）"
+        missing=true
+    fi
+
+    # --- Node.js ---
+    if cmd_exists node; then
+        local node_ver
+        node_ver=$(node -v | sed 's/v//' | cut -d. -f1)
+        if (( node_ver >= MIN_NODE_VERSION )); then
+            success "Node.js $(node -v)"
+        else
+            error "Node.js 版本 $(node -v) 过低，需要 v${MIN_NODE_VERSION}+"
+            missing=true
+        fi
+    else
+        error "未找到 Node.js（需要 v${MIN_NODE_VERSION}+）"
+        missing=true
+    fi
+
+    # --- Docker（必须，沙箱镜像依赖）---
+    if cmd_exists docker; then
+        if docker info &>/dev/null 2>&1; then
+            success "Docker $(docker --version | sed -E 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+        elif sudo docker info &>/dev/null 2>&1; then
+            # daemon 正在运行，但当前用户尚未加入 docker 组（需重新登录生效）
+            echo ""
+            error "Docker 已安装并运行，但当前用户无 socket 访问权限（docker 组尚未生效）"
+            warn "请执行以下任一操作后重新运行本脚本："
+            echo ""
+            echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
+            echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
+            echo ""
+            exit 1
+        else
+            error "未找到 Docker 或 Docker 未运行（必须安装）"
+            missing=true
+        fi
+    else
+        error "未找到 Docker（必须安装）"
+        missing=true
+    fi
+
+    # --- OpenClaw ---
+    if cmd_exists openclaw; then
+        success "OpenClaw v$(openclaw --version 2>/dev/null || echo 'unknown')"
+    else
+        error "未找到 openclaw 命令"
+        missing=true
+    fi
+
+    if [[ "$missing" == "true" ]]; then
+        _print_prereq_instructions
+        error "请安装以上缺失依赖后重新运行本脚本"
+        exit 1
+    fi
+
+    echo ""
+
+    # --- OpenClaw 初始化（首次 or 重置）---
+    if [[ ! -f "$OPENCLAW_CONFIG" ]]; then
+        step "首次初始化 OpenClaw..."
+        echo -e "${DIM}将启动 OpenClaw 交互式配置向导...${NC}"
+        echo ""
+        run_openclaw_onboard
+        success "OpenClaw 初始化完成"
+    else
+        success "OpenClaw 配置已存在: ${OPENCLAW_CONFIG}"
+        echo ""
+        printf "%s" "是否清理当前安装并重新配置? [y/N]: "
+        read -r reinstall_yn </dev/tty
+        if [[ "$reinstall_yn" =~ ^[Yy] ]]; then
+            step "清理当前 OpenClaw 安装..."
+            openclaw gateway stop 2>/dev/null || true
+            cleanup_openclaw_sandbox_containers || warn "历史沙箱容器未完全清理，请稍后手动执行: openclaw sandbox recreate --all --force"
+            rm -rf "$OPENCLAW_HOME"
+            success "清理完成，启动 OpenClaw 初始化向导..."
+            echo ""
+            run_openclaw_onboard
+            success "OpenClaw 初始化完成"
+        fi
+    fi
+
+    # --- 确保 Gateway 已启动 ---
+    ensure_gateway_running
+
+    # --- 对齐 Gateway token（auth/remote）---
+    echo ""
+    step "同步 Gateway token 配置..."
+    sync_gateway_tokens
+    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
+        step "检测到 token 变更，重启 Gateway 使配置生效..."
+        restart_gateway_after_token_change || true
+    fi
+}
+
 # 检测 OpenClaw 托管 Gateway 服务能力（launchd / systemd --user / schtasks）
 get_gateway_service_mode() {
     local os_name
@@ -1110,139 +1319,6 @@ setup_gateway_file_upload_skill() {
 # 第一步：检查环境 & 安装 OpenClaw
 # ============================================================================
 
-check_and_install_openclaw() {
-    header "第一步：检查环境 & 安装 OpenClaw"
-
-    # --- 检查 Node.js ---
-    if cmd_exists node; then
-        local node_version
-        node_version=$(node -v | sed 's/v//' | cut -d. -f1)
-        if (( node_version < MIN_NODE_VERSION )); then
-            error "Node.js 版本 $(node -v) 过低，需要 v${MIN_NODE_VERSION}+"
-            echo "  推荐: nvm install ${MIN_NODE_VERSION} && nvm use ${MIN_NODE_VERSION}"
-            exit 1
-        fi
-        success "Node.js $(node -v)"
-    else
-        error "未找到 Node.js，需要 v${MIN_NODE_VERSION}+"
-        echo "  推荐安装方法:"
-        echo "    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"
-        echo "    nvm install ${MIN_NODE_VERSION}"
-        exit 1
-    fi
-
-    # --- 检查 npm ---
-    if cmd_exists npm; then
-        success "npm $(npm -v)"
-    else
-        error "未找到 npm"
-        exit 1
-    fi
-
-    # --- 检查 Docker（可选，沙箱 agent 需要）---
-    if cmd_exists docker; then
-        if docker info &>/dev/null; then
-            success "Docker $(docker --version | sed -E 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-            if ! ensure_custom_sandbox_image; then
-                error "专用沙箱镜像准备失败，请修复后重试"
-                exit 1
-            fi
-        else
-            warn "Docker 已安装但未运行。沙箱 Agent 需要 Docker"
-        fi
-    else
-        warn "未找到 Docker。沙箱 Agent 需要 Docker，主 Agent 不受影响"
-    fi
-
-    # --- 检查/安装 OpenClaw ---
-    if cmd_exists openclaw; then
-        local current_version
-        current_version=$(openclaw --version 2>/dev/null || echo "unknown")
-        success "OpenClaw 已安装 (v${current_version})"
-
-        echo ""
-        printf "%s" "是否清理当前安装并重新配置? [y/N]: "
-        read -r reinstall_yn </dev/tty
-        if [[ "$reinstall_yn" =~ ^[Yy] ]]; then
-            step "清理当前 OpenClaw 安装..."
-            openclaw gateway stop 2>/dev/null || true
-            cleanup_openclaw_sandbox_containers || warn "历史沙箱容器未完全清理，请稍后手动执行: openclaw sandbox recreate --all --force"
-            rm -rf "$OPENCLAW_HOME"
-            success "清理完成，启动 OpenClaw 初始化向导..."
-            echo ""
-            run_openclaw_onboard
-            success "OpenClaw 初始化完成"
-        fi
-    else
-        step "安装 OpenClaw..."
-        echo ""
-        echo "选择安装方式:"
-        echo "  1) npm install -g openclaw@2026.02.26 (推荐)"
-        echo "  2) curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash"
-        echo ""
-
-        local install_method
-        read -p "请输入选项 [1-2, 默认 2]: " install_method
-        install_method="${install_method:-2}"
-
-        case "$install_method" in
-            1)
-                # 尝试不用 sudo，如果失败再提示
-                if npm install -g openclaw@2026.02.26 2>/dev/null; then
-                    success "OpenClaw 安装成功（用户级）"
-                else
-                    warn "用户级安装失败，需要 sudo 权限"
-                    if sudo -n true 2>/dev/null; then
-                        sudo npm install -g openclaw@2026.02.26
-                    else
-                        error "需要 sudo 权限但无法获取。请手动运行: sudo npm install -g openclaw@2026.02.26"
-                        exit 1
-                    fi
-                fi
-                ;;
-            2)
-                curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash
-                ;;
-            *)
-                warn "无效选项，使用默认方式（curl）"
-                curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash
-                ;;
-        esac
-
-        if ! cmd_exists openclaw; then
-            error "安装失败，请检查输出并重试"
-            error "你可以手动安装："
-            echo "  方式1: sudo npm install -g openclaw@2026.02.26"
-            echo "  方式2: curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash"
-            exit 1
-        fi
-        success "OpenClaw $(openclaw --version) 安装成功"
-    fi
-
-    # --- 首次初始化（如果没有配置文件）---
-    if [[ ! -f "$OPENCLAW_CONFIG" ]]; then
-        step "首次初始化 OpenClaw..."
-        echo -e "${DIM}将启动 OpenClaw 交互式配置向导...${NC}"
-        echo ""
-        run_openclaw_onboard
-        success "OpenClaw 初始化完成"
-    else
-        success "OpenClaw 配置已存在: ${OPENCLAW_CONFIG}"
-    fi
-
-    # --- 确保 gateway 已启动 ---
-    ensure_gateway_running
-
-    # --- 对齐 Gateway token（auth/remote）---
-    echo ""
-    step "同步 Gateway token 配置..."
-    sync_gateway_tokens
-    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
-        step "检测到 token 变更，重启 Gateway 使配置生效..."
-        restart_gateway_after_token_change || true
-    fi
-}
-
 # ============================================================================
 # 第二步：配置模型提供商
 # ============================================================================
@@ -2092,7 +2168,8 @@ main() {
     # 快捷模式
     if [[ "$ADD_AGENT_ONLY" == "true" ]]; then
         if ! cmd_exists openclaw; then
-            error "OpenClaw 未安装，请先运行完整安装流程"
+            error "OpenClaw 未安装，请先完成安装后重新运行"
+            _print_prereq_instructions
             exit 1
         fi
         configure_agents
@@ -2102,7 +2179,8 @@ main() {
 
     if [[ "$ADD_PROVIDER_ONLY" == "true" ]]; then
         if ! cmd_exists openclaw; then
-            error "OpenClaw 未安装，请先运行完整安装流程"
+            error "OpenClaw 未安装，请先完成安装后重新运行"
+            _print_prereq_instructions
             exit 1
         fi
         configure_models
@@ -2112,7 +2190,7 @@ main() {
 
     # 完整流程
     if [[ "$SKIP_INSTALL" != "true" ]]; then
-        check_and_install_openclaw
+        check_prerequisites
     else
         if ! cmd_exists openclaw; then
             error "OpenClaw 未安装，请去掉 --skip-install 运行"
