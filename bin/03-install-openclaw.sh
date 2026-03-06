@@ -1177,8 +1177,8 @@ check_and_install_openclaw() {
         step "安装 OpenClaw..."
         echo ""
         echo "选择安装方式:"
-        echo "  1) npm install -g openclaw@latest (推荐)"
-        echo "  2) curl -fsSL https://openclaw.ai/install.sh | bash"
+        echo "  1) npm install -g openclaw@2026.02.26 (推荐)"
+        echo "  2) curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash"
         echo ""
 
         local install_method
@@ -1188,32 +1188,32 @@ check_and_install_openclaw() {
         case "$install_method" in
             1)
                 # 尝试不用 sudo，如果失败再提示
-                if npm install -g openclaw@latest 2>/dev/null; then
+                if npm install -g openclaw@2026.02.26 2>/dev/null; then
                     success "OpenClaw 安装成功（用户级）"
                 else
                     warn "用户级安装失败，需要 sudo 权限"
                     if sudo -n true 2>/dev/null; then
-                        sudo npm install -g openclaw@latest
+                        sudo npm install -g openclaw@2026.02.26
                     else
-                        error "需要 sudo 权限但无法获取。请手动运行: sudo npm install -g openclaw@latest"
+                        error "需要 sudo 权限但无法获取。请手动运行: sudo npm install -g openclaw@2026.02.26"
                         exit 1
                     fi
                 fi
                 ;;
             2)
-                curl -fsSL https://openclaw.ai/install.sh | bash
+                curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash
                 ;;
             *)
                 warn "无效选项，使用默认方式（curl）"
-                curl -fsSL https://openclaw.ai/install.sh | bash
+                curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash
                 ;;
         esac
 
         if ! cmd_exists openclaw; then
             error "安装失败，请检查输出并重试"
             error "你可以手动安装："
-            echo "  方式1: sudo npm install -g openclaw@latest"
-            echo "  方式2: curl -fsSL https://openclaw.ai/install.sh | bash"
+            echo "  方式1: sudo npm install -g openclaw@2026.02.26"
+            echo "  方式2: curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash"
             exit 1
         fi
         success "OpenClaw $(openclaw --version) 安装成功"
