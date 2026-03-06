@@ -126,7 +126,13 @@ cp .env.example .env
 | `DB_PATH` | `/opt/openclaw/data/gateway/gateway.db` | SQLite 数据库路径 |
 | `GATEWAY_PORT` | `8000` | Gateway 监听端口 |
 | `OPENCLAW_PROTOCOL` | `ws` | 通信协议：`ws` / `sse` / `http` |
-| `OPENCLAW_TIMEOUT` | `2700` | OpenClaw 调用超时（秒） |
+| `OPENCLAW_TIMEOUT` | `180` | 旧版兼容总超时（秒） |
+| `OPENCLAW_CONNECT_TIMEOUT` | `10` | OpenClaw 连接超时（秒） |
+| `OPENCLAW_WS_IDLE_TIMEOUT` | `30` | WS 空闲超时（秒） |
+| `OPENCLAW_WS_TOTAL_TIMEOUT` | `180` | WS 总超时（秒） |
+| `MAX_GATEWAY_WORKERS` | `8` | Gateway 全局 worker 池大小 |
+| `MAX_PER_USER_PENDING` | `1` | 单用户最多等待消息数 |
+| `MAX_QUEUE_WAIT_SECONDS` | `60` | 等待消息最长排队时间（秒） |
 | `GATEWAY_URL` | `http://localhost:8000` | Gateway 地址（管理脚本用于通知重载） |
 
 #### 3. 启动 Gateway

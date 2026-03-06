@@ -189,7 +189,9 @@ OpenClaw Gateway 使用 `ws` 库（Node.js WebSocket 库），**无硬性连接�
 | 组件 | 参数 | 默认值 | 说明 |
 |------|------|--------|------|
 | OpenClaw Agent | `timeout` | **600 秒** (10 分钟) | 单个请求最长处理时间 |
-| Gateway (我们的) | `OPENCLAW_TIMEOUT` | **2700 秒** (45 分钟) | 等待 OpenClaw 回复的超时 |
+| Gateway (我们的) | `OPENCLAW_WS_TOTAL_TIMEOUT` | **180 秒** | 等待 OpenClaw WS 完整回复的总超时 |
+| Gateway (我们的) | `OPENCLAW_WS_IDLE_TIMEOUT` | **30 秒** | WS 空闲超时，长时间无事件直接中断 |
+| Gateway (我们的) | `MAX_PER_USER_PENDING` | **1** | 单用户最多等待 1 条消息 |
 
 **代码位置**：
 - `packages/core/src/gateway/local/command-lanes.ts` - 队列超时
@@ -312,7 +314,11 @@ ulimit -n 65535
 
 **Gateway 配置** (`.env`)：
 ```bash
-OPENCLAW_TIMEOUT=2700
+OPENCLAW_TIMEOUT=180
+OPENCLAW_WS_IDLE_TIMEOUT=30
+OPENCLAW_WS_TOTAL_TIMEOUT=180
+MAX_PER_USER_PENDING=1
+MAX_QUEUE_WAIT_SECONDS=60
 OPENCLAW_PROTOCOL=ws
 ```
 

@@ -1468,7 +1468,16 @@ sudo crontab -e
 | `DB_PATH` | `/opt/openclaw/data/gateway/gateway.db` | 是 | SQLite 数据库路径 |
 | `GATEWAY_PORT` | `8000` | 是 | Gateway 监听端口 |
 | `OPENCLAW_PROTOCOL` | `ws` | 否 | 通信协议（ws/sse/http） |
-| `OPENCLAW_TIMEOUT` | `2700` | 否 | OpenClaw 超时时间（秒） |
+| `OPENCLAW_TIMEOUT` | `180` | 否 | 旧版兼容总超时（秒） |
+| `OPENCLAW_CONNECT_TIMEOUT` | `10` | 否 | OpenClaw 连接超时（秒） |
+| `OPENCLAW_WS_IDLE_TIMEOUT` | `30` | 否 | WS 空闲超时（秒） |
+| `OPENCLAW_WS_TOTAL_TIMEOUT` | `180` | 否 | WS 总超时（秒） |
+| `OPENCLAW_SSE_IDLE_TIMEOUT` | `30` | 否 | SSE 空闲超时（秒） |
+| `OPENCLAW_SSE_TOTAL_TIMEOUT` | `180` | 否 | SSE 总超时（秒） |
+| `OPENCLAW_HTTP_TIMEOUT` | `180` | 否 | HTTP 调用超时（秒） |
+| `MAX_GATEWAY_WORKERS` | `8` | 否 | Gateway 全局 worker 池大小 |
+| `MAX_PER_USER_PENDING` | `1` | 否 | 单用户最多等待消息数 |
+| `MAX_QUEUE_WAIT_SECONDS` | `60` | 否 | 等待消息最大排队时长（秒） |
 | `GATEWAY_URL` | `http://localhost:8000` | 是 | Gateway 对外访问地址（OpenClaw skill 回调依赖） |
 | `FILE_STORAGE_MODE` | `local` | 是 | 文件存储模式（`local` / `s3`） |
 | `FILE_STORAGE_PRESIGN_EXPIRES` | `86400` | 否 | 预签名下载链接有效期（秒） |
@@ -1546,6 +1555,16 @@ sudo systemctl restart openclaw-gateway
 - Gateway 统一按 `20000` 字节阈值做安全截断后再回复。
 - 无论 `local` 还是 `s3`，超长文本都不自动转下载链接。
 
+#### 并发与超时策略
+
+- 同一 `agent + user` 同时只执行 1 条消息。
+- 当前有 1 条执行中时，最多再保留 1 条等待消息；第 3 条会被直接拒绝。
+- 第 1 条被动回复固定为：`已收到，处理中...`
+- 第 2 条等待消息被动回复：`前序任务处理中，已进入等待队列，请稍候...`
+- 队列已满时被动回复：`当前已有任务处理中，请稍后再试`
+- OpenClaw 执行超时后主动回复：`处理超时，请重试。`
+- 等待消息排队超过 `MAX_QUEUE_WAIT_SECONDS` 后，会主动回复：`前序任务处理时间较长，本次请求未执行，请重试。`
+
 #### 启用 S3 模式
 
 1. 在 Gateway `.env` 中设置（与 Java 代码兼容推荐）：
@@ -1587,4 +1606,4 @@ bash bin/03-install-openclaw.sh --skip-install
 ---
 
 **最后更新**: 2026-03-05
-**版本**: v1.9
+**版本**: v2.0

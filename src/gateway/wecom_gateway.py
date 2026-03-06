@@ -14,6 +14,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 import threading
 import queue
+from collections import deque
 import mimetypes
 import zipfile
 import websocket
@@ -76,8 +77,34 @@ _sanitize_requests_tls_env()
 DB_PATH = os.getenv('DB_PATH', '/opt/openclaw/data/gateway/gateway.db')
 
 # 通信协议（全局默认）
-OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '2700'))
+OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '180'))
 OPENCLAW_PROTOCOL = os.getenv('OPENCLAW_PROTOCOL', 'ws')
+
+
+def _read_positive_int_env(name, default_value):
+    """读取正整数环境变量，非法值回退默认值"""
+    raw_value = os.getenv(name, str(default_value)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning(f"环境变量 {name} 非法: {raw_value}，回退默认值 {default_value}")
+        return default_value
+    if value <= 0:
+        logger.warning(f"环境变量 {name} 必须为正整数，回退默认值 {default_value}")
+        return default_value
+    return value
+
+
+OPENCLAW_CONNECT_TIMEOUT = _read_positive_int_env('OPENCLAW_CONNECT_TIMEOUT', 10)
+OPENCLAW_WS_IDLE_TIMEOUT = _read_positive_int_env('OPENCLAW_WS_IDLE_TIMEOUT', 30)
+OPENCLAW_WS_TOTAL_TIMEOUT = _read_positive_int_env('OPENCLAW_WS_TOTAL_TIMEOUT', 180)
+OPENCLAW_SSE_IDLE_TIMEOUT = _read_positive_int_env('OPENCLAW_SSE_IDLE_TIMEOUT', 30)
+OPENCLAW_SSE_TOTAL_TIMEOUT = _read_positive_int_env('OPENCLAW_SSE_TOTAL_TIMEOUT', 180)
+OPENCLAW_HTTP_TIMEOUT = _read_positive_int_env('OPENCLAW_HTTP_TIMEOUT', 180)
+
+MAX_GATEWAY_WORKERS = _read_positive_int_env('MAX_GATEWAY_WORKERS', 8)
+MAX_PER_USER_PENDING = _read_positive_int_env('MAX_PER_USER_PENDING', 1)
+MAX_QUEUE_WAIT_SECONDS = _read_positive_int_env('MAX_QUEUE_WAIT_SECONDS', 60)
 
 # Gateway 端口
 GATEWAY_PORT = int(os.getenv('GATEWAY_PORT', '8000'))
@@ -178,6 +205,19 @@ AGENTS = load_agents_from_db()
 
 # ============= OpenClaw API 通用调用 =============
 
+
+class OpenClawTimeoutError(Exception):
+    """OpenClaw 调用超时"""
+
+    def __init__(self, stage, message):
+        super().__init__(message)
+        self.stage = stage
+
+
+def _timeout_message(stage, seconds):
+    """格式化超时错误消息"""
+    return f"openclaw {stage} 超时（{seconds}s）"
+
 def _extract_reply_text(data):
     """从 /v1/responses 返回数据中提取文本"""
     texts = []
@@ -189,53 +229,67 @@ def _extract_reply_text(data):
     return '\n'.join(texts).strip()
 
 
-def _call_openclaw_sse(url, message, session_key, timeout=2700, token='', agent_id='main'):
+def _call_openclaw_sse(url, message, session_key, timeout=None, token='', agent_id='main'):
     """单次 HTTP SSE 流式调用，返回回复文本。连接异常时抛出异常。"""
-    resp = requests.post(
-        f"{url}/v1/responses",
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-            'x-openclaw-agent-id': agent_id,
-        },
-        json={'model': 'openclaw', 'input': message, 'stream': True, 'user': session_key},
-        timeout=(10, timeout),
-        stream=True,
-    )
-    resp.raise_for_status()
+    start_time = time.monotonic()
+    try:
+        resp = requests.post(
+            f"{url}/v1/responses",
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+                'x-openclaw-agent-id': agent_id,
+            },
+            json={'model': 'openclaw', 'input': message, 'stream': True, 'user': session_key},
+            timeout=(OPENCLAW_CONNECT_TIMEOUT, OPENCLAW_SSE_IDLE_TIMEOUT),
+            stream=True,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.Timeout as e:
+        raise OpenClawTimeoutError('sse_connect', _timeout_message('sse_connect', OPENCLAW_CONNECT_TIMEOUT)) from e
 
     final_data = None
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line or not line.startswith('data: '):
-            continue
-        payload = line[6:]
-        if payload == '[DONE]':
-            break
-        try:
-            evt = json.loads(payload)
-            if evt.get('type') == 'response.completed':
-                final_data = evt.get('response', {})
-        except json.JSONDecodeError:
-            continue
+    try:
+        for line in resp.iter_lines(decode_unicode=True):
+            if time.monotonic() - start_time > OPENCLAW_SSE_TOTAL_TIMEOUT:
+                raise OpenClawTimeoutError('sse_total', _timeout_message('sse_total', OPENCLAW_SSE_TOTAL_TIMEOUT))
+            if not line or not line.startswith('data: '):
+                continue
+            payload = line[6:]
+            if payload == '[DONE]':
+                break
+            try:
+                evt = json.loads(payload)
+                if evt.get('type') == 'response.completed':
+                    final_data = evt.get('response', {})
+            except json.JSONDecodeError:
+                continue
+    except OpenClawTimeoutError:
+        raise
+    except requests.exceptions.Timeout as e:
+        raise OpenClawTimeoutError('sse_idle', _timeout_message('sse_idle', OPENCLAW_SSE_IDLE_TIMEOUT)) from e
 
     if final_data:
         return _extract_reply_text(final_data)
     return ''
 
 
-def _call_openclaw_http(url, message, session_key, timeout=2700, token='', agent_id='main'):
+def _call_openclaw_http(url, message, session_key, timeout=None, token='', agent_id='main'):
     """同步 HTTP POST 调用，不使用流式，直接拿完整 JSON 响应"""
-    resp = requests.post(
-        f"{url}/v1/responses",
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-            'x-openclaw-agent-id': agent_id,
-        },
-        json={'model': 'openclaw', 'input': message, 'user': session_key},
-        timeout=(10, timeout),
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.post(
+            f"{url}/v1/responses",
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+                'x-openclaw-agent-id': agent_id,
+            },
+            json={'model': 'openclaw', 'input': message, 'user': session_key},
+            timeout=(OPENCLAW_CONNECT_TIMEOUT, OPENCLAW_HTTP_TIMEOUT),
+        )
+        resp.raise_for_status()
+    except requests.exceptions.Timeout as e:
+        raise OpenClawTimeoutError('http', _timeout_message('http', OPENCLAW_HTTP_TIMEOUT)) from e
     return _extract_reply_text(resp.json())
 
 
@@ -283,14 +337,20 @@ def _merge_ws_stream_text(accumulated_text, last_piece, current_piece):
     return accumulated_text + current_piece
 
 
-def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_id='main'):
+def _call_openclaw_ws(url, message, session_key, timeout=None, token='', agent_id='main'):
     """WebSocket 协议调用：connect 握手 + chat.send，监听 chat state=final 获取回复"""
     ws_url = url.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
-    # 连接阶段使用短超时（10 秒），避免服务不可达时等待过长
-    ws = websocket.create_connection(ws_url, timeout=10)
+    start_time = time.monotonic()
     try:
-        # 连接成功后切换到长超时（等待 Agent 处理）
-        ws.settimeout(timeout)
+        ws = websocket.create_connection(ws_url, timeout=OPENCLAW_CONNECT_TIMEOUT)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if 'timed out' in err_msg or 'timeout' in err_msg:
+            raise OpenClawTimeoutError('ws_connect', _timeout_message('ws_connect', OPENCLAW_CONNECT_TIMEOUT)) from e
+        raise
+    try:
+        # 连接成功后切换到空闲超时（等待 Agent 处理）
+        ws.settimeout(OPENCLAW_WS_IDLE_TIMEOUT)
         # Step 1: 收 challenge
         ws.recv()
 
@@ -324,7 +384,12 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_i
         accumulated_text = ''
         last_piece = ''
         while True:
-            raw = ws.recv()
+            if time.monotonic() - start_time > OPENCLAW_WS_TOTAL_TIMEOUT:
+                raise OpenClawTimeoutError('ws_total', _timeout_message('ws_total', OPENCLAW_WS_TOTAL_TIMEOUT))
+            try:
+                raw = ws.recv()
+            except websocket.WebSocketTimeoutException as e:
+                raise OpenClawTimeoutError('ws_idle', _timeout_message('ws_idle', OPENCLAW_WS_IDLE_TIMEOUT)) from e
             evt = json.loads(raw)
             if evt.get('type') == 'event' and evt.get('event') == 'chat':
                 payload = evt.get('payload', {})
@@ -352,7 +417,7 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_i
         ws.close()
 
 
-def _call_openclaw(url, message, session_key, timeout=2700, token='', agent_id='main'):
+def _call_openclaw(url, message, session_key, timeout=None, token='', agent_id='main'):
     """统一调用入口，根据 OPENCLAW_PROTOCOL 选择协议"""
     protocol = OPENCLAW_PROTOCOL.lower()
 
@@ -361,30 +426,12 @@ def _call_openclaw(url, message, session_key, timeout=2700, token='', agent_id='
                                    token=token, agent_id=agent_id)
 
     elif protocol == 'ws':
-        try:
-            return _call_openclaw_ws(url, message, session_key, timeout,
-                                     token=token, agent_id=agent_id)
-        except Exception as e:
-            err_msg = str(e)
-            # 确定性错误（认证失败、RPC 错误）不重试
-            if 'connect 失败' in err_msg or 'RPC 错误' in err_msg:
-                raise
-            logger.warning(f"WS 调用失败: {e}，尝试重试")
-            retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
-            return _call_openclaw_ws(url, retry_msg, session_key, timeout,
-                                     token=token, agent_id=agent_id)
+        return _call_openclaw_ws(url, message, session_key, timeout,
+                                 token=token, agent_id=agent_id)
 
     else:  # 默认 sse
-        try:
-            return _call_openclaw_sse(url, message, session_key, timeout,
-                                      token=token, agent_id=agent_id)
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.ReadTimeout) as e:
-            logger.warning(f"SSE 连接断开: {e}，尝试重试")
-            retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
-            return _call_openclaw_sse(url, retry_msg, session_key, timeout,
-                                      token=token, agent_id=agent_id)
+        return _call_openclaw_sse(url, message, session_key, timeout,
+                                  token=token, agent_id=agent_id)
 
 
 _SANDBOX_MOUNT_ERROR_MARKERS = (
@@ -519,7 +566,7 @@ def log_task(task_id, user_id, agent_id, content, status='pending', result=''):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO task_logs (task_id, user_id, agent_id, task_content, status, result) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO task_logs (task_id, user_id, agent_id, task_content, status, result) VALUES (?, ?, ?, ?, ?, ?)",
             (task_id, user_id, agent_id, content, status, result)
         )
         conn.commit()
@@ -1359,49 +1406,162 @@ def extract_message_content(msg, user_id='', encoding_aes_key='', shared_dir='',
     return content
 
 
-# ============= 异步处理（per-user per-agent 消息管道）=============
+# ============= 异步处理（全局 worker 池 + 单用户串行）=============
 
-_user_queues = {}   # queue_key -> queue.Queue
-_user_workers = {}  # queue_key -> Thread
+PASSIVE_REPLY_PROCESSING = '已收到，处理中...'
+PASSIVE_REPLY_QUEUED = '前序任务处理中，已进入等待队列，请稍候...'
+PASSIVE_REPLY_BUSY = '当前已有任务处理中，请稍后再试'
+ACTIVE_REPLY_TIMEOUT = '处理超时，请重试。'
+ACTIVE_REPLY_QUEUE_EXPIRED = '前序任务处理时间较长，本次请求未执行，请重试。'
+ACTIVE_REPLY_SYSTEM_ERROR = '系统异常，请稍后再试。'
+ACTIVE_REPLY_NO_RESPONSE = '处理失败，请稍后再试。'
+
+_dispatch_queue = queue.Queue()
+_user_task_states = {}  # queue_key -> {'running': bool, 'pending': deque()}
+_scheduler_workers = []
+_scheduler_started = False
 _queue_lock = threading.Lock()
 
 
-def _user_worker(queue_key):
-    """单个用户+agent 的消息 worker，串行处理"""
-    q = _user_queues[queue_key]
+def _send_wecom_response(response_url, agent_name, reply_text):
+    """通过 response_url 主动回复企业微信消息"""
+    if not response_url:
+        logger.warning(f"[{agent_name}] response_url 为空，无法主动回复")
+        return False
+
+    wecom_reply = truncate_message(reply_text, max_len=WECOM_MSG_MAX_LEN)
+    payload = {"msgtype": "markdown", "markdown": {"content": wecom_reply}}
+    try:
+        resp = requests.post(response_url, json=payload, timeout=10)
+        logger.info(f"[{agent_name}] 主动回复: {resp.status_code}, 长度: {_utf8_len(wecom_reply)} bytes")
+        return True
+    except Exception as e:
+        logger.error(f"[{agent_name}] 主动回复失败: {e}")
+        return False
+
+
+def _ensure_scheduler_workers():
+    """懒加载固定数量的调度 worker"""
+    global _scheduler_started
+    with _queue_lock:
+        if _scheduler_started:
+            return
+        for index in range(MAX_GATEWAY_WORKERS):
+            worker = threading.Thread(
+                target=_scheduler_worker,
+                name=f'gateway-worker-{index + 1}',
+                daemon=True,
+            )
+            _scheduler_workers.append(worker)
+            worker.start()
+        _scheduler_started = True
+        logger.info(f"已启动 Gateway worker 池，数量={MAX_GATEWAY_WORKERS}")
+
+
+def _build_task(queue_key, user_id, content, task_id, response_url, agent_name):
+    """构造调度任务对象"""
+    return {
+        'queue_key': queue_key,
+        'user_id': user_id,
+        'content': content,
+        'task_id': task_id,
+        'response_url': response_url,
+        'agent_name': agent_name,
+        'enqueued_at': time.time(),
+    }
+
+
+def _schedule_next_task_locked(queue_key):
+    """在持锁状态下调度同一用户的下一条任务"""
+    state = _user_task_states.get(queue_key)
+    if not state:
+        return
+    if state['pending']:
+        next_task = state['pending'].popleft()
+        state['running'] = True
+        _dispatch_queue.put(next_task)
+        logger.info(f"调度下一条任务: {queue_key}, 剩余等待={len(state['pending'])}")
+        return
+    del _user_task_states[queue_key]
+    logger.info(f"队列空闲释放: {queue_key}")
+
+
+def _scheduler_worker():
+    """固定 worker 池，从全局队列获取任务执行"""
     while True:
+        task = _dispatch_queue.get()
+        queue_key = task['queue_key']
         try:
-            task = q.get(timeout=300)
-        except queue.Empty:
-            with _queue_lock:
-                if q.empty():
-                    del _user_queues[queue_key]
-                    del _user_workers[queue_key]
-                    logger.info(f"Worker {queue_key} 空闲退出")
-                    return
-                continue
-        try:
-            _process_single_message(**task)
+            queue_wait_seconds = max(0.0, time.time() - task['enqueued_at'])
+            if queue_wait_seconds > MAX_QUEUE_WAIT_SECONDS:
+                logger.warning(f"队列等待超时: {queue_key}, task_id={task['task_id']}, wait={queue_wait_seconds:.2f}s")
+                update_task_status(task['task_id'], 'queue_expired', f'queue_wait_s={queue_wait_seconds:.2f}')
+                _send_wecom_response(task['response_url'], task['agent_name'], ACTIVE_REPLY_QUEUE_EXPIRED)
+            else:
+                _process_single_message(
+                    user_id=task['user_id'],
+                    content=task['content'],
+                    task_id=task['task_id'],
+                    response_url=task['response_url'],
+                    agent_name=task['agent_name'],
+                    queue_wait_seconds=queue_wait_seconds,
+                )
         except Exception as e:
             logger.error(f"处理消息失败 ({queue_key}): {e}")
         finally:
-            q.task_done()
+            with _queue_lock:
+                _schedule_next_task_locked(queue_key)
+            _dispatch_queue.task_done()
 
 
-def _process_single_message(user_id, content, task_id, response_url, agent_name):
+def _enqueue_message(user_id, content, task_id, response_url, agent_name):
+    """按单用户串行策略入调度器，返回决策结果"""
+    _ensure_scheduler_workers()
+    queue_key = f"{agent_name}:{user_id}"
+    task = _build_task(queue_key, user_id, content, task_id, response_url, agent_name)
+
+    with _queue_lock:
+        state = _user_task_states.get(queue_key)
+        if state is None:
+            _user_task_states[queue_key] = {
+                'running': True,
+                'pending': deque(),
+            }
+            log_task(task_id, user_id, agent_name, content[:200], status='pending', result='run_now')
+            _dispatch_queue.put(task)
+            logger.info(f"消息立即调度: {queue_key}, task_id={task_id}")
+            return 'run_now'
+
+        pending_count = len(state['pending'])
+        if pending_count >= MAX_PER_USER_PENDING:
+            log_task(task_id, user_id, agent_name, content[:200], status='busy_rejected',
+                     result=f'running=1 pending={pending_count}')
+            logger.warning(f"队列已满，拒绝新消息: {queue_key}, task_id={task_id}")
+            return 'reject_busy'
+
+        state['pending'].append(task)
+        pending_position = len(state['pending'])
+        log_task(task_id, user_id, agent_name, content[:200], status='queued',
+                 result=f'pending_position={pending_position}')
+        logger.info(f"消息进入等待队列: {queue_key}, task_id={task_id}, 等待数={pending_position}")
+        return 'queued'
+
+
+def _process_single_message(user_id, content, task_id, response_url, agent_name, queue_wait_seconds=0.0):
     """处理单条消息：调用对应 agent -> 回复"""
     agent_cfg = AGENTS.get(agent_name)
     if not agent_cfg:
         logger.error(f"Agent {agent_name} 不存在（可能已被删除）")
+        update_task_status(task_id, 'error', 'agent_missing')
+        _send_wecom_response(response_url, agent_name, ACTIVE_REPLY_SYSTEM_ERROR)
         return
 
     session_key = f"wecom:{agent_name}:{user_id}"
-    log_task(task_id, user_id, agent_name, content[:200], status='processing')
+    update_task_status(task_id, 'processing', f'queue_wait_s={queue_wait_seconds:.2f}')
 
     try:
         reply = _call_openclaw(
             agent_cfg['openclaw_url'], content, session_key,
-            timeout=OPENCLAW_TIMEOUT,
             token=agent_cfg['openclaw_token'],
             agent_id=agent_cfg['openclaw_agent_id'],
         )
@@ -1411,52 +1571,31 @@ def _process_single_message(user_id, content, task_id, response_url, agent_name)
             recovery_session_key = f"{session_key}:recovery:{uuid.uuid4().hex[:8]}"
             recovery_reply = _call_openclaw(
                 agent_cfg['openclaw_url'], content, recovery_session_key,
-                timeout=OPENCLAW_TIMEOUT,
                 token=agent_cfg['openclaw_token'],
                 agent_id=agent_cfg['openclaw_agent_id'],
             )
             if recovery_reply:
                 reply = recovery_reply
         if not reply:
-            reply = '处理失败，请稍后再试。'
+            reply = ACTIVE_REPLY_NO_RESPONSE
             update_task_status(task_id, 'failed', '无响应')
         else:
             update_task_status(task_id, 'success', reply[:500])
+    except OpenClawTimeoutError as e:
+        logger.warning(f"调用 agent {agent_name} 超时: {e}")
+        reply = ACTIVE_REPLY_TIMEOUT
+        update_task_status(task_id, 'timeout', e.stage)
     except Exception as e:
         logger.error(f"调用 agent {agent_name} 异常: {e}")
-        reply = '系统异常，请联系管理员。'
+        reply = ACTIVE_REPLY_SYSTEM_ERROR
         update_task_status(task_id, 'error', str(e)[:500])
 
-    wecom_reply = truncate_message(reply, max_len=WECOM_MSG_MAX_LEN)
-
-    payload = {"msgtype": "markdown", "markdown": {"content": wecom_reply}}
-    try:
-        resp = requests.post(response_url, json=payload, timeout=10)
-        logger.info(f"[{agent_name}] 主动回复: {resp.status_code}, 长度: {_utf8_len(wecom_reply)} bytes")
-    except Exception as e:
-        logger.error(f"[{agent_name}] 主动回复失败: {e}")
+    _send_wecom_response(response_url, agent_name, reply)
 
 
 def process_message_async(user_id, content, task_id, response_url, agent_name):
-    """将消息放入 agent:user 队列，串行处理"""
-    task = {
-        'user_id': user_id,
-        'content': content,
-        'task_id': task_id,
-        'response_url': response_url,
-        'agent_name': agent_name,
-    }
-    queue_key = f"{agent_name}:{user_id}"
-    with _queue_lock:
-        if queue_key not in _user_queues:
-            _user_queues[queue_key] = queue.Queue()
-            t = threading.Thread(target=_user_worker, args=(queue_key,), daemon=True)
-            _user_workers[queue_key] = t
-            t.start()
-            logger.info(f"创建 worker: {queue_key}")
-        _user_queues[queue_key].put(task)
-        qsize = _user_queues[queue_key].qsize()
-    logger.info(f"消息已入队: {queue_key}, task_id={task_id}, 队列长度={qsize}")
+    """将消息放入调度器，返回决策结果"""
+    return _enqueue_message(user_id, content, task_id, response_url, agent_name)
 
 
 # ============= 消息去重 =============
@@ -1619,10 +1758,16 @@ def wecom_callback(agent_name):
 
                 task_id = str(uuid.uuid4())
 
-                processing_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": "正在处理，请稍候..."}})
-                reply_pkg = crypto.build_reply(processing_msg, int(timestamp), nonce)
+                decision = process_message_async(from_user, content, task_id, response_url, agent_name)
+                if decision == 'run_now':
+                    passive_text = PASSIVE_REPLY_PROCESSING
+                elif decision == 'queued':
+                    passive_text = PASSIVE_REPLY_QUEUED
+                else:
+                    passive_text = PASSIVE_REPLY_BUSY
 
-                process_message_async(from_user, content, task_id, response_url, agent_name)
+                processing_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": passive_text}})
+                reply_pkg = crypto.build_reply(processing_msg, int(timestamp), nonce)
 
                 if reply_pkg:
                     return jsonify(reply_pkg), 200
@@ -1765,6 +1910,8 @@ def health():
         'service': 'openclaw-wecom-gateway',
         'protocol': OPENCLAW_PROTOCOL,
         'file_storage_mode': FILE_STORAGE_MODE,
+        'active_user_queues': len(_user_task_states),
+        'dispatch_queue_size': _dispatch_queue.qsize(),
         'agents': len(AGENTS),
         'agent_names': list(AGENTS.keys()),
     })
@@ -1786,14 +1933,36 @@ def stats():
         cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'failed'")
         failed_tasks = cursor.fetchone()[0]
 
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'timeout'")
+        timeout_tasks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'queue_expired'")
+        queue_expired_tasks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'busy_rejected'")
+        busy_rejected_tasks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'queued'")
+        queued_tasks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'processing'")
+        processing_tasks = cursor.fetchone()[0]
+
         conn.close()
 
         return jsonify({
             'total_tasks': total_tasks,
             'success_tasks': success_tasks,
             'failed_tasks': failed_tasks,
+            'timeout_tasks': timeout_tasks,
+            'queue_expired_tasks': queue_expired_tasks,
+            'busy_rejected_tasks': busy_rejected_tasks,
+            'queued_tasks': queued_tasks,
+            'processing_tasks': processing_tasks,
             'success_rate': f"{success_tasks / total_tasks * 100:.2f}%" if total_tasks > 0 else "0%",
             'agents': len(AGENTS),
+            'active_user_queues': len(_user_task_states),
+            'dispatch_queue_size': _dispatch_queue.qsize(),
             'timestamp': int(time.time())
         })
     except Exception as e:
@@ -1806,7 +1975,18 @@ if __name__ == '__main__':
     logger.info("OpenClaw 企业微信桥接网关启动中...")
     logger.info(f"数据库路径: {DB_PATH}")
     logger.info(f"通信协议: {OPENCLAW_PROTOCOL}")
-    logger.info(f"超时时间: {OPENCLAW_TIMEOUT}s")
+    logger.info(f"旧版超时兼容值: {OPENCLAW_TIMEOUT}s")
+    logger.info(
+        "OpenClaw 超时配置: "
+        f"connect={OPENCLAW_CONNECT_TIMEOUT}s, "
+        f"ws_idle={OPENCLAW_WS_IDLE_TIMEOUT}s, ws_total={OPENCLAW_WS_TOTAL_TIMEOUT}s, "
+        f"sse_idle={OPENCLAW_SSE_IDLE_TIMEOUT}s, sse_total={OPENCLAW_SSE_TOTAL_TIMEOUT}s, "
+        f"http={OPENCLAW_HTTP_TIMEOUT}s"
+    )
+    logger.info(
+        f"队列配置: workers={MAX_GATEWAY_WORKERS}, "
+        f"per_user_pending={MAX_PER_USER_PENDING}, queue_wait={MAX_QUEUE_WAIT_SECONDS}s"
+    )
     logger.info(f"文件存储模式: {FILE_STORAGE_MODE}")
     if FILE_STORAGE_MODE == 's3':
         logger.info(f"S3 Bucket: {S3_BUCKET or '(未配置)'}")
