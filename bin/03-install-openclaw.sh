@@ -49,6 +49,9 @@ OPENCLAW_SANDBOX_DOCKERFILE="${OPENCLAW_SANDBOX_DOCKERFILE:-${REPO_ROOT}/bin/ope
 GATEWAY_SKILL_NAME="gateway-file-upload"
 GATEWAY_SKILL_SOURCE_DIR="${REPO_ROOT}/openclaw-skills/${GATEWAY_SKILL_NAME}"
 GATEWAY_SKILL_TARGET_DIR="${OPENCLAW_HOME}/skills/${GATEWAY_SKILL_NAME}"
+OPENCLAW_GATEWAY_RUN_PID_FILE="${OPENCLAW_HOME}/gateway-run.pid"
+OPENCLAW_GATEWAY_RUN_LOG_FILE="${OPENCLAW_HOME}/gateway-run.log"
+OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG=""
 EDITOR="${EDITOR:-${VISUAL:-nano}}"
 MIN_NODE_VERSION=22
 SKIP_INSTALL=false
@@ -84,6 +87,196 @@ done
 
 # 检查命令是否存在
 cmd_exists() { command -v "$1" &>/dev/null; }
+
+# 检测 OpenClaw 托管 Gateway 服务能力（launchd / systemd --user / schtasks）
+get_gateway_service_mode() {
+    local os_name
+    os_name="$(uname -s 2>/dev/null || echo unknown)"
+
+    case "$os_name" in
+        Darwin)
+            echo "launchd"
+            ;;
+        Linux)
+            if ! cmd_exists systemctl; then
+                echo "none"
+                return 0
+            fi
+
+            if systemctl --user show-environment >/dev/null 2>&1; then
+                echo "systemd-user"
+            else
+                echo "none"
+            fi
+            ;;
+        CYGWIN*|MINGW*|MSYS*)
+            echo "schtasks"
+            ;;
+        *)
+            echo "none"
+            ;;
+    esac
+}
+
+
+gateway_service_supported() {
+    [[ "$(get_gateway_service_mode)" != "none" ]]
+}
+
+
+gateway_start_hint() {
+    if gateway_service_supported; then
+        echo "openclaw gateway start"
+    else
+        echo "openclaw gateway run"
+    fi
+}
+
+
+resolve_onboard_daemon_skip_flag() {
+    local help_text
+
+    if [[ -n "$OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG" ]]; then
+        echo "$OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG"
+        return 0
+    fi
+
+    help_text="$(openclaw onboard --help 2>&1 || true)"
+    if echo "$help_text" | grep -q -- "--no-install-daemon"; then
+        OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG="--no-install-daemon"
+    elif echo "$help_text" | grep -q -- "--skip-daemon"; then
+        OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG="--skip-daemon"
+    else
+        OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG="unsupported"
+    fi
+
+    echo "$OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG"
+}
+
+
+run_openclaw_onboard() {
+    local skip_flag
+
+    if gateway_service_supported; then
+        openclaw onboard --install-daemon
+        return 0
+    fi
+
+    warn "当前环境没有可用的 OpenClaw 托管服务能力（常见于 systemctl --user 不可用），将跳过 daemon 安装"
+    skip_flag="$(resolve_onboard_daemon_skip_flag)"
+
+    case "$skip_flag" in
+        --no-install-daemon|--skip-daemon)
+            openclaw onboard "$skip_flag"
+            ;;
+        *)
+            warn "当前 OpenClaw 版本不支持跳过 daemon 安装参数，请在向导中手动跳过服务安装"
+            openclaw onboard
+            ;;
+    esac
+}
+
+
+start_gateway_run_fallback() {
+    local pid=""
+
+    mkdir -p "$OPENCLAW_HOME"
+
+    if [[ -f "$OPENCLAW_GATEWAY_RUN_PID_FILE" ]]; then
+        pid="$(cat "$OPENCLAW_GATEWAY_RUN_PID_FILE" 2>/dev/null || true)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            step "检测到兼容模式 Gateway 已在运行（PID: ${pid}）"
+            return 0
+        fi
+        rm -f "$OPENCLAW_GATEWAY_RUN_PID_FILE"
+    fi
+
+    nohup openclaw gateway run >"$OPENCLAW_GATEWAY_RUN_LOG_FILE" 2>&1 &
+    pid=$!
+    echo "$pid" > "$OPENCLAW_GATEWAY_RUN_PID_FILE"
+    sleep 3
+
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && openclaw health &>/dev/null; then
+        success "已用兼容模式启动 Gateway（后台执行 openclaw gateway run）"
+        echo -e "  ${DIM}日志: ${OPENCLAW_GATEWAY_RUN_LOG_FILE}${NC}"
+        return 0
+    fi
+
+    warn "兼容模式 Gateway 启动后仍未通过健康检查，请查看日志: ${OPENCLAW_GATEWAY_RUN_LOG_FILE}"
+    return 1
+}
+
+
+restart_gateway_run_fallback() {
+    local pid=""
+
+    if [[ -f "$OPENCLAW_GATEWAY_RUN_PID_FILE" ]]; then
+        pid="$(cat "$OPENCLAW_GATEWAY_RUN_PID_FILE" 2>/dev/null || true)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" >/dev/null 2>&1 || true
+            sleep 1
+        fi
+        rm -f "$OPENCLAW_GATEWAY_RUN_PID_FILE"
+        start_gateway_run_fallback
+        return $?
+    fi
+
+    if openclaw health &>/dev/null; then
+        warn "当前环境未使用托管服务，若 Gateway 已在运行，请手动重启当前进程使新 token 生效"
+        return 0
+    fi
+
+    start_gateway_run_fallback
+}
+
+
+ensure_gateway_running() {
+    local start_hint
+    start_hint="$(gateway_start_hint)"
+
+    step "检查 Gateway 状态..."
+    if openclaw health &>/dev/null; then
+        success "Gateway 已在运行"
+        return 0
+    fi
+
+    if gateway_service_supported; then
+        step "启动 Gateway 服务..."
+        openclaw gateway start >/dev/null 2>&1 || true
+    else
+        warn "当前环境不可用托管服务，改为后台执行: ${start_hint}"
+        start_gateway_run_fallback || {
+            warn "Gateway 兼容启动失败，请稍后手动运行: ${start_hint}"
+            return 0
+        }
+    fi
+
+    sleep 3
+    if openclaw health &>/dev/null; then
+        success "Gateway 启动成功"
+    else
+        warn "Gateway 启动失败，Agent 创建可能受影响，请稍后手动运行: ${start_hint}"
+    fi
+}
+
+
+restart_gateway_after_token_change() {
+    if gateway_service_supported; then
+        openclaw gateway restart >/dev/null 2>&1 || {
+            warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
+            return 1
+        }
+        sleep 2
+        return 0
+    fi
+
+    restart_gateway_run_fallback || {
+        warn "Gateway 兼容模式重启失败，请手动重启当前 openclaw gateway run 进程"
+        return 1
+    }
+    sleep 2
+    return 0
+}
 
 # JSON5 配置读取（通过 openclaw config get）
 config_get() { openclaw config get "$1" 2>/dev/null || echo ""; }
@@ -180,6 +373,11 @@ _status_has_token_mismatch() {
 repair_gateway_service_token_if_needed() {
     # 如果 service token 与 config token 漂移，自动执行 gateway install --force 修复
     local status_output
+
+    if ! gateway_service_supported; then
+        return 0
+    fi
+
     status_output="$(openclaw gateway status 2>&1 || true)"
 
     if ! _status_has_token_mismatch "$status_output"; then
@@ -203,6 +401,16 @@ repair_gateway_service_token_if_needed() {
 hard_check_gateway_token_health() {
     # 硬校验：gateway status 必须 RPC ok，doctor 不得出现 token stale/mismatch
     local status_output doctor_output
+
+    if ! gateway_service_supported; then
+        step "当前环境未启用托管 Gateway 服务，跳过 service token / doctor 硬校验"
+        if openclaw health >/dev/null 2>&1; then
+            success "Gateway 直连健康检查通过"
+        else
+            warn "Gateway 当前未运行，已跳过服务级 token 校验"
+        fi
+        return 0
+    fi
 
     # 先尝试自动修复 service token 漂移（不影响已健康场景）
     if ! repair_gateway_service_token_if_needed; then
@@ -962,7 +1170,7 @@ check_and_install_openclaw() {
             rm -rf "$OPENCLAW_HOME"
             success "清理完成，启动 OpenClaw 初始化向导..."
             echo ""
-            openclaw onboard --install-daemon
+            run_openclaw_onboard
             success "OpenClaw 初始化完成"
         fi
     else
@@ -1016,26 +1224,14 @@ check_and_install_openclaw() {
         step "首次初始化 OpenClaw..."
         echo -e "${DIM}将启动 OpenClaw 交互式配置向导...${NC}"
         echo ""
-        openclaw onboard --install-daemon
+        run_openclaw_onboard
         success "OpenClaw 初始化完成"
     else
         success "OpenClaw 配置已存在: ${OPENCLAW_CONFIG}"
     fi
 
     # --- 确保 gateway 已启动 ---
-    step "检查 Gateway 状态..."
-    if openclaw health &>/dev/null; then
-        success "Gateway 已在运行"
-    else
-        step "启动 Gateway..."
-        openclaw gateway start &>/dev/null &
-        sleep 3
-        if openclaw health &>/dev/null; then
-            success "Gateway 启动成功"
-        else
-            warn "Gateway 启动失败，Agent 创建可能受影响，请稍后手动运行: openclaw gateway start"
-        fi
-    fi
+    ensure_gateway_running
 
     # --- 对齐 Gateway token（auth/remote）---
     echo ""
@@ -1043,10 +1239,7 @@ check_and_install_openclaw() {
     sync_gateway_tokens
     if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
         step "检测到 token 变更，重启 Gateway 使配置生效..."
-        openclaw gateway restart >/dev/null 2>&1 || {
-            warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
-        }
-        sleep 2
+        restart_gateway_after_token_change || true
     fi
 }
 
@@ -1837,7 +2030,7 @@ final_check() {
     if openclaw health 2>/dev/null; then
         success "OpenClaw Gateway 运行正常"
     else
-        warn "OpenClaw Gateway 未运行。启动命令: openclaw gateway start"
+        warn "OpenClaw Gateway 未运行。启动命令: $(gateway_start_hint)"
     fi
 
     # 对于 --skip-install / --add-agent 模式，也要确保 token 配置对齐
@@ -1845,10 +2038,7 @@ final_check() {
     sync_gateway_tokens
     if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
         step "检测到 token 变更，重启 Gateway 使配置生效..."
-        openclaw gateway restart >/dev/null 2>&1 || {
-            warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
-        }
-        sleep 2
+        restart_gateway_after_token_change || true
     fi
 
     step "按 FILE_STORAGE_MODE 安装/刷新文件上传 Skill..."
@@ -1872,12 +2062,14 @@ final_check() {
     fi
 
     echo ""
+    local gateway_start_cmd
+    gateway_start_cmd="$(gateway_start_hint)"
     echo -e "${BOLD}${GREEN}╔══════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${GREEN}║    OpenClaw 配置完成!                ║${NC}"
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════╝${NC}"
     echo ""
     echo "后续操作:"
-    echo -e "  ${CYAN}1.${NC} 启动 OpenClaw:       ${DIM}openclaw gateway start${NC}"
+    echo -e "  ${CYAN}1.${NC} 启动 OpenClaw:       ${DIM}${gateway_start_cmd}${NC}"
     echo -e "  ${CYAN}2.${NC} 部署企微 Gateway:    ${DIM}sudo bash bin/02-install-gateway.sh${NC}"
     echo -e "  ${CYAN}3.${NC} 更新代码后同步部署: ${DIM}sudo bash bin/02-install-gateway.sh${NC}"
     echo -e "  ${CYAN}4.${NC} 添加企微 Agent 绑定: ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"

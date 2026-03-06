@@ -102,7 +102,7 @@ bash bin/03-install-openclaw.sh --add-provider
 | **1** | 通过 npm 全局安装，需要 Node.js 22+。如果无全局写权限会自动提示 sudo |
 | **2** | 官方安装脚本，自动处理依赖和 PATH 配置（**推荐新手使用**） |
 
-安装完成后会自动运行 `openclaw onboard --install-daemon` 进入 **OpenClaw 初始化向导**（见 [2.1.6](#216-openclaw-onboard-初始化向导)）。
+安装完成后会自动运行 OpenClaw 初始化向导：若当前环境支持托管服务，则使用 `openclaw onboard --install-daemon`；若检测到 `systemctl --user` 不可用等情况，则自动改为跳过 daemon 安装的兼容模式（见 [2.1.6](#216-openclaw-onboard-初始化向导)）。
 
 #### 场景 B：OpenClaw 已安装
 
@@ -364,7 +364,7 @@ Agent ID (英文标识, 如 development, testing, service): development
 
 ### 2.1.6 OpenClaw onboard 初始化向导
 
-首次安装 OpenClaw 或选择"清理重新配置"时，会自动运行 `openclaw onboard --install-daemon`。这是 OpenClaw 官方的交互式初始化向导，主要完成以下配置：
+首次安装 OpenClaw 或选择"清理重新配置"时，脚本会自动运行 OpenClaw 官方的交互式初始化向导；若当前环境支持托管服务则安装 daemon，否则自动跳过 daemon 安装以避免 `systemctl --user` 类报错。向导主要完成以下配置：
 
 #### 步骤 1：选择运行模式
 
@@ -416,7 +416,7 @@ Select [1-3]: _
 
 #### 步骤 4：安装 Daemon
 
-向导自动注册系统服务（Linux 下为 systemd，macOS 下为 launchd），使 OpenClaw Gateway 开机自启。
+若当前环境支持托管服务，向导会自动注册系统服务（Linux 下为 systemd，macOS 下为 launchd），使 OpenClaw Gateway 开机自启；若当前环境不支持，则脚本会跳过此步骤，并提示使用 `openclaw gateway run` 兼容启动。
 
 #### 完成
 
