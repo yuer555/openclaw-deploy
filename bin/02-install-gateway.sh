@@ -23,6 +23,61 @@ LOG_DIR="/var/log/openclaw"
 VENV_DIR="/opt/openclaw/gateway/venv"
 FALLBACK_ENV_FILE="/opt/openclaw/.env"
 
+sanitize_tls_env_file() {
+    local env_file="$1"
+    [ -f "$env_file" ] || return 0
+
+    local removed
+    removed=$(python3 - "$env_file" <<'PYEOF'
+import os
+import sys
+
+env_file = sys.argv[1]
+target_keys = {"REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE"}
+
+with open(env_file, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+new_lines = []
+removed = []
+
+for raw in lines:
+    stripped = raw.strip()
+    if not stripped or stripped.startswith('#') or '=' not in stripped:
+        new_lines.append(raw)
+        continue
+
+    key, value = stripped.split('=', 1)
+    key = key.strip()
+
+    if key not in target_keys:
+        new_lines.append(raw)
+        continue
+
+    value = value.strip().strip('"').strip("'")
+    if value and os.path.isfile(value):
+        new_lines.append(raw)
+        continue
+
+    removed.append(f"{key}={value}")
+
+if removed:
+    with open(env_file, 'w', encoding='utf-8') as f:
+        f.writelines(new_lines)
+
+for item in removed:
+    print(item)
+PYEOF
+)
+
+    if [ -n "$removed" ]; then
+        while IFS= read -r item; do
+            [ -n "$item" ] || continue
+            echo "   ⚠️  清理无效 TLS 配置: $item ($env_file)"
+        done <<< "$removed"
+    fi
+}
+
 # 使用调用 sudo 的实际用户运行 Gateway（与 OpenClaw 共用同一用户，避免权限问题）
 RUN_USER="${SUDO_USER:-$(whoami)}"
 RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"
@@ -132,6 +187,10 @@ else
     echo "   .env 已存在，跳过"
 fi
 
+# 自动清理无效 TLS 证书路径（避免 requests 报 invalid certifi/cacert.pem）
+sanitize_tls_env_file "$INSTALL_DIR/.env"
+sanitize_tls_env_file "$FALLBACK_ENV_FILE"
+
 echo "   ✅ 代码文件复制完成"
 
 # 步骤 6: 创建 venv 并安装 Python 依赖
@@ -145,6 +204,21 @@ else
 fi
 "$VENV_DIR/bin/pip" install -q --upgrade pip
 "$VENV_DIR/bin/pip" install -q -r "$INSTALL_DIR/src/gateway/requirements.txt"
+
+# certifi 偶发损坏会导致 requests 报 "invalid path .../certifi/cacert.pem"
+if ! "$VENV_DIR/bin/python" - <<'PYEOF'
+import os
+import certifi
+path = certifi.where()
+if not path or not os.path.isfile(path):
+    raise SystemExit(1)
+print(path)
+PYEOF
+then
+    echo "   ⚠️  检测到 certifi CA 路径异常，尝试修复..."
+    "$VENV_DIR/bin/pip" install -q --force-reinstall certifi
+fi
+
 echo "   ✅ Python 依赖安装完成"
 
 # 步骤 7: 设置权限

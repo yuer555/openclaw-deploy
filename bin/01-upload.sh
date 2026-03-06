@@ -117,7 +117,8 @@ echo "  bin/                          — 部署步骤脚本"
 echo "    ├── 02-install-gateway.sh"
 echo "    ├── 03-install-openclaw.sh"
 echo "    ├── 04-manage-agent.sh"
-echo "    └── 05-cleanup.sh"
+echo "    ├── 05-cleanup.sh"
+echo "    └── openclaw-sandbox-devtools.Dockerfile"
 echo "  scripts/                      — 工具脚本"
 echo "    ├── manage-agent.py"
 echo "    ├── gateway-ctl.sh"
@@ -167,6 +168,9 @@ cp "${PROJECT_ROOT}/src/gateway/requirements.txt" "${STAGING}/src/gateway/"
 print_info "复制部署步骤脚本..."
 mkdir -p "${STAGING}/bin"
 for f in "${PROJECT_ROOT}/bin/"*.sh; do
+    [ -f "$f" ] && cp "$f" "${STAGING}/bin/"
+done
+for f in "${PROJECT_ROOT}/bin/"*.Dockerfile; do
     [ -f "$f" ] && cp "$f" "${STAGING}/bin/"
 done
 

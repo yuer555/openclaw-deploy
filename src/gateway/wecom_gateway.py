@@ -37,6 +37,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_requests_tls_env():
+    """修复失效 TLS 证书路径，避免 requests 因无效 cacert 路径报错"""
+    for env_key in ('REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE'):
+        env_value = os.getenv(env_key, '').strip()
+        if env_value and not os.path.isfile(env_value):
+            logger.warning(f"检测到无效 {env_key}={env_value}，已忽略并回退系统证书")
+            os.environ.pop(env_key, None)
+
+    try:
+        import requests.adapters as req_adapters
+        default_ca = getattr(req_adapters, 'DEFAULT_CA_BUNDLE_PATH', '')
+        if default_ca and os.path.isfile(default_ca):
+            return
+
+        fallback_paths = [
+            '/etc/ssl/certs/ca-certificates.crt',
+            '/etc/pki/tls/certs/ca-bundle.crt',
+            '/etc/ssl/cert.pem',
+        ]
+        for path in fallback_paths:
+            if os.path.isfile(path):
+                req_adapters.DEFAULT_CA_BUNDLE_PATH = path
+                logger.warning(f"requests 默认 CA 路径无效，已回退到系统证书: {path}")
+                return
+
+        logger.error("未找到可用系统 CA 证书文件，HTTPS 请求可能失败")
+    except Exception as e:
+        logger.warning(f"初始化 TLS 证书路径失败: {e}")
+
+
+_sanitize_requests_tls_env()
+
 # ============= 配置（从环境变量读取）=============
 
 # 数据库配置
