@@ -133,6 +133,35 @@ gateway_start_hint() {
 }
 
 
+process_is_running() {
+    local pid="$1"
+    local process_state=""
+
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+
+    if cmd_exists ps; then
+        process_state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -z "$process_state" || "$process_state" == *Z* ]]; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+
+start_gateway_run_process() {
+    if cmd_exists setsid; then
+        setsid openclaw gateway run >"$OPENCLAW_GATEWAY_RUN_LOG_FILE" 2>&1 < /dev/null &
+    else
+        nohup openclaw gateway run >"$OPENCLAW_GATEWAY_RUN_LOG_FILE" 2>&1 < /dev/null &
+    fi
+
+    echo "$!"
+}
+
+
 resolve_onboard_daemon_skip_flag() {
     local help_text
 
@@ -184,19 +213,18 @@ start_gateway_run_fallback() {
 
     if [[ -f "$OPENCLAW_GATEWAY_RUN_PID_FILE" ]]; then
         pid="$(cat "$OPENCLAW_GATEWAY_RUN_PID_FILE" 2>/dev/null || true)"
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if process_is_running "$pid"; then
             step "检测到兼容模式 Gateway 已在运行（PID: ${pid}）"
             return 0
         fi
         rm -f "$OPENCLAW_GATEWAY_RUN_PID_FILE"
     fi
 
-    nohup openclaw gateway run >"$OPENCLAW_GATEWAY_RUN_LOG_FILE" 2>&1 &
-    pid=$!
+    pid="$(start_gateway_run_process)"
     echo "$pid" > "$OPENCLAW_GATEWAY_RUN_PID_FILE"
     sleep 3
 
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && openclaw health &>/dev/null; then
+    if process_is_running "$pid" && openclaw health &>/dev/null; then
         success "已用兼容模式启动 Gateway（后台执行 openclaw gateway run）"
         echo -e "  ${DIM}日志: ${OPENCLAW_GATEWAY_RUN_LOG_FILE}${NC}"
         return 0
@@ -212,7 +240,7 @@ restart_gateway_run_fallback() {
 
     if [[ -f "$OPENCLAW_GATEWAY_RUN_PID_FILE" ]]; then
         pid="$(cat "$OPENCLAW_GATEWAY_RUN_PID_FILE" 2>/dev/null || true)"
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if process_is_running "$pid"; then
             kill "$pid" >/dev/null 2>&1 || true
             sleep 1
         fi
