@@ -78,14 +78,9 @@ PYEOF
     fi
 }
 
-# 使用调用 sudo 的实际用户运行 Gateway（与 OpenClaw 共用同一用户，避免权限问题）
-RUN_USER="${SUDO_USER:-$(whoami)}"
+# 已是 root 时直接以 root 运行，通过 sudo 时使用实际调用用户
+RUN_USER="${SUDO_USER:-root}"
 RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"
-if [ "$RUN_USER" = "root" ]; then
-    echo "错误: 请使用 sudo 运行（不要直接以 root 登录运行）"
-    echo "用法: sudo bash $0"
-    exit 1
-fi
 echo "Gateway 将以用户 $RUN_USER:$RUN_GROUP 运行"
 
 # 步骤 1: 检测操作系统
