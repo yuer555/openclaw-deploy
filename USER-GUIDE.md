@@ -259,30 +259,63 @@ Agent ID (英文标识, 如 development, testing, service): development
 | **显示名称** | 日志和统计中展示的名称，可以是中文 |
 | **Docker 沙箱** | 启用后 Agent 在 Docker 容器内执行代码。需要服务器已安装 Docker |
 
+安装脚本会优先检查并构建专用沙箱镜像：`openclaw-sandbox:gateway-devtools-bookworm`。
+- 镜像已存在：跳过构建。
+- 镜像不存在：自动执行 `docker build` 构建。
+
 启用沙箱后自动写入以下配置：
 
 ```json
 {
+  "id": "development",
+  "name": "development",
+  "workspace": "~/.openclaw/workspace-development",
+  "agentDir": "~/.openclaw/agents/development/agent",
+  "identity": {
+    "name": "development"
+  },
   "sandbox": {
     "mode": "all",
-    "scope": "agent",
     "workspaceAccess": "rw",
+    "scope": "agent",
     "docker": {
+      "image": "openclaw-sandbox:gateway-devtools-bookworm",
       "network": "bridge",
       "readOnlyRoot": false,
       "binds": [
         "<workspace>/shared:/app/shared:rw"
-      ]
+      ],
+      "env": {
+        "OPENCLAW_FILE_UPLOAD_GATEWAY_URL": "http://your-gateway:8000",
+        "OPENCLAW_FILE_UPLOAD_TOKEN": "***",
+        "OPENCLAW_FILE_UPLOAD_EXPIRES": "86400"
+      },
+      "setupCommand": "apt-get update && apt-get install -y git curl"
     }
+  },
+  "tools": {
+    "allow": [
+      "group:fs",
+      "group:runtime",
+      "group:memory",
+      "group:sessions"
+    ],
+    "deny": [
+      "apply_patch"
+    ]
   }
 }
 ```
 
 | 字段 | 值 | 说明 |
 |------|-----|------|
+| `image` | `openclaw-sandbox:gateway-devtools-bookworm` | 安装脚本自动构建的专用开发镜像（存在则跳过构建） |
 | `network` | `bridge` | 容器需要联网（API 调用等） |
 | `readOnlyRoot` | `false` | 容器根文件系统可写 |
 | `binds` | `<workspace>/shared:/app/shared:rw` | 显式挂载共享目录，容器内固定路径 `/app/shared` |
+| `setupCommand` | `apt-get update && apt-get install -y git curl` | 新容器首次创建后执行，补齐常用工具 |
+| `tools.allow` | `group:fs/group:runtime/group:memory/group:sessions` | Agent 允许的工具分组 |
+| `tools.deny` | `apply_patch` | 禁止危险补丁工具 |
 
 共享文件目录默认位于 `~/.openclaw/workspace-<agent_id>/shared`，容器内通过 `/app/shared` 访问。
 
@@ -1554,4 +1587,4 @@ bash bin/03-install-openclaw.sh --skip-install
 ---
 
 **最后更新**: 2026-03-05
-**版本**: v1.8
+**版本**: v1.9

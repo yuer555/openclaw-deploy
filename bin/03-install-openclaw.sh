@@ -44,6 +44,8 @@ success() { echo -e "${GREEN}✓${NC} $*"; }
 OPENCLAW_HOME="${HOME}/.openclaw"
 OPENCLAW_CONFIG="${OPENCLAW_HOME}/openclaw.json"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OPENCLAW_SANDBOX_IMAGE="${OPENCLAW_SANDBOX_IMAGE:-openclaw-sandbox:gateway-devtools-bookworm}"
+OPENCLAW_SANDBOX_DOCKERFILE="${OPENCLAW_SANDBOX_DOCKERFILE:-${REPO_ROOT}/bin/openclaw-sandbox-devtools.Dockerfile}"
 GATEWAY_SKILL_NAME="gateway-file-upload"
 GATEWAY_SKILL_SOURCE_DIR="${REPO_ROOT}/openclaw-skills/${GATEWAY_SKILL_NAME}"
 GATEWAY_SKILL_TARGET_DIR="${OPENCLAW_HOME}/skills/${GATEWAY_SKILL_NAME}"
@@ -554,6 +556,42 @@ cleanup_openclaw_sandbox_containers() {
 }
 
 
+ensure_custom_sandbox_image() {
+    # 构建专用沙箱镜像（存在则跳过）
+    if ! cmd_exists docker; then
+        warn "未找到 Docker，跳过专用沙箱镜像构建"
+        return 0
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        warn "Docker 未运行，跳过专用沙箱镜像构建"
+        return 0
+    fi
+
+    if docker image inspect "$OPENCLAW_SANDBOX_IMAGE" >/dev/null 2>&1; then
+        success "检测到专用沙箱镜像已存在: ${OPENCLAW_SANDBOX_IMAGE}"
+        return 0
+    fi
+
+    if [[ ! -f "$OPENCLAW_SANDBOX_DOCKERFILE" ]]; then
+        error "未找到专用沙箱镜像 Dockerfile: ${OPENCLAW_SANDBOX_DOCKERFILE}"
+        return 1
+    fi
+
+    step "构建专用沙箱镜像: ${OPENCLAW_SANDBOX_IMAGE}"
+    if docker build \
+        -t "$OPENCLAW_SANDBOX_IMAGE" \
+        -f "$OPENCLAW_SANDBOX_DOCKERFILE" \
+        "$REPO_ROOT"; then
+        success "专用沙箱镜像构建成功: ${OPENCLAW_SANDBOX_IMAGE}"
+        return 0
+    fi
+
+    error "专用沙箱镜像构建失败: ${OPENCLAW_SANDBOX_IMAGE}"
+    return 1
+}
+
+
 _read_env_file_value() {
     local env_file="$1"
     local key="$2"
@@ -897,6 +935,10 @@ check_and_install_openclaw() {
     if cmd_exists docker; then
         if docker info &>/dev/null; then
             success "Docker $(docker --version | sed -E 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+            if ! ensure_custom_sandbox_image; then
+                error "专用沙箱镜像准备失败，请修复后重试"
+                exit 1
+            fi
         else
             warn "Docker 已安装但未运行。沙箱 Agent 需要 Docker"
         fi
@@ -1460,6 +1502,10 @@ PYEOF
 
     # 配置沙箱（非 main agent）
     if [[ "$use_sandbox" == "true" && "$agent_id" != "main" ]]; then
+        if ! ensure_custom_sandbox_image; then
+            error "专用沙箱镜像准备失败，无法为 Agent '${agent_id}' 配置沙箱"
+            return 1
+        fi
         step "配置 Docker 沙箱..."
         _configure_sandbox "$agent_id" "$agent_name"
     fi
@@ -1498,6 +1544,7 @@ _configure_sandbox() {
     local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
     local agent_dir="${OPENCLAW_HOME}/agents/${agent_id}/agent"
     local shared_dir="${workspace}/shared"
+    local sandbox_image="$OPENCLAW_SANDBOX_IMAGE"
     local storage_mode
     storage_mode="$(_resolve_file_storage_mode)"
     _resolve_gateway_skill_runtime_values
@@ -1508,13 +1555,13 @@ _configure_sandbox() {
     mkdir -p "$agent_dir"
 
     if cmd_exists python3; then
-        python3 - "$OPENCLAW_CONFIG" "$agent_id" "$agent_name_input" "$workspace" "$agent_dir" "$shared_dir" "$storage_mode" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES" <<'PYEOF'
+        python3 - "$OPENCLAW_CONFIG" "$agent_id" "$agent_name_input" "$workspace" "$agent_dir" "$shared_dir" "$sandbox_image" "$storage_mode" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES" <<'PYEOF'
 import json
 import os
 import re
 import sys
 
-config_path, agent_id, agent_name_raw, workspace, agent_dir, shared_dir, storage_mode, gateway_url, upload_token, upload_expires = sys.argv[1:11]
+config_path, agent_id, agent_name_raw, workspace, agent_dir, shared_dir, sandbox_image, storage_mode, gateway_url, upload_token, upload_expires = sys.argv[1:12]
 agent_name = (agent_name_raw or agent_id or '').strip() or agent_id
 
 with open(config_path, "r") as f:
@@ -1550,6 +1597,7 @@ target["identity"] = {"name": agent_name}
 docker_cfg = {
     "readOnlyRoot": False,
     "network": "bridge",
+    "image": sandbox_image,
     "binds": [
         f"{shared_dir}:/app/shared:rw"
     ],
@@ -1569,6 +1617,11 @@ target["sandbox"] = {
     "scope": "agent",
     "docker": docker_cfg,
 }
+
+defaults = agents_cfg.setdefault("defaults", {})
+default_sandbox = defaults.setdefault("sandbox", {})
+default_docker = default_sandbox.setdefault("docker", {})
+default_docker["image"] = sandbox_image
 
 target["tools"] = {
     "allow": [
