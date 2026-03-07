@@ -199,11 +199,38 @@ check_prerequisites() {
     if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
         OPENCLAW_GATEWAY_TOKEN="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 32)"
         export OPENCLAW_GATEWAY_TOKEN
-        step "已生成固定 Gateway Token: ${OPENCLAW_GATEWAY_TOKEN:0:16}..."
-        echo ""
-        echo -e "${YELLOW}提示：将以下内容添加到 ~/.bashrc 或 ~/.zshrc 以永久保存：${NC}"
-        echo -e "${DIM}export OPENCLAW_GATEWAY_TOKEN=\"${OPENCLAW_GATEWAY_TOKEN}\"${NC}"
-        echo ""
+
+        # 检测用户使用的 shell
+        local shell_rc=""
+        if [[ -n "${BASH_VERSION:-}" ]]; then
+            shell_rc="$HOME/.bashrc"
+        elif [[ -n "${ZSH_VERSION:-}" ]]; then
+            shell_rc="$HOME/.zshrc"
+        else
+            # 回退：检查 SHELL 环境变量
+            case "${SHELL:-}" in
+                */bash) shell_rc="$HOME/.bashrc" ;;
+                */zsh)  shell_rc="$HOME/.zshrc" ;;
+                *)      shell_rc="$HOME/.profile" ;;
+            esac
+        fi
+
+        # 写入 shell 配置文件
+        if [[ -n "$shell_rc" ]]; then
+            if ! grep -q "OPENCLAW_GATEWAY_TOKEN" "$shell_rc" 2>/dev/null; then
+                echo "" >> "$shell_rc"
+                echo "# OpenClaw Gateway Token (auto-generated)" >> "$shell_rc"
+                echo "export OPENCLAW_GATEWAY_TOKEN=\"${OPENCLAW_GATEWAY_TOKEN}\"" >> "$shell_rc"
+                success "已生成 Gateway Token 并写入 ${shell_rc}"
+                step "Token 预览: ${OPENCLAW_GATEWAY_TOKEN:0:16}..."
+                echo ""
+                warn "请执行以下命令使环境变量立即生效："
+                echo -e "${DIM}source ${shell_rc}${NC}"
+                echo ""
+            else
+                step "检测到 ${shell_rc} 中已有 OPENCLAW_GATEWAY_TOKEN，跳过写入"
+            fi
+        fi
     else
         step "使用已有 Gateway Token: ${OPENCLAW_GATEWAY_TOKEN:0:16}..."
     fi
@@ -548,39 +575,30 @@ PYEOF
 
 
 sync_gateway_tokens() {
-    # 对齐 gateway.auth.token 与 gateway.remote.token，避免 token mismatch
-    local auth_token remote_token desired_token
+    # 将 gateway.auth.token 与 gateway.remote.token 设置为环境变量引用
+    local auth_token remote_token
     GATEWAY_TOKEN_SYNC_CHANGED=false
 
     auth_token=$(_read_token_from_config_file "auth")
     remote_token=$(_read_token_from_config_file "remote")
-    desired_token="$auth_token"
 
-    if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
-        desired_token="$OPENCLAW_GATEWAY_TOKEN"
-        if [[ "$auth_token" != "$desired_token" ]]; then
-            config_set "gateway.auth.token" "$desired_token"
-            auth_token="$desired_token"
-            GATEWAY_TOKEN_SYNC_CHANGED=true
-            step "已将 gateway.auth.token 对齐到 OPENCLAW_GATEWAY_TOKEN"
-        fi
-    fi
-
-    if [[ -z "$desired_token" ]]; then
-        warn "未检测到 gateway.auth.token，无法自动对齐 remote.token"
-        return 0
-    fi
-
-    if [[ "$remote_token" != "$desired_token" ]]; then
-        config_set "gateway.remote.token" "$desired_token"
+    # 检查是否已经是环境变量引用格式
+    if [[ "$auth_token" != "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+        config_set "gateway.auth.token" "\${OPENCLAW_GATEWAY_TOKEN}"
         GATEWAY_TOKEN_SYNC_CHANGED=true
-        step "已将 gateway.remote.token 对齐到 gateway.auth.token"
+        step "已将 gateway.auth.token 设置为环境变量引用"
+    fi
+
+    if [[ "$remote_token" != "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+        config_set "gateway.remote.token" "\${OPENCLAW_GATEWAY_TOKEN}"
+        GATEWAY_TOKEN_SYNC_CHANGED=true
+        step "已将 gateway.remote.token 设置为环境变量引用"
     fi
 
     if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
-        success "Gateway token 已对齐（auth/remote）"
+        success "Gateway token 已设置为环境变量引用"
     else
-        step "Gateway token 已对齐，无需调整"
+        step "Gateway token 已是环境变量引用，无需调整"
     fi
 }
 
