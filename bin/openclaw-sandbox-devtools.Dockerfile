@@ -1,4 +1,5 @@
-FROM debian:bookworm-slim
+ARG OPENCLAW_SANDBOX_BASE_IMAGE=debian:bookworm-slim
+FROM ${OPENCLAW_SANDBOX_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
@@ -7,10 +8,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     UV_SYSTEM_PYTHON=1
-
-# 配置国内 APT 镜像源（阿里云）
-RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources \
- && sed -i 's/security.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

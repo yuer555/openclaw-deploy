@@ -22,6 +22,7 @@ DATA_DIR="/opt/openclaw/data"
 LOG_DIR="/var/log/openclaw"
 VENV_DIR="/opt/openclaw/gateway/venv"
 FALLBACK_ENV_FILE="/opt/openclaw/.env"
+SHARED_ROOT="/app/shared"
 
 sanitize_tls_env_file() {
     local env_file="$1"
@@ -228,9 +229,12 @@ echo "   ✅ Python 依赖安装完成"
 # 步骤 7: 设置权限
 echo ""
 echo "🔐 步骤 7/8: 设置文件权限..."
+mkdir -p "$SHARED_ROOT"
 chown -R "$RUN_USER:$RUN_GROUP" "$INSTALL_DIR"
 chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
 chown -R "$RUN_USER:$RUN_GROUP" "$LOG_DIR"
+chown "$RUN_USER:$RUN_GROUP" "$SHARED_ROOT"
+chmod 775 "$SHARED_ROOT"
 if [ -f "$INSTALL_DIR/.env" ]; then
     chmod 600 "$INSTALL_DIR/.env"
 fi
@@ -240,6 +244,7 @@ fi
 chmod +x "$INSTALL_DIR/scripts/manage-agent.py"
 chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
 chmod +x "$INSTALL_DIR/bin/"*.sh 2>/dev/null || true
+echo "   ✅ 共享目录已就绪: $SHARED_ROOT"
 echo "   ✅ 权限设置完成"
 
 # 步骤 8: 安装并启动 systemd 服务

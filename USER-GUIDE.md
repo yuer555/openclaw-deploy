@@ -11,8 +11,10 @@
 | 1. 上传代码 | `bin/01-upload.sh` | 本地 | 打包项目文件并上传到服务器 |
 | 2. 安装 Gateway | `sudo bash bin/02-install-gateway.sh` | 服务器 | 安装 Python 依赖、配置 systemd 服务 |
 | 3. 安装 OpenClaw | `bash bin/03-install-openclaw.sh` | 服务器 | 安装 OpenClaw、配置模型和 Agent |
-| 4. 添加 Agent 绑定 | `bin/04-manage-agent.sh add <name>` | 服务器 | 绑定企业微信机器人到 OpenClaw Agent |
+| 4. 添加 Agent 绑定 | `bin/04-manage-agent.sh add [agent_id]` | 服务器 | 绑定企业微信机器人到 OpenClaw Agent，`agent_id` 同时作为路由名 |
 | 5. 清理环境 | `sudo bash bin/05-cleanup.sh` | 服务器 | 卸载服务 / 清空 OpenClaw / 全部重置 |
+
+> 权限规则：`02`、`05` 需要 `sudo`；`03`、`04` 必须使用**普通用户**运行，不能用 `sudo`、不能用 `root`。
 
 ---
 
@@ -85,7 +87,7 @@ bash bin/03-install-openclaw.sh --add-provider
 
 ### 2.1.1 第一步：检查环境 & 安装 OpenClaw
 
-脚本会自动检测 Node.js (22+)、npm、Docker，然后进入安装流程。
+脚本会自动检测 Node.js (22+)、npm；Docker 仅在你创建沙箱 Agent 时才需要。
 
 #### 场景 A：OpenClaw 未安装
 
@@ -250,6 +252,7 @@ API 协议格式:
 
 Agent ID (英文标识, 如 development, testing, service): development
 显示名称 (直接回车使用 Agent ID: development): 开发助手
+说明: 仅启用沙箱时才需要 Docker 和专用沙箱镜像；非沙箱 Agent 无需 Docker。
 是否启用 Docker 沙箱? (直接回车默认 Yes) [Y/n]: _
 ```
 
@@ -257,11 +260,53 @@ Agent ID (英文标识, 如 development, testing, service): development
 |------|------|
 | **Agent ID** | 英文标识符，用于 API 调用和配置引用 |
 | **显示名称** | 日志和统计中展示的名称，可以是中文 |
-| **Docker 沙箱** | 启用后 Agent 在 Docker 容器内执行代码。需要服务器已安装 Docker |
+| **Docker 沙箱** | 启用后 Agent 在 Docker 容器内执行代码。仅沙箱 Agent 需要 Docker |
 
-安装脚本会优先检查并构建专用沙箱镜像：`openclaw-sandbox:gateway-devtools-bookworm`。
-- 镜像已存在：跳过构建。
-- 镜像不存在：自动执行 `docker build` 构建。
+如果你选择启用沙箱，脚本会检查 Docker 和专用沙箱镜像是否已准备好：
+- 已准备好：继续创建 Agent。
+- 未准备好：输出安装 Docker、配置镜像加速、构建沙箱镜像的命令；执行完成后重新运行脚本。
+
+沙箱准备命令（仅沙箱 Agent 需要）：
+
+```bash
+# 1) 安装 Docker（Ubuntu / Debian）
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg \
+  | sudo tee /etc/apt/keyrings/docker.asc > /dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+  https://mirrors.aliyun.com/docker-ce/linux/ubuntu \
+  $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker
+
+# 2) 配置镜像加速（腾讯云机器优先）
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json > /dev/null <<'JSON'
+{
+  "registry-mirrors": [
+    "https://mirror.ccs.tencentyun.com",
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com"
+  ]
+}
+JSON
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+docker info | sed -n '/Registry Mirrors/,$p'
+
+# 3) 构建专用沙箱镜像
+docker build \
+  --build-arg OPENCLAW_SANDBOX_BASE_IMAGE=debian:bookworm-slim \
+  -t openclaw-sandbox:gateway-devtools-bookworm \
+  -f bin/openclaw-sandbox-devtools.Dockerfile \
+  .
+docker image inspect openclaw-sandbox:gateway-devtools-bookworm
+```
 
 启用沙箱后自动写入以下配置：
 
@@ -283,7 +328,7 @@ Agent ID (英文标识, 如 development, testing, service): development
       "network": "bridge",
       "readOnlyRoot": false,
       "binds": [
-        "<workspace>/shared:/app/shared:rw"
+        "/home/ubuntu/.openclaw/workspace-development/shared:/app/shared/development:rw"
       ],
       "env": {
         "OPENCLAW_FILE_UPLOAD_GATEWAY_URL": "http://your-gateway:8000",
@@ -309,15 +354,15 @@ Agent ID (英文标识, 如 development, testing, service): development
 
 | 字段 | 值 | 说明 |
 |------|-----|------|
-| `image` | `openclaw-sandbox:gateway-devtools-bookworm` | 安装脚本自动构建的专用开发镜像（存在则跳过构建） |
+| `image` | `openclaw-sandbox:gateway-devtools-bookworm` | 需提前准备好的专用沙箱镜像；脚本仅检查，不自动构建 |
 | `network` | `bridge` | 容器需要联网（API 调用等） |
 | `readOnlyRoot` | `false` | 容器根文件系统可写 |
-| `binds` | `<workspace>/shared:/app/shared:rw` | 显式挂载共享目录，容器内固定路径 `/app/shared` |
+| `binds` | `~/.openclaw/workspace-<agent_id>/shared:/app/shared/<agent_id>:rw` | 显式挂载 workspace 内共享目录到 agent 固定对外路径 |
 | `setupCommand` | `apt-get update && apt-get install -y git curl` | 新容器首次创建后执行，补齐常用工具 |
 | `tools.allow` | `group:fs/group:runtime/group:memory/group:sessions` | Agent 允许的工具分组 |
 | `tools.deny` | `apply_patch` | 禁止危险补丁工具 |
 
-共享文件目录默认位于 `~/.openclaw/workspace-<agent_id>/shared`，容器内通过 `/app/shared` 访问。
+Gateway 对外下发的共享文件路径固定为 `/app/shared/<agent_id>`；宿主机上该路径通过软链指向 `~/.openclaw/workspace-<agent_id>/shared`。
 
 创建完成后同样会询问是否编辑人格设定。子 Agent 的模型配置（`auth-profiles.json`、`models.json`）会自动从主 Agent 同步。
 
@@ -329,11 +374,15 @@ Agent ID (英文标识, 如 development, testing, service): development
 
 ```
 企业微信 Gateway 连接 OpenClaw 所需信息:
-  OPENCLAW_URL=ws://localhost:18789
-  OPENCLAW_TOKEN=1e443bcba0ed1327...
+  Gateway URL: http://localhost:18789
+  Gateway Token: 1e443bcba0ed1327...
 
-在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。
-不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。
+在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 Gateway 地址和 Gateway Token。
+新规则下 `agent_id` 同时作为：
+- OpenClaw agent_id
+- Gateway 路由名
+- SQLite `agents.name`
+- Agent 对外共享路径 `/app/shared/<agent_id>`
 ```
 
 **记下这两个值**，后面添加企微 Agent 绑定时需要。
@@ -344,8 +393,10 @@ Agent ID (英文标识, 如 development, testing, service): development
 
 脚本自动执行：
 - 列出所有已配置的 Agent
-- 列出所有已配置的模型
-- OpenClaw Gateway 健康检查
+- OpenClaw 健康检查
+- 同步 Gateway token 配置
+- 按 `FILE_STORAGE_MODE` 刷新文件上传 Skill
+- 校验共享目录契约和 token 健康状态
 
 ```
 ╔══════════════════════════════════════╗
@@ -355,7 +406,7 @@ Agent ID (英文标识, 如 development, testing, service): development
 后续操作:
   1. 启动 OpenClaw:       openclaw gateway start
   2. 部署企微 Gateway:    sudo bash bin/02-install-gateway.sh
-  3. 添加企微 Agent 绑定: /opt/openclaw/gateway/bin/04-manage-agent.sh add <name>
+  3. 添加企微 Agent 绑定: /opt/openclaw/gateway/bin/04-manage-agent.sh add [agent_id]
   4. 查看 Agent 列表:     /opt/openclaw/gateway/bin/04-manage-agent.sh list
   5. 查看 OpenClaw 面板:  openclaw dashboard
 ```
@@ -463,8 +514,94 @@ cat ~/.openclaw/openclaw.json | grep -A 5 gateway
 ```
 
 ⚠️ **记下这两个值，后面要用**：
-- **OpenClaw 地址**: `http://localhost:18789` （或服务器 IP）
-- **OpenClaw Token**: `你的长串token`
+- **Gateway 地址（OpenClaw 服务地址）**: `http://localhost:18789` （或服务器 IP）
+- **Gateway Token（OpenClaw token）**: `你的长串token`
+
+---
+
+### 2.2.1 如果你是自行部署 OpenClaw（不使用 `03` 脚本）
+
+当前代码对 `agent_id`、路由名和本地共享目录采用**强绑定设计**。如果你是手工安装 OpenClaw、手工编辑 `~/.openclaw/openclaw.json`，请务必满足以下约束，否则 `local` 文件模式下 Agent 会拿不到正确路径。
+
+#### 强绑定规则
+
+1. **`agent_id` = Gateway 路由名 = SQLite `agents.name`**
+   - 例如你在 `04-manage-agent.sh` 里添加的是 `team-dev`
+   - 那么 OpenClaw 里的 agent 也必须叫 `team-dev`
+   - 企业微信回调地址就是 `https://your-domain/team-dev/wecom/callback`
+
+2. **Gateway 对外共享路径固定为 `/app/shared/<agent_id>`**
+   - 例如 `team-dev` 对应 `/app/shared/team-dev`
+   - 宿主机上这个路径应软链到真实目录：`~/.openclaw/workspace-team-dev/shared`
+   - Gateway 在 `FILE_STORAGE_MODE=local` 时，会把文件路径直接下发为这个绝对路径下的文件
+
+3. **沙箱 Agent 必须使用“workspace 内 source + 固定 target”绑定**
+   - 推荐 `scope: "agent"`
+   - `binds` 必须包含：
+     ```json
+     ["~/.openclaw/workspace-team-dev/shared:/app/shared/team-dev:rw"]
+     ```
+   - 这样 bind source 位于 allowed roots 内，容器里仍统一看到 `/app/shared/team-dev`
+
+4. **非沙箱 Agent 不需要额外 bind**
+   - 因为 Agent 直接运行在宿主机
+   - 只要 OpenClaw 进程本身有权限访问 `/app/shared/<agent_id>`（软链路径）即可
+
+5. **`/app/shared` 必须提前创建并放权**
+   - 至少保证 Gateway 和 OpenClaw 运行用户可读写
+   - 推荐：
+     ```bash
+     sudo mkdir -p /app/shared
+     sudo chown <运行用户>:<运行组> /app/shared
+     sudo chmod 775 /app/shared
+     ```
+
+#### 手工配置最小示例
+
+假设你的 agent 是 `team-dev`，且启用了 Docker 沙箱：
+
+```json
+{
+  "id": "team-dev",
+  "name": "team-dev",
+  "workspace": "/home/ubuntu/.openclaw/workspace-team-dev",
+  "agentDir": "/home/ubuntu/.openclaw/agents/team-dev/agent",
+  "sandbox": {
+    "mode": "all",
+    "workspaceAccess": "rw",
+    "scope": "agent",
+    "docker": {
+      "image": "openclaw-sandbox:gateway-devtools-bookworm",
+      "binds": [
+        "/home/ubuntu/.openclaw/workspace-team-dev/shared:/app/shared/team-dev:rw"
+      ]
+    }
+  }
+}
+```
+
+然后再执行：
+
+```bash
+mkdir -p ~/.openclaw/workspace-team-dev/shared
+sudo mkdir -p /app/shared
+sudo ln -s ~/.openclaw/workspace-team-dev/shared /app/shared/team-dev
+/opt/openclaw/gateway/bin/04-manage-agent.sh add team-dev
+```
+
+#### 什么时候必须重新建沙箱容器？
+
+- 你修改了 `sandbox.docker.binds`
+- 你切换了 `FILE_STORAGE_MODE`
+- 你给 Agent 新增了上传 Skill 相关环境变量
+
+这几种情况都建议执行：
+
+```bash
+openclaw sandbox recreate --agent <agent_id>
+```
+
+> 注意：如果你把 sandbox `scope` 改成 `shared`，每个 Agent 的自定义 bind 可能不会按预期生效。当前项目文档和脚本都按 `scope: "agent"` 设计。
 
 ---
 
@@ -650,7 +787,7 @@ curl http://localhost:8000/health
 
 **URL 格式**：
 ```
-https://你的域名/{agent_name}/wecom/callback
+https://你的域名/{agent_id}/wecom/callback
 ```
 
 **示例**：
@@ -660,7 +797,7 @@ https://ai.yourcompany.com/team-dev/wecom/callback
 
 **填写步骤**：
 
-1. **URL 填入** 上面的地址（`{agent_name}` 替换为你想要的名字，如 `team-dev`）
+1. **URL 填入** 上面的地址（`{agent_id}` 替换为你在 `04` 中填写的 Agent ID，如 `team-dev`）
 2. **Token** 填入刚才生成的 Token
 3. **EncodingAESKey** 填入刚才生成的 EncodingAESKey
 4. **点击"保存"**
@@ -675,10 +812,21 @@ https://ai.yourcompany.com/team-dev/wecom/callback
 
 **Agent** 是 Gateway 和企业微信机器人的绑定关系，包含：
 - 企业微信机器人的加密配置（Token/AESKey）
-- 对应的 OpenClaw 实例地址和 Token
-- 使用哪个 OpenClaw Agent（`main` 或自定义）
+- 对应的 OpenClaw 服务地址和 Token
+- 绑定到哪个 OpenClaw Agent
+- 本地文件共享目录
 
 **一个 Agent 对应一个企业微信机器人**。
+
+#### 当前版本的重要规则
+
+从当前版本开始，新增/更新绑定时使用**强绑定规则**：
+
+- `agent_id` = Gateway 路由名
+- `agent_id` = OpenClaw agent_id
+- `shared_dir` 固定为 `/app/shared/<agent_id>`（宿主机上通常是指向 workspace `shared` 的软链）
+
+也就是说，**不再推荐**“企微路由名是 `team-dev`，但 OpenClaw Agent ID 写 `main`”这种拆分配置。旧数据仍有兼容逻辑，但新配置请保持同名。
 
 ---
 
@@ -692,25 +840,30 @@ https://ai.yourcompany.com/team-dev/wecom/callback
 python3 scripts/manage-agent.py add team-dev
 ```
 
+> 注意：`04` 和 `manage-agent.py` 都必须用**普通用户**执行，不要加 `sudo`。
+
 **按照提示输入**：
 
 ```
-📝 添加新 Agent: team-dev
+Gateway 地址（回车使用默认 http://localhost:18789）: http://localhost:18789
 
-显示名称（用于日志和统计）: 研发团队 AI 助手
+Agent ID（路由名，同 OpenClaw agent_id）: team-dev
+
+共享文件目录（自动生成，不可修改）: /app/shared/team-dev
+
+Gateway Token（从 ~/.openclaw/openclaw.json 或 ~/.openclaw/.env 获取）: 1e443bcba0ed1327699b31cdee8f6150e97226386c375f75
 
 企业微信 Token（随机生成的 32 位字符串）: 32c4407bae780aeb92b0d7f504dc26c1
 
 企业微信 EncodingAESKey（随机生成的 43 位字符串）: f7cTZKs4PQ1E0cLHrHArKpSoHYUzxUNE8mKTIauIkZA
 
-OpenClaw 地址（如 http://localhost:18789 或 ws://IP:PORT）: http://localhost:18789
+显示名（回车使用 team-dev）: 研发团队 AI 助手
 
-OpenClaw Token（从 ~/.openclaw/openclaw.json 获取）: 1e443bcba0ed1327699b31cdee8f6150e97226386c375f75
-
-OpenClaw Agent ID（默认 main，按回车使用默认）: [直接回车]
-
-✅ Agent 'team-dev' 添加成功！
+已添加 agent 'team-dev'
+企业微信回调地址: https://your-domain/team-dev/wecom/callback
 ```
+
+> 如果 `04` 提示无法创建 `/app/shared/team-dev`，请先检查 `/app/shared` 是否已由 `02` 脚本创建，或手动按 [2.2.1](#221-如果你是自行部署-openclaw不使用-03-脚本) 放权。
 
 ---
 
@@ -724,20 +877,7 @@ OpenClaw Agent ID（默认 main，按回车使用默认）: [直接回车]
 python3 scripts/manage-agent.py list
 ```
 
-**预期输出**：
-```
-========================================
-📋 当前已配置的 Agents
-========================================
-
-Agent: team-dev
-  显示名称: 研发团队 AI 助手
-  OpenClaw URL: http://localhost:18789
-  OpenClaw Agent ID: main
-  创建时间: 2026-03-02 10:00:00
-
-总共 1 个 agent
-```
+**预期现象**：列表中能看到 `team-dev` 这一行，并且共享目录为 `/app/shared/team-dev`。
 
 **检查 Gateway API**：
 ```bash
@@ -751,7 +891,7 @@ curl http://localhost:8000/admin/agents
     "team-dev": {
       "display_name": "研发团队 AI 助手",
       "openclaw_url": "http://localhost:18789",
-      "openclaw_agent_id": "main"
+      "openclaw_agent_id": "team-dev"
     }
   }
 }
@@ -860,11 +1000,11 @@ task_id_123|zhangsan|team-dev|你好|success|收到你的消息...|2026-03-02 10
 
 ### 7.2 使用不同的 OpenClaw Agent
 
-**场景**：想让机器人使用不同的 OpenClaw Agent（如 `work` agent）
+**场景**：想让机器人使用不同的 OpenClaw Agent
 
 **步骤 1：在 OpenClaw 中创建 Agent**
 
-参考 OpenClaw 文档创建新 agent，假设名为 `work`。
+参考 OpenClaw 文档创建新 agent，假设名为 `team-work`。
 
 **步骤 2：添加 Gateway Agent 时指定**
 
@@ -872,7 +1012,12 @@ task_id_123|zhangsan|team-dev|你好|success|收到你的消息...|2026-03-02 10
 /opt/openclaw/gateway/bin/04-manage-agent.sh add team-work
 ```
 
-当提示输入 **OpenClaw Agent ID** 时，输入 `work`（而不是默认的 `main`）。
+当前版本中，`04` 会把 `team-work` 同时写成：
+- Gateway 路由名
+- OpenClaw Agent ID
+- 本地共享目录 `/app/shared/team-work`
+
+因此这里**不再单独输入另一个 OpenClaw Agent ID**。如果你想让企微机器人走某个特定 Agent，请直接在 OpenClaw 里创建同名 Agent。
 
 ---
 
@@ -885,11 +1030,11 @@ task_id_123|zhangsan|team-dev|你好|success|收到你的消息...|2026-03-02 10
 
 **按提示修改**（不想改的直接回车保持原值）：
 ```
-当前显示名称: 研发团队 AI 助手
-新显示名称（回车保持不变）: [直接回车保持不变]
+当前显示名: 研发团队 AI 助手
+新显示名（回车保持不变）: [直接回车保持不变]
 
-当前 OpenClaw URL: http://localhost:18789
-新 OpenClaw URL（回车保持不变）: http://new-server:18789  ← 修改了
+当前 Gateway 地址: http://localhost:18789
+新 Gateway 地址（回车保持不变）: http://new-server:18789  ← 修改了
 
 ... 其他配置 ...
 
@@ -940,23 +1085,26 @@ sudo journalctl -u openclaw-gateway -f
 
 ### 7.6 服务管理（快捷命令）
 
-**安装后提供了便捷脚本**：
+**安装后提供了便捷脚本**（脚本内部会自行调用 `sudo systemctl`；推荐仍以普通用户执行）：
 
 ```bash
 # 启动
-sudo gateway-ctl start
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh start
 
 # 停止
-sudo gateway-ctl stop
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh stop
 
 # 重启
-sudo gateway-ctl restart
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh restart
 
 # 查看状态
-sudo gateway-ctl status
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh status
 
 # 查看日志
-sudo gateway-ctl logs
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh logs
+
+# 查看 Agent 列表
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh list-agents
 ```
 
 ---
@@ -1045,7 +1193,7 @@ sudo gateway-ctl logs
    curl http://localhost:18789/health
    ```
 
-3. **检查 OpenClaw Token 是否正确**：
+3. **检查 Gateway Token 是否正确**：
    ```bash
    # 查看 Gateway 配置的 Token
    sqlite3 /opt/openclaw/data/gateway/gateway.db "SELECT openclaw_token FROM agents WHERE name='team-dev';"
@@ -1076,11 +1224,12 @@ sudo gateway-ctl logs
 
 **排查**：
 
-1. **查看 OpenClaw 统计**：
+1. **查看 OpenClaw 控制台 / 健康状态**：
    ```bash
-   curl http://localhost:18789/api/stats
+   openclaw dashboard
+   openclaw health
    ```
-   关注 `queueDepth`（队列深度）和 `activeRequests`（活跃请求数）
+   如果你的 OpenClaw 版本提供统计页，再重点关注队列深度和活跃请求数。
 
 2. **查看 Gateway 日志中的耗时**：
    ```bash
@@ -1259,8 +1408,9 @@ sudo rm -rf /opt/openclaw
 
 4. **验证配置**：
    ```bash
-   curl http://localhost:18789/api/stats | jq .maxConcurrent
+   openclaw dashboard
    ```
+   检查并发相关配置是否已经生效。
 
 **推荐值**：
 - 10-20 人：`maxConcurrent: 8`
@@ -1278,13 +1428,11 @@ sudo rm -rf /opt/openclaw
 #### 方案 1：按部门分流（单 OpenClaw 实例）
 
 ```bash
-# 研发部使用 main agent
+# 研发部使用 dept-dev agent
 /opt/openclaw/gateway/bin/04-manage-agent.sh add dept-dev
-# OpenClaw Agent ID: main
 
-# 运维部使用 work agent
+# 运维部使用 dept-ops agent
 /opt/openclaw/gateway/bin/04-manage-agent.sh add dept-ops
-# OpenClaw Agent ID: work
 ```
 
 **优点**：配置简单
@@ -1307,13 +1455,13 @@ Gateway
 
 1. **在不同服务器上启动 OpenClaw 实例**
 
-2. **添加 agent 时使用不同的 OpenClaw URL**：
+2. **添加 agent 时使用不同的 Gateway 地址**：
    ```bash
    /opt/openclaw/gateway/bin/04-manage-agent.sh add dept-dev
-   # OpenClaw URL: http://server1:18789
+   # Gateway 地址: http://server1:18789
    
    /opt/openclaw/gateway/bin/04-manage-agent.sh add dept-ops
-   # OpenClaw URL: http://server2:18789
+   # Gateway 地址: http://server2:18789
    ```
 
 **优点**：
@@ -1367,14 +1515,13 @@ sudo certbot --nginx -d ai.yourcompany.com
 
 ### 9.5 监控和告警
 
-**定期检查脚本**：
+**定期检查脚本示例**（以下脚本需你自行保存，不是仓库内置文件）：
 
 ```bash
 #!/bin/bash
-# /opt/openclaw/scripts/health-check.sh
+# 例如保存为: /usr/local/bin/openclaw-health-check.sh
 
 GATEWAY_URL="http://localhost:8000"
-OPENCLAW_URL="http://localhost:18789"
 
 # 检查 Gateway
 gateway_status=$(curl -s $GATEWAY_URL/health | jq -r .status)
@@ -1383,17 +1530,9 @@ if [ "$gateway_status" != "ok" ]; then
     # 发送告警（邮件/钉钉/Slack）
 fi
 
-# 检查 OpenClaw
-openclaw_status=$(curl -s $OPENCLAW_URL/health | jq -r .status)
-if [ "$openclaw_status" != "ok" ]; then
-    echo "⚠️ OpenClaw 异常！"
-    # 发送告警
-fi
-
-# 检查队列深度
-queue_depth=$(curl -s $OPENCLAW_URL/api/stats | jq -r .queueDepth)
-if [ "$queue_depth" -gt 10 ]; then
-    echo "⚠️ 队列深度过高: $queue_depth"
+# 检查 systemd 服务
+if ! systemctl is-active --quiet openclaw-gateway; then
+    echo "⚠️ openclaw-gateway 服务异常！"
 fi
 ```
 
@@ -1403,7 +1542,7 @@ fi
 sudo crontab -e
 
 # 添加以下行
-*/5 * * * * /opt/openclaw/scripts/health-check.sh >> /var/log/openclaw-health.log 2>&1
+*/5 * * * * /usr/local/bin/openclaw-health-check.sh >> /var/log/openclaw-health.log 2>&1
 ```
 
 ---
@@ -1415,15 +1554,24 @@ sudo crontab -e
 ```
 /opt/openclaw/
 ├── gateway/
-│   ├── bin/                  # 部署步骤脚本
-│   ├── scripts/              # 工具脚本
-│   ├── src/                  # 应用代码
+│   ├── bin/
+│   │   └── 04-manage-agent.sh
+│   ├── scripts/
+│   │   ├── gateway-ctl.sh
+│   │   ├── manage-agent.py
+│   │   └── openclaw-gateway.service
+│   ├── src/
+│   │   └── gateway/
+│   │       └── wecom_gateway.py
+│   ├── venv/                 # Python 虚拟环境
 │   └── .env                  # 环境变量
 ├── data/
 │   └── gateway/
 │       ├── gateway.db        # SQLite 数据库
-│       ├── gateway.log       # 日志文件
-│       └── files/            # 文件下载目录
+│       └── files/            # 下载文件暂存目录
+└── /var/log/openclaw/
+    ├── gateway.log           # 标准输出日志
+    └── gateway-error.log     # 错误日志
 ```
 
 ---
@@ -1438,9 +1586,10 @@ sudo crontab -e
 | display_name | TEXT | 显示名称 |
 | wecom_token | TEXT | 企业微信 Token |
 | wecom_aes_key | TEXT | 企业微信 EncodingAESKey |
-| openclaw_url | TEXT | OpenClaw 地址 |
-| openclaw_token | TEXT | OpenClaw Token |
-| openclaw_agent_id | TEXT | OpenClaw Agent ID（默认 main） |
+| openclaw_url | TEXT | OpenClaw 服务地址（`04` 交互中显示为 Gateway 地址） |
+| openclaw_token | TEXT | OpenClaw Token（`04` 交互中显示为 Gateway Token） |
+| openclaw_agent_id | TEXT | OpenClaw Agent ID；新规则下与 `name` 保持一致 |
+| shared_dir | TEXT | 本地共享目录；新规则下固定为 `/app/shared/<agent_id>` |
 | created_at | TEXT | 创建时间 |
 | updated_at | TEXT | 更新时间 |
 
@@ -1478,7 +1627,7 @@ sudo crontab -e
 | `MAX_GATEWAY_WORKERS` | `8` | 否 | Gateway 全局 worker 池大小 |
 | `MAX_PER_USER_PENDING` | `1` | 否 | 单用户最多等待消息数 |
 | `MAX_QUEUE_WAIT_SECONDS` | `60` | 否 | 等待消息最大排队时长（秒） |
-| `GATEWAY_URL` | `http://localhost:8000` | 是 | Gateway 对外访问地址（OpenClaw skill 回调依赖） |
+| `GATEWAY_URL` | `http://localhost:8000` | 是 | Gateway 对外访问地址（管理脚本重载通知、上传 Skill 回调依赖） |
 | `FILE_STORAGE_MODE` | `local` | 是 | 文件存储模式（`local` / `s3`） |
 | `FILE_STORAGE_PRESIGN_EXPIRES` | `86400` | 否 | 预签名下载链接有效期（秒） |
 | `MAX_INTERNAL_UPLOAD_FILE_SIZE` | `52428800` | 否 | OpenClaw skill 通过内部接口上传时的大小限制 |
@@ -1511,6 +1660,9 @@ sudo systemctl status openclaw-gateway
 # 查看实时日志
 sudo journalctl -u openclaw-gateway -f
 
+# 使用快捷运维脚本
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh status
+
 # 查看所有 Agent
 /opt/openclaw/gateway/bin/04-manage-agent.sh list
 
@@ -1521,9 +1673,6 @@ sqlite3 /opt/openclaw/data/gateway/gateway.db \
 # 查看任务统计
 sqlite3 /opt/openclaw/data/gateway/gateway.db \
   "SELECT status, COUNT(*) FROM task_logs GROUP BY status;"
-
-# 检查 OpenClaw 统计
-curl http://localhost:18789/api/stats | jq
 
 # 检查 Gateway 健康状态
 curl http://localhost:8000/health | jq
@@ -1547,7 +1696,7 @@ sudo systemctl restart openclaw-gateway
 
 ### 10.6 文件存储模式与上传 Skill
 
-默认模式：`FILE_STORAGE_MODE=local`（保持原有本地共享目录行为）。
+默认模式：`FILE_STORAGE_MODE=local`。
 
 #### 企业微信回复策略（markdown.content 限制）
 
@@ -1601,9 +1750,13 @@ bash bin/03-install-openclaw.sh --skip-install
 
 #### local 模式行为
 
-- `FILE_STORAGE_MODE=local` 时，不安装上传 Skill，继续使用本地文件路径。
+- `FILE_STORAGE_MODE=local` 时，不安装上传 Skill，继续使用本地绝对路径。
+- Gateway 会把企业微信文件保存到 `/app/shared/<agent_id>/<日期>/...`，并把这个绝对路径直接下发给 Agent。
+- 宿主机上的 `/app/shared/<agent_id>` 建议做成软链，指向 `~/.openclaw/workspace-<agent_id>/shared`。
+- 因此 `local` 模式下，最关键的约束是：`agent_id` 同名、`/app/shared/<agent_id>` 正确指向 workspace 内真实目录、沙箱 bind source 位于该 workspace 内。
+- 如果你不是用 `03` 脚本安装 OpenClaw，请务必按 [2.2.1](#221-如果你是自行部署-openclaw不使用-03-脚本) 手工满足这些约束。
 
 ---
 
-**最后更新**: 2026-03-05
-**版本**: v2.0
+**最后更新**: 2026-03-07
+**版本**: v2.1

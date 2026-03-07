@@ -4,10 +4,12 @@
 
 set -e
 
-# 禁止以 root/sudo 运行（避免共享目录路径解析为 /root/.openclaw）
+# 禁止 root / sudo 运行；应始终使用 Gateway 运行用户执行
 if [ "$(id -u)" -eq 0 ]; then
-    echo "错误: 请不要使用 sudo 运行此脚本"
+    echo "错误: 请不要使用 root 或 sudo 运行此脚本"
     echo "用法: ./04-manage-agent.sh <command> [args]"
+    echo "请使用 Gateway 运行用户执行，例如："
+    echo "  bin/04-manage-agent.sh add development"
     exit 1
 fi
 

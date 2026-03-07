@@ -7,9 +7,11 @@ import os
 import logging
 import json
 import base64
+import shutil
 import tempfile
 from Crypto.Cipher import AES
 import struct
+import ssl
 import requests
 from datetime import datetime, timedelta, timezone
 import threading
@@ -38,35 +40,101 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+LOCAL_SHARED_ROOT = '/app/shared'
 
-def _sanitize_requests_tls_env():
-    """修复失效 TLS 证书路径，避免 requests 因无效 cacert 路径报错"""
+
+_REQUESTS_VERIFY_PATH = None
+_REQUESTS_VERIFY_FAILED = False
+
+
+def _is_valid_ca_path(path):
+    return bool(path) and os.path.exists(path)
+
+
+def _resolve_requests_verify():
+    """解析 requests 使用的 CA 路径，优先返回显式有效路径，避免遗留 certifi 路径导致失败"""
+    global _REQUESTS_VERIFY_PATH, _REQUESTS_VERIFY_FAILED
+
+    if _is_valid_ca_path(_REQUESTS_VERIFY_PATH):
+        return _REQUESTS_VERIFY_PATH
+
+    candidates = []
+    seen = set()
+
+    def add_candidate(path):
+        normalized = (path or '').strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(normalized)
+
     for env_key in ('REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE'):
         env_value = os.getenv(env_key, '').strip()
-        if env_value and not os.path.isfile(env_value):
+        if env_value and not _is_valid_ca_path(env_value):
             logger.warning(f"检测到无效 {env_key}={env_value}，已忽略并回退系统证书")
             os.environ.pop(env_key, None)
+            continue
+        add_candidate(env_value)
 
     try:
         import requests.adapters as req_adapters
-        default_ca = getattr(req_adapters, 'DEFAULT_CA_BUNDLE_PATH', '')
-        if default_ca and os.path.isfile(default_ca):
-            return
+        add_candidate(getattr(req_adapters, 'DEFAULT_CA_BUNDLE_PATH', ''))
+    except Exception:
+        req_adapters = None
 
-        fallback_paths = [
-            '/etc/ssl/certs/ca-certificates.crt',
-            '/etc/pki/tls/certs/ca-bundle.crt',
-            '/etc/ssl/cert.pem',
-        ]
-        for path in fallback_paths:
-            if os.path.isfile(path):
-                req_adapters.DEFAULT_CA_BUNDLE_PATH = path
-                logger.warning(f"requests 默认 CA 路径无效，已回退到系统证书: {path}")
-                return
+    try:
+        import requests.certs as req_certs
+        add_candidate(req_certs.where())
+    except Exception:
+        pass
 
-        logger.error("未找到可用系统 CA 证书文件，HTTPS 请求可能失败")
+    try:
+        import certifi
+        add_candidate(certifi.where())
+    except Exception:
+        pass
+
+    try:
+        default_paths = ssl.get_default_verify_paths()
+        add_candidate(default_paths.cafile)
+        add_candidate(default_paths.capath)
+        add_candidate(default_paths.openssl_cafile)
+        add_candidate(default_paths.openssl_capath)
     except Exception as e:
-        logger.warning(f"初始化 TLS 证书路径失败: {e}")
+        logger.warning(f"读取系统 TLS 默认路径失败: {e}")
+
+    fallback_paths = [
+        '/etc/ssl/certs/ca-certificates.crt',
+        '/etc/pki/tls/certs/ca-bundle.crt',
+        '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem',
+        '/etc/ssl/cert.pem',
+        '/etc/ssl/certs',
+    ]
+    for path in fallback_paths:
+        add_candidate(path)
+
+    for path in candidates:
+        if _is_valid_ca_path(path):
+            _REQUESTS_VERIFY_PATH = path
+            if req_adapters is not None:
+                req_adapters.DEFAULT_CA_BUNDLE_PATH = path
+            return path
+
+    if not _REQUESTS_VERIFY_FAILED:
+        logger.error("未找到可用系统 CA 证书文件或目录，HTTPS 请求可能失败")
+        _REQUESTS_VERIFY_FAILED = True
+    return True
+
+
+def _sanitize_requests_tls_env():
+    """启动时预热 TLS 证书路径解析，尽早清理遗留环境变量"""
+    _resolve_requests_verify()
+
+
+def _requests_request(method, url, **kwargs):
+    """统一 requests 调用，显式指定 verify，避免被遗留环境变量覆盖"""
+    kwargs.setdefault('verify', _resolve_requests_verify())
+    return requests.request(method, url, **kwargs)
 
 
 _sanitize_requests_tls_env()
@@ -184,14 +252,21 @@ def load_agents_from_db():
     ).fetchall()
     agents = {}
     for name, display, token, aes_key, url, oc_token, agent_id, shared_dir in rows:
+        effective_agent_id = (agent_id or name or 'main').strip() or 'main'
+        expected_shared_dir = os.path.join(LOCAL_SHARED_ROOT, name)
+        configured_shared_dir = (shared_dir or '').strip()
+        if agent_id and agent_id != name:
+            logger.warning(f"[{name}] openclaw_agent_id 与路由名不一致，当前继续沿用 DB 中的 agent_id={agent_id}")
+        if configured_shared_dir and os.path.normpath(configured_shared_dir) != os.path.normpath(expected_shared_dir):
+            logger.warning(f"[{name}] shared_dir 与固定路径不一致，已改用 {expected_shared_dir}（原值: {configured_shared_dir}）")
         agents[name] = {
             'display_name': display,
             'wecom_token': token,
             'wecom_encoding_aes_key': aes_key,
             'openclaw_url': url,
             'openclaw_token': oc_token,
-            'openclaw_agent_id': agent_id or 'main',
-            'shared_dir': shared_dir or '',
+            'openclaw_agent_id': effective_agent_id,
+            'shared_dir': expected_shared_dir,
         }
     conn.close()
     return agents
@@ -233,7 +308,8 @@ def _call_openclaw_sse(url, message, session_key, timeout=None, token='', agent_
     """单次 HTTP SSE 流式调用，返回回复文本。连接异常时抛出异常。"""
     start_time = time.monotonic()
     try:
-        resp = requests.post(
+        resp = _requests_request(
+            'post',
             f"{url}/v1/responses",
             headers={
                 'Authorization': f'Bearer {token}',
@@ -277,7 +353,8 @@ def _call_openclaw_sse(url, message, session_key, timeout=None, token='', agent_
 def _call_openclaw_http(url, message, session_key, timeout=None, token='', agent_id='main'):
     """同步 HTTP POST 调用，不使用流式，直接拿完整 JSON 响应"""
     try:
-        resp = requests.post(
+        resp = _requests_request(
+            'post',
             f"{url}/v1/responses",
             headers={
                 'Authorization': f'Bearer {token}',
@@ -670,10 +747,6 @@ def _get_today_dir_for_agent(shared_dir):
     os.makedirs(path, exist_ok=True)
     return path
 
-# 容器内共享目录路径（避免使用 /workspace 下的保留挂载前缀）
-CONTAINER_SHARED_MOUNT = '/app/shared'
-
-
 # ============= 文件发布（local / s3） =============
 
 _s3_client = None
@@ -754,16 +827,45 @@ def _get_s3_client():
         return _s3_client
 
 
-def _publish_file_local(local_path, shared_dir=''):
-    """local 模式：返回容器内可访问路径（或宿主机路径）"""
+def _path_is_within(path, parent_dir):
+    """判断 path 是否位于 parent_dir 内"""
+    path_abs = os.path.abspath(path)
+    parent_abs = os.path.abspath(parent_dir)
+    return path_abs == parent_abs or path_abs.startswith(parent_abs + os.sep)
+
+
+def _ensure_local_file_in_shared_dir(local_path, shared_dir):
+    """local 模式下确保文件最终位于 agent 共享目录中"""
     host_path = os.path.abspath(local_path)
-    display_path = _to_container_path(host_path, shared_dir)
+    if not shared_dir or _path_is_within(host_path, shared_dir):
+        return host_path
+
+    target_dir = _get_today_dir_for_agent(shared_dir)
+    file_name = os.path.basename(host_path)
+    base_name, ext = os.path.splitext(file_name)
+    target_path = os.path.join(target_dir, file_name)
+    counter = 1
+
+    while os.path.exists(target_path):
+        if os.path.abspath(target_path) == host_path:
+            return host_path
+        target_path = os.path.join(target_dir, f"{base_name}-{counter}{ext}")
+        counter += 1
+
+    shutil.move(host_path, target_path)
+    logger.info(f"local 文件已移动到共享目录: {target_path}")
+    return target_path
+
+
+def _publish_file_local(local_path, shared_dir=''):
+    """local 模式：返回 agent 可直接访问的绝对路径"""
+    host_path = _ensure_local_file_in_shared_dir(local_path, shared_dir)
     return {
         'storage_mode': 'local',
         'storage_uri': f"file://{host_path}",
         'download_url': '',
         'expires_at': '',
-        'display_value': display_path,
+        'display_value': host_path,
     }
 
 
@@ -1189,14 +1291,14 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
     """下载临时 COS URL 到文件目录（按日期分区）
     返回 (local_path, text_content_or_none, status)
     
-    如果 shared_dir 已设置，文件保存到共享目录（供 Docker 沙箱访问）。
-    返回的 local_path 为宿主机路径，调用者需根据需要转换为容器内路径。
+    如果 shared_dir 已设置，文件保存到该 agent 的固定绝对路径共享目录。
+    返回的 local_path 为可直接下发给 agent 的绝对路径。
     status: ok | risky_deleted
     """
     tmp_path = None
     try:
         today_dir = _get_today_dir_for_agent(shared_dir)
-        resp = requests.get(url, timeout=30, stream=True)
+        resp = _requests_request('get', url, timeout=30, stream=True)
         resp.raise_for_status()
 
         tmp_filename = f"{prefix}-{uuid.uuid4().hex[:8]}.tmp"
@@ -1274,28 +1376,10 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
                 pass
         return None, None, 'error'
 
-
-def _to_container_path(host_path, shared_dir):
-    """将宿主机路径转换为容器内路径（/app/shared/...）
-    
-    如果 shared_dir 已配置且 host_path 在该目录下，将前缀替换为 /app/shared。
-    否则返回原始宿主机路径（适用于 main agent 等无沙箱场景）。
-    """
-    if shared_dir:
-        host_norm = os.path.normpath(host_path)
-        shared_norm = os.path.normpath(shared_dir)
-        if host_norm == shared_norm or host_norm.startswith(shared_norm + os.sep):
-            relative = host_norm[len(shared_norm):]
-            if not relative.startswith(os.sep):
-                relative = os.sep + relative
-            return (CONTAINER_SHARED_MOUNT + relative).replace(os.sep, '/')
-    return host_path
-
-
 def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='', agent_name=''):
     """提取单条消息内容（主消息或 quote 内的消息），返回文本描述
     
-    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，路径转为容器内路径 /app/shared/...
+    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，并直接下发绝对路径。
     """
     msg_type = item.get('msgtype', '')
 
@@ -1432,7 +1516,7 @@ def _send_wecom_response(response_url, agent_name, reply_text):
     wecom_reply = truncate_message(reply_text, max_len=WECOM_MSG_MAX_LEN)
     payload = {"msgtype": "markdown", "markdown": {"content": wecom_reply}}
     try:
-        resp = requests.post(response_url, json=payload, timeout=10)
+        resp = _requests_request('post', response_url, json=payload, timeout=10)
         logger.info(f"[{agent_name}] 主动回复: {resp.status_code}, 长度: {_utf8_len(wecom_reply)} bytes")
         return True
     except Exception as e:

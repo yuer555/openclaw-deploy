@@ -14,7 +14,8 @@
 #   bash bin/03-install-openclaw.sh --add-agent      # 只添加新 Agent
 #   bash bin/03-install-openclaw.sh --add-provider   # 只添加模型提供商
 #
-# 要求：Node.js 22+, Docker（沙箱 agent 需要）
+# 要求：Node.js 22+；Docker 仅在沙箱 agent 需要
+# 注意：请使用普通用户运行，不要 sudo，不要 root
 # ============================================================================
 
 set -euo pipefail
@@ -43,9 +44,11 @@ success() { echo -e "${GREEN}✓${NC} $*"; }
 # ---------------------------------------------------------------------------
 OPENCLAW_HOME="${HOME}/.openclaw"
 OPENCLAW_CONFIG="${OPENCLAW_HOME}/openclaw.json"
+OPENCLAW_ENV_FILE="${OPENCLAW_HOME}/.env"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPENCLAW_SANDBOX_IMAGE="${OPENCLAW_SANDBOX_IMAGE:-openclaw-sandbox:gateway-devtools-bookworm}"
 OPENCLAW_SANDBOX_DOCKERFILE="${OPENCLAW_SANDBOX_DOCKERFILE:-${REPO_ROOT}/bin/openclaw-sandbox-devtools.Dockerfile}"
+OPENCLAW_SANDBOX_BASE_IMAGE="${OPENCLAW_SANDBOX_BASE_IMAGE:-debian:bookworm-slim}"
 GATEWAY_SKILL_NAME="gateway-file-upload"
 GATEWAY_SKILL_SOURCE_DIR="${REPO_ROOT}/openclaw-skills/${GATEWAY_SKILL_NAME}"
 GATEWAY_SKILL_TARGET_DIR="${OPENCLAW_HOME}/skills/${GATEWAY_SKILL_NAME}"
@@ -54,10 +57,12 @@ OPENCLAW_GATEWAY_RUN_LOG_FILE="${OPENCLAW_HOME}/gateway-run.log"
 OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG=""
 EDITOR="${EDITOR:-${VISUAL:-nano}}"
 MIN_NODE_VERSION=22
+HOST_SHARED_ROOT="/app/shared"
 SKIP_INSTALL=false
 ADD_AGENT_ONLY=false
 ADD_PROVIDER_ONLY=false
 GATEWAY_TOKEN_SYNC_CHANGED=false
+GATEWAY_TOKEN_PREPARE_REQUIRED=false
 
 # ---------------------------------------------------------------------------
 # 参数解析
@@ -81,12 +86,178 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "$(id -u)" -eq 0 ]; then
+    echo "错误: 请不要使用 root 或 sudo 运行此脚本"
+    echo "原因: OpenClaw 的 workspace/sandbox 目录必须位于普通用户家目录，root 会落到 /root/.openclaw 并触发沙箱安全限制"
+    echo "正确方式:"
+    echo "  普通用户执行: bash bin/03-install-openclaw.sh"
+    echo "  仅 Gateway 安装脚本使用 sudo: sudo bash bin/02-install-gateway.sh"
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
 
 # 检查命令是否存在
 cmd_exists() { command -v "$1" &>/dev/null; }
+
+_ensure_openclaw_env_file() {
+    local env_file_created=false
+
+    mkdir -p "$OPENCLAW_HOME"
+    if [[ ! -f "$OPENCLAW_ENV_FILE" ]]; then
+        touch "$OPENCLAW_ENV_FILE"
+        env_file_created=true
+    fi
+    chmod 600 "$OPENCLAW_ENV_FILE" 2>/dev/null || true
+
+    if [[ "$env_file_created" == "true" ]]; then
+        success "已创建 OpenClaw 环境文件: ${OPENCLAW_ENV_FILE}"
+    fi
+}
+
+
+_append_gateway_token_to_env_file_if_missing() {
+    local token="$1"
+
+    _ensure_openclaw_env_file
+
+    if grep -Eq '^[[:space:]]*OPENCLAW_GATEWAY_TOKEN=' "$OPENCLAW_ENV_FILE" 2>/dev/null; then
+        return 1
+    fi
+
+    [[ -s "$OPENCLAW_ENV_FILE" ]] && echo "" >> "$OPENCLAW_ENV_FILE"
+    echo "OPENCLAW_GATEWAY_TOKEN=${token}" >> "$OPENCLAW_ENV_FILE"
+    success "已写入 Gateway Token 到 ${OPENCLAW_ENV_FILE}"
+    return 0
+}
+
+ensure_gateway_token() {
+    local env_token config_token generated_token=""
+
+    _ensure_openclaw_env_file
+
+    env_token="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_GATEWAY_TOKEN")"
+    if [[ -n "$env_token" ]]; then
+        if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" && "${OPENCLAW_GATEWAY_TOKEN}" != "$env_token" ]]; then
+            warn "${OPENCLAW_ENV_FILE} 中已有 OPENCLAW_GATEWAY_TOKEN，当前 shell 中的同名变量将仅在本次进程内生效"
+        fi
+        OPENCLAW_GATEWAY_TOKEN="$env_token"
+        export OPENCLAW_GATEWAY_TOKEN
+        return 0
+    fi
+
+    if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
+        _append_gateway_token_to_env_file_if_missing "$OPENCLAW_GATEWAY_TOKEN" || true
+        export OPENCLAW_GATEWAY_TOKEN
+        return 0
+    fi
+
+    config_token="$(_read_token_from_config_file "auth")"
+    if [[ -n "$config_token" && "$config_token" != "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+        OPENCLAW_GATEWAY_TOKEN="$config_token"
+        export OPENCLAW_GATEWAY_TOKEN
+        _append_gateway_token_to_env_file_if_missing "$OPENCLAW_GATEWAY_TOKEN" || true
+        step "检测到现有 gateway.auth.token，已同步到 ${OPENCLAW_ENV_FILE}"
+        return 0
+    fi
+
+    generated_token="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 32)"
+    OPENCLAW_GATEWAY_TOKEN="$generated_token"
+    export OPENCLAW_GATEWAY_TOKEN
+    _append_gateway_token_to_env_file_if_missing "$OPENCLAW_GATEWAY_TOKEN" || true
+    success "已生成新的 Gateway Token，并写入 ${OPENCLAW_ENV_FILE}"
+}
+
+_print_sandbox_runtime_instructions() {
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  Docker 沙箱准备指南${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "  仅当你要创建 Docker 沙箱 Agent 时才需要以下步骤。"
+    echo "  不启用沙箱则无需安装 Docker。"
+    echo ""
+    echo -e "${CYAN}▸ 1. 安装 Docker${NC}"
+    echo ""
+    if cmd_exists apt-get; then
+        echo "  sudo apt-get install -y ca-certificates curl"
+        echo "  sudo install -m 0755 -d /etc/apt/keyrings"
+        echo "  curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg \\"
+        echo "    | sudo tee /etc/apt/keyrings/docker.asc > /dev/null"
+        echo "  echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \\"
+        echo "    https://mirrors.aliyun.com/docker-ce/linux/ubuntu \\"
+        echo "    \$(. /etc/os-release && echo \$VERSION_CODENAME) stable\" \\"
+        echo "    | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null"
+        echo "  sudo apt-get update"
+        echo "  sudo apt-get install -y docker-ce docker-ce-cli containerd.io"
+    elif cmd_exists dnf; then
+        echo "  sudo dnf install -y dnf-plugins-core"
+        echo "  sudo dnf config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo"
+        echo "  sudo dnf install -y docker-ce docker-ce-cli containerd.io"
+    elif cmd_exists yum; then
+        echo "  sudo yum install -y yum-utils"
+        echo "  sudo yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo"
+        echo "  sudo yum install -y docker-ce docker-ce-cli containerd.io"
+    else
+        echo "  # Ubuntu/Debian:"
+        echo "  sudo apt-get update && sudo apt-get install -y docker.io"
+        echo "  # RHEL/Rocky/CentOS:"
+        echo "  sudo yum install -y docker"
+    fi
+    echo "  sudo systemctl enable --now docker"
+    echo "  sudo usermod -aG docker \$USER"
+    echo "  newgrp docker   # 或重新登录"
+    echo ""
+    echo -e "${CYAN}▸ 2. 配置镜像加速${NC}（腾讯云机器优先）"
+    echo ""
+    cat <<'EOF'
+  sudo mkdir -p /etc/docker
+  sudo tee /etc/docker/daemon.json > /dev/null <<'JSON'
+  {
+    "registry-mirrors": [
+      "https://mirror.ccs.tencentyun.com",
+      "https://hub-mirror.c.163.com",
+      "https://mirror.baidubce.com"
+    ]
+  }
+  JSON
+  sudo systemctl daemon-reload
+  sudo systemctl restart docker
+  docker info | sed -n '/Registry Mirrors/,$p'
+EOF
+    echo ""
+    echo -e "${CYAN}▸ 3. 构建专用沙箱镜像${NC}"
+    echo -e "  当前基础镜像: ${BOLD}${OPENCLAW_SANDBOX_BASE_IMAGE}${NC}"
+    echo ""
+    echo "  # 如基础镜像拉取慢，可改成你自己的 SWR / 私有仓库地址"
+    echo "  export OPENCLAW_SANDBOX_BASE_IMAGE=\"${OPENCLAW_SANDBOX_BASE_IMAGE}\""
+    echo ""
+    echo "  docker build \\"
+    echo "    --build-arg OPENCLAW_SANDBOX_BASE_IMAGE=${OPENCLAW_SANDBOX_BASE_IMAGE} \\"
+    echo "    -t ${OPENCLAW_SANDBOX_IMAGE} \\"
+    echo "    -f ${OPENCLAW_SANDBOX_DOCKERFILE} \\"
+    echo "    ${REPO_ROOT}"
+    echo ""
+    echo "  # 验证镜像是否存在"
+    echo "  docker image inspect ${OPENCLAW_SANDBOX_IMAGE}"
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+
+_sandbox_image_available() {
+    if ! cmd_exists docker; then
+        return 1
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        return 1
+    fi
+
+    docker image inspect "$OPENCLAW_SANDBOX_IMAGE" >/dev/null 2>&1
+}
 
 # 打印前置依赖安装指南
 _print_prereq_instructions() {
@@ -147,46 +318,12 @@ _print_prereq_instructions() {
     echo "  # 方式二：npm 安装"
     echo "  npm install -g openclaw@2026.02.26"
     echo ""
-    echo -e "${CYAN}▸ Docker${NC}（必须，沙箱 Agent 运行时依赖）"
+    echo -e "${CYAN}▸ Docker${NC}（仅启用沙箱 Agent 时需要）"
     echo ""
-    if cmd_exists apt-get; then
-        echo "  sudo apt-get install -y ca-certificates curl"
-        echo "  sudo install -m 0755 -d /etc/apt/keyrings"
-        echo "  curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg \\"
-        echo "    | sudo tee /etc/apt/keyrings/docker.asc > /dev/null"
-        echo "  echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \\"
-        echo "    https://mirrors.aliyun.com/docker-ce/linux/ubuntu \\"
-        echo "    \$(. /etc/os-release && echo \$VERSION_CODENAME) stable\" \\"
-        echo "    | sudo tee /etc/apt/sources.list.d/docker.list"
-        echo "  sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io"
-        echo "  sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
-        echo "  # 注意：usermod 需重新登录生效，或临时执行: newgrp docker"
-        echo "  sudo yum install -y yum-utils"
-        echo "  sudo yum-config-manager --add-repo \\"
-        echo "    https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo"
-        echo "  sudo yum install -y docker-ce docker-ce-cli containerd.io"
-        echo "  sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
-        echo "  # 注意：usermod 需重新登录生效，或临时执行: newgrp docker"
-    else
-        echo "  # Ubuntu/Debian（阿里云镜像源）:"
-        echo "  sudo apt-get install -y ca-certificates curl"
-        echo "  sudo install -m 0755 -d /etc/apt/keyrings"
-        echo "  curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg \\"
-        echo "    | sudo tee /etc/apt/keyrings/docker.asc > /dev/null"
-        echo "  echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \\"
-        echo "    https://mirrors.aliyun.com/docker-ce/linux/ubuntu \\"
-        echo "    \$(. /etc/os-release && echo \$VERSION_CODENAME) stable\" \\"
-        echo "    | sudo tee /etc/apt/sources.list.d/docker.list"
-        echo "  sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io"
-        echo "  sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
-        echo ""
-        echo "  # RHEL/Rocky/CentOS（阿里云镜像源）:"
-        echo "  sudo yum install -y yum-utils"
-        echo "  sudo yum-config-manager --add-repo \\"
-        echo "    https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo"
-        echo "  sudo yum install -y docker-ce docker-ce-cli containerd.io"
-        echo "  sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
-    fi
+    echo "  无需现在安装。只有在创建 Docker 沙箱 Agent 时，脚本才会继续提示："
+    echo "  1) 安装 Docker"
+    echo "  2) 配置镜像加速"
+    echo "  3) 构建专用沙箱镜像"
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
@@ -194,46 +331,7 @@ _print_prereq_instructions() {
 # 检查前置依赖
 check_prerequisites() {
     header "第一步：检查前置环境"
-
-    # --- 设置固定 Gateway Token（避免每次重新生成）---
-    if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
-        OPENCLAW_GATEWAY_TOKEN="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 32)"
-        export OPENCLAW_GATEWAY_TOKEN
-
-        # 检测用户使用的 shell
-        local shell_rc=""
-        if [[ -n "${BASH_VERSION:-}" ]]; then
-            shell_rc="$HOME/.bashrc"
-        elif [[ -n "${ZSH_VERSION:-}" ]]; then
-            shell_rc="$HOME/.zshrc"
-        else
-            # 回退：检查 SHELL 环境变量
-            case "${SHELL:-}" in
-                */bash) shell_rc="$HOME/.bashrc" ;;
-                */zsh)  shell_rc="$HOME/.zshrc" ;;
-                *)      shell_rc="$HOME/.profile" ;;
-            esac
-        fi
-
-        # 写入 shell 配置文件
-        if [[ -n "$shell_rc" ]]; then
-            if ! grep -q "OPENCLAW_GATEWAY_TOKEN" "$shell_rc" 2>/dev/null; then
-                echo "" >> "$shell_rc"
-                echo "# OpenClaw Gateway Token (auto-generated)" >> "$shell_rc"
-                echo "export OPENCLAW_GATEWAY_TOKEN=\"${OPENCLAW_GATEWAY_TOKEN}\"" >> "$shell_rc"
-                success "已生成 Gateway Token 并写入 ${shell_rc}"
-                step "Token 预览: ${OPENCLAW_GATEWAY_TOKEN:0:16}..."
-                echo ""
-                warn "请执行以下命令使环境变量立即生效："
-                echo -e "${DIM}source ${shell_rc}${NC}"
-                echo ""
-            else
-                step "检测到 ${shell_rc} 中已有 OPENCLAW_GATEWAY_TOKEN，跳过写入"
-            fi
-        fi
-    else
-        step "使用已有 Gateway Token: ${OPENCLAW_GATEWAY_TOKEN:0:16}..."
-    fi
+    GATEWAY_TOKEN_PREPARE_REQUIRED=false
 
     local missing=false
 
@@ -260,27 +358,28 @@ check_prerequisites() {
         missing=true
     fi
 
-    # --- Docker（必须，沙箱镜像依赖）---
+    # --- Docker（可选，仅沙箱 Agent 需要）---
     if cmd_exists docker; then
         if docker info &>/dev/null 2>&1; then
             success "Docker $(docker --version | sed -E 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+            if docker image inspect "$OPENCLAW_SANDBOX_IMAGE" >/dev/null 2>&1; then
+                success "已检测到沙箱镜像: ${OPENCLAW_SANDBOX_IMAGE}"
+            else
+                step "未检测到沙箱镜像（仅启用 Docker 沙箱 Agent 时需要）"
+            fi
         elif sudo docker info &>/dev/null 2>&1; then
-            # daemon 正在运行，但当前用户尚未加入 docker 组（需重新登录生效）
             echo ""
-            error "Docker 已安装并运行，但当前用户无 socket 访问权限（docker 组尚未生效）"
-            warn "请执行以下任一操作后重新运行本脚本："
+            warn "Docker 已安装并运行，但当前用户无 socket 访问权限"
+            warn "若后续启用 Docker 沙箱 Agent，请先执行以下任一操作："
             echo ""
             echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
             echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
             echo ""
-            exit 1
         else
-            error "未找到 Docker 或 Docker 未运行（必须安装）"
-            missing=true
+            warn "未检测到可用 Docker（若后续启用 Docker 沙箱 Agent，请先安装并启动 Docker）"
         fi
     else
-        error "未找到 Docker（必须安装）"
-        missing=true
+        warn "未找到 Docker（仅在启用 Docker 沙箱 Agent 时必须安装）"
     fi
 
     # --- OpenClaw ---
@@ -306,6 +405,7 @@ check_prerequisites() {
         echo ""
         run_openclaw_onboard
         success "OpenClaw 初始化完成"
+        GATEWAY_TOKEN_PREPARE_REQUIRED=true
     else
         success "OpenClaw 配置已存在: ${OPENCLAW_CONFIG}"
         echo ""
@@ -320,7 +420,14 @@ check_prerequisites() {
             echo ""
             run_openclaw_onboard
             success "OpenClaw 初始化完成"
+            GATEWAY_TOKEN_PREPARE_REQUIRED=true
         fi
+    fi
+
+    # --- 初始化完成后再准备 Gateway Token ---
+    # 避免在“是否重装”确认之前生成 ~/.openclaw/.env，随后又被 rm -rf 清掉
+    if [[ "$GATEWAY_TOKEN_PREPARE_REQUIRED" == "true" ]]; then
+        ensure_gateway_token
     fi
 
     # --- 确保 Gateway 已启动 ---
@@ -576,11 +683,24 @@ PYEOF
 
 sync_gateway_tokens() {
     # 将 gateway.auth.token 与 gateway.remote.token 设置为环境变量引用
-    local auth_token remote_token
+    local auth_token remote_token env_token
     GATEWAY_TOKEN_SYNC_CHANGED=false
 
     auth_token=$(_read_token_from_config_file "auth")
     remote_token=$(_read_token_from_config_file "remote")
+    env_token="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_GATEWAY_TOKEN")"
+
+    if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" && -z "$env_token" && "$GATEWAY_TOKEN_PREPARE_REQUIRED" != "true" ]]; then
+        if [[ "$auth_token" == "\${OPENCLAW_GATEWAY_TOKEN}" || "$remote_token" == "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+            warn "当前 Gateway 配置依赖 OPENCLAW_GATEWAY_TOKEN，但 ${OPENCLAW_ENV_FILE} 中未找到该变量"
+            warn "请先补充 ${OPENCLAW_ENV_FILE}，再重新执行 token 同步"
+        else
+            step "检测到沿用现有安装，跳过 Gateway Token 初始化"
+        fi
+        return 0
+    fi
+
+    ensure_gateway_token
 
     # 检查是否已经是环境变量引用格式
     if [[ "$auth_token" != "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
@@ -674,7 +794,7 @@ hard_check_gateway_token_health() {
     success "Gateway RPC probe: ok"
 
     step "OpenClaw doctor token 校验..."
-    doctor_output="$(openclaw doctor 2>&1 || true)"
+    doctor_output="$(openclaw doctor --non-interactive 2>&1 || true)"
     if echo "$doctor_output" | grep -Eqi "service token is stale|gateway token mismatch|gateway auth token mismatch|config token differs from service token"; then
         error "检测到 token 漂移（openclaw doctor）"
         echo "$doctor_output"
@@ -684,8 +804,135 @@ hard_check_gateway_token_health() {
 }
 
 
+shared_dir_for_agent() {
+    local agent_id="$1"
+    printf "%s/%s\n" "$HOST_SHARED_ROOT" "$agent_id"
+}
+
+
+shared_source_dir_for_agent() {
+    local agent_id="$1"
+    if [[ "$agent_id" == "main" ]]; then
+        printf "%s/shared\n" "${OPENCLAW_HOME}/workspace"
+    else
+        printf "%s/shared\n" "${OPENCLAW_HOME}/workspace-${agent_id}"
+    fi
+}
+
+
+ensure_shared_root() {
+    if [[ -d "$HOST_SHARED_ROOT" && -w "$HOST_SHARED_ROOT" ]]; then
+        return 0
+    fi
+
+    if mkdir -p "$HOST_SHARED_ROOT" 2>/dev/null; then
+        chmod 775 "$HOST_SHARED_ROOT" 2>/dev/null || true
+        return 0
+    fi
+
+    warn "无法自动创建共享根目录: ${HOST_SHARED_ROOT}"
+    echo -e "  ${DIM}请先执行: sudo mkdir -p ${HOST_SHARED_ROOT}${NC}"
+    echo -e "  ${DIM}          sudo chown $(whoami):$(id -gn) ${HOST_SHARED_ROOT}${NC}"
+    echo -e "  ${DIM}          sudo chmod 775 ${HOST_SHARED_ROOT}${NC}"
+    return 1
+}
+
+
+ensure_shared_dir_for_agent() {
+    local agent_id="$1"
+    local shared_dir
+    local shared_source_dir
+    shared_dir="$(shared_dir_for_agent "$agent_id")"
+    shared_source_dir="$(shared_source_dir_for_agent "$agent_id")"
+
+    if ! ensure_shared_root; then
+        return 1
+    fi
+
+    if ! mkdir -p "$shared_source_dir" 2>/dev/null; then
+        warn "无法自动创建共享真实目录: ${shared_source_dir}"
+        echo -e "  ${DIM}请先确认 $(dirname "$shared_source_dir") 对当前用户可写${NC}"
+        return 1
+    fi
+
+    if cmd_exists python3; then
+        local layout_output layout_status
+        layout_output="$(python3 - "$shared_source_dir" "$shared_dir" <<'PYEOF'
+import os
+import shutil
+import sys
+
+source_dir = os.path.realpath(sys.argv[1])
+exposed_dir = sys.argv[2]
+
+os.makedirs(source_dir, exist_ok=True)
+os.makedirs(os.path.dirname(exposed_dir), exist_ok=True)
+
+if os.path.islink(exposed_dir):
+    if os.path.realpath(exposed_dir) != source_dir:
+        os.remove(exposed_dir)
+        os.symlink(source_dir, exposed_dir)
+        print(f"fixed:{exposed_dir}->{source_dir}")
+    else:
+        print(f"ok:{exposed_dir}->{source_dir}")
+    raise SystemExit(0)
+
+if os.path.isdir(exposed_dir):
+    if os.path.realpath(exposed_dir) == source_dir:
+        print(f"ok:{exposed_dir}->{source_dir}")
+        raise SystemExit(0)
+
+    conflicts = [name for name in os.listdir(exposed_dir) if os.path.exists(os.path.join(source_dir, name))]
+    if conflicts:
+        print("conflict:" + ",".join(conflicts))
+        raise SystemExit(2)
+
+    for name in os.listdir(exposed_dir):
+        shutil.move(os.path.join(exposed_dir, name), os.path.join(source_dir, name))
+    os.rmdir(exposed_dir)
+    os.symlink(source_dir, exposed_dir)
+    print(f"migrated:{exposed_dir}->{source_dir}")
+    raise SystemExit(0)
+
+if os.path.lexists(exposed_dir):
+    print(f"unsupported:{exposed_dir}")
+    raise SystemExit(3)
+
+os.symlink(source_dir, exposed_dir)
+print(f"created:{exposed_dir}->{source_dir}")
+PYEOF
+)"
+        layout_status=$?
+
+        case "$layout_status" in
+            0)
+                return 0
+                ;;
+            2)
+                warn "共享路径已存在冲突文件，未自动迁移: ${shared_dir}"
+                echo -e "  ${DIM}请手动整理后改为软链: ${shared_dir} -> ${shared_source_dir}${NC}"
+                return 1
+                ;;
+            *)
+                warn "无法自动创建共享目录软链: ${shared_dir}"
+                echo -e "  ${DIM}${layout_output}${NC}"
+                return 1
+                ;;
+        esac
+    fi
+
+    if [[ ! -e "$shared_dir" ]]; then
+        ln -s "$shared_source_dir" "$shared_dir" 2>/dev/null && return 0
+    fi
+
+    warn "无法自动创建共享目录软链: ${shared_dir}"
+    echo -e "  ${DIM}请手动确认软链: ${shared_dir} -> ${shared_source_dir}${NC}"
+    return 1
+}
+
+
 hard_check_sandbox_shared_contract() {
-    # 硬校验：沙箱 agent 的共享目录契约必须成立（<workspace>/shared -> /app/shared）
+    # 硬校验：沙箱 agent 的共享目录契约必须成立（workspace/shared -> /app/shared/<agent_id>）
     if ! cmd_exists python3; then
         warn "未找到 python3，跳过共享目录契约校验"
         return 0
@@ -734,22 +981,24 @@ for agent in agents:
         errors.append(f"{agent_id}: workspaceAccess 不是 rw（当前: {sandbox.get('workspaceAccess')}）")
 
     workspace = agent.get('workspace') or os.path.expanduser(f"~/.openclaw/workspace-{agent_id}")
-    shared = os.path.join(workspace, 'shared')
+    shared_src = os.path.join(workspace, 'shared')
+    shared_dst = os.path.join('/app/shared', agent_id)
 
-    if not os.path.isdir(workspace):
-        errors.append(f"{agent_id}: workspace 不存在: {workspace}")
+    if not os.path.exists(shared_src):
+        os.makedirs(shared_src, exist_ok=True)
+        notes.append(f"{agent_id}: 已自动创建共享目录 {shared_src}")
+
+    if not os.path.lexists(shared_dst):
+        errors.append(f"{agent_id}: 缺少宿主机暴露路径 {shared_dst}（应软链到 {shared_src}）")
         continue
 
-    if not os.path.exists(shared):
-        os.makedirs(shared, exist_ok=True)
-        notes.append(f"{agent_id}: 已自动创建共享目录 {shared}")
-
-    if os.path.realpath(shared) != os.path.realpath(os.path.join(workspace, 'shared')):
-        errors.append(f"{agent_id}: 共享目录路径异常: {shared}")
+    if os.path.realpath(shared_dst) != os.path.realpath(shared_src):
+        errors.append(f"{agent_id}: 宿主机暴露路径异常（当前: {shared_dst} -> {os.path.realpath(shared_dst)}，期望: {shared_src}）")
+        continue
 
     docker_cfg = sandbox.get('docker', {})
-    expected_src = os.path.realpath(shared)
-    expected_dst = '/app/shared'
+    expected_src = os.path.realpath(shared_src)
+    expected_dst = shared_dst
     mount_ok = False
 
     for item in (docker_cfg.get('binds') or []):
@@ -775,7 +1024,7 @@ for agent in agents:
                 break
 
     if not mount_ok:
-        errors.append(f"{agent_id}: 缺少共享目录挂载（需要 {shared} -> /app/shared）")
+        errors.append(f"{agent_id}: 缺少共享目录挂载（需要 {shared_src} -> {shared_dst}）")
 
 if errors:
     print('SANDBOX_SHARED_CONTRACT_FAILED')
@@ -802,7 +1051,7 @@ PYEOF
     fi
 
     if [[ "$check_output" == *"SANDBOX_SHARED_CONTRACT_OK"* ]]; then
-        success "沙箱共享目录契约校验通过（容器内路径: /app/shared）"
+        success "沙箱共享目录契约校验通过（workspace/shared 已挂到 /app/shared/<agent_id>）"
         if echo "$check_output" | grep -q "^- "; then
             echo "$check_output" | grep "^- "
         fi
@@ -813,7 +1062,9 @@ PYEOF
             if [[ -n "$containers" ]]; then
                 while IFS= read -r c; do
                     [[ -z "$c" ]] && continue
-                    if ! docker exec -w /workspace "$c" sh -lc 'mkdir -p /app/shared && touch /app/shared/.probe && rm -f /app/shared/.probe' >/dev/null 2>&1; then
+                    local agent_id
+                    agent_id="${c#openclaw-sbx-agent-}"
+                    if ! docker exec -w /workspace "$c" sh -lc "mkdir -p '/app/shared/${agent_id}' && touch '/app/shared/${agent_id}/.probe' && rm -f '/app/shared/${agent_id}/.probe'" >/dev/null 2>&1; then
                         warn "运行时共享目录探针失败: ${c}"
                         probe_failed=1
                     fi
@@ -1003,21 +1254,27 @@ cleanup_openclaw_sandbox_containers() {
 }
 
 
-ensure_custom_sandbox_image() {
-    # 构建专用沙箱镜像（存在则跳过）
+require_custom_sandbox_image() {
+    # 启用沙箱 Agent 时强制检查专用沙箱镜像是否已准备完成
     if ! cmd_exists docker; then
-        warn "未找到 Docker，跳过专用沙箱镜像构建"
-        return 0
+        error "未找到 Docker，无法启用 Docker 沙箱"
+        _print_sandbox_runtime_instructions
+        return 1
     fi
 
     if ! docker info >/dev/null 2>&1; then
-        warn "Docker 未运行，跳过专用沙箱镜像构建"
-        return 0
-    fi
-
-    if docker image inspect "$OPENCLAW_SANDBOX_IMAGE" >/dev/null 2>&1; then
-        success "检测到专用沙箱镜像已存在: ${OPENCLAW_SANDBOX_IMAGE}"
-        return 0
+        if sudo docker info >/dev/null 2>&1; then
+            echo ""
+            error "Docker 已安装并运行，但当前用户无 socket 访问权限"
+            warn "请执行以下任一操作后重新运行脚本："
+            echo ""
+            echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
+            echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
+            echo ""
+        else
+            error "Docker 未运行，无法启用 Docker 沙箱"
+        fi
+        return 1
     fi
 
     if [[ ! -f "$OPENCLAW_SANDBOX_DOCKERFILE" ]]; then
@@ -1025,16 +1282,14 @@ ensure_custom_sandbox_image() {
         return 1
     fi
 
-    step "构建专用沙箱镜像: ${OPENCLAW_SANDBOX_IMAGE}"
-    if docker build \
-        -t "$OPENCLAW_SANDBOX_IMAGE" \
-        -f "$OPENCLAW_SANDBOX_DOCKERFILE" \
-        "$REPO_ROOT"; then
-        success "专用沙箱镜像构建成功: ${OPENCLAW_SANDBOX_IMAGE}"
+    if _sandbox_image_available; then
+        success "检测到专用沙箱镜像已存在: ${OPENCLAW_SANDBOX_IMAGE}"
         return 0
     fi
 
-    error "专用沙箱镜像构建失败: ${OPENCLAW_SANDBOX_IMAGE}"
+    error "未检测到专用沙箱镜像: ${OPENCLAW_SANDBOX_IMAGE}"
+    warn "启用 Docker 沙箱 Agent 前，请先手动构建专用沙箱镜像"
+    _print_sandbox_runtime_instructions
     return 1
 }
 
@@ -1078,7 +1333,7 @@ _detect_gateway_env_file() {
         return 0
     fi
 
-    for candidate in "/opt/openclaw/gateway/.env" "/opt/openclaw/.env" "${REPO_ROOT}/.env" "$(pwd)/.env"; do
+    for candidate in "${OPENCLAW_ENV_FILE}" "/opt/openclaw/gateway/.env" "/opt/openclaw/.env" "${REPO_ROOT}/.env" "$(pwd)/.env"; do
         if [[ -f "$candidate" ]]; then
             echo "$candidate"
             return 0
@@ -1732,7 +1987,10 @@ create_agent() {
 
     local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
     local agent_dir="${OPENCLAW_HOME}/agents/${agent_id}/agent"
-
+    local shared_dir
+    local shared_source_dir
+    shared_dir="$(shared_dir_for_agent "$agent_id")"
+    shared_source_dir="$(shared_source_dir_for_agent "$agent_id")"
     # 检查是否已存在
     if openclaw agents list 2>/dev/null | grep -q "^- ${agent_id}"; then
         warn "Agent '${agent_id}' 已存在"
@@ -1795,18 +2053,24 @@ PYEOF
         mkdir -p "$workspace"
     fi
 
+    if ensure_shared_dir_for_agent "$agent_id"; then
+        step "共享目录已就绪: ${shared_dir} -> ${shared_source_dir}"
+    else
+        warn "共享目录未就绪，后续请手动确认: ${shared_dir} -> ${shared_source_dir}"
+    fi
+
     local storage_mode
     storage_mode="$(_resolve_file_storage_mode)"
     _sync_gateway_skill_to_workspace "$storage_mode" "$agent_id" "$workspace"
 
     # 配置沙箱（非 main agent）
     if [[ "$use_sandbox" == "true" && "$agent_id" != "main" ]]; then
-        if ! ensure_custom_sandbox_image; then
-            error "专用沙箱镜像准备失败，无法为 Agent '${agent_id}' 配置沙箱"
+        if ! require_custom_sandbox_image; then
+            error "专用沙箱镜像未就绪，无法为 Agent '${agent_id}' 配置沙箱"
             return 1
         fi
         step "配置 Docker 沙箱..."
-        _configure_sandbox "$agent_id" "$agent_name"
+        _configure_sandbox "$agent_id" "$agent_name" "$shared_source_dir" "$shared_dir"
     fi
 
     # 设置 agent 名称和身份
@@ -1831,6 +2095,8 @@ PYEOF
     success "Agent '${agent_id}' 创建成功"
     echo -e "  ${DIM}Workspace: ${workspace}${NC}"
     echo -e "  ${DIM}Agent Dir: ${agent_dir}${NC}"
+    echo -e "  ${DIM}Shared Dir: ${shared_dir}${NC}"
+    echo -e "  ${DIM}Shared Src: ${shared_source_dir}${NC}"
     echo ""
 
     return 0
@@ -1840,27 +2106,27 @@ PYEOF
 _configure_sandbox() {
     local agent_id="$1"
     local agent_name_input="${2:-$1}"
+    local shared_source_dir="${3:-$(shared_source_dir_for_agent "$agent_id")}"
+    local shared_dir="${4:-$(shared_dir_for_agent "$agent_id")}"
     local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
     local agent_dir="${OPENCLAW_HOME}/agents/${agent_id}/agent"
-    local shared_dir="${workspace}/shared"
     local sandbox_image="$OPENCLAW_SANDBOX_IMAGE"
     local storage_mode
     storage_mode="$(_resolve_file_storage_mode)"
     _resolve_gateway_skill_runtime_values
 
-    # 确保共享目录存在。
-    # 约定：容器内通过 /app/shared 访问（避免 /workspace 保留挂载前缀冲突）
-    mkdir -p "$shared_dir"
+    # 约定：workspace 内 shared 目录作为挂载源，对外统一暴露为 /app/shared/<agent_id>。
+    ensure_shared_dir_for_agent "$agent_id" || true
     mkdir -p "$agent_dir"
 
     if cmd_exists python3; then
-        python3 - "$OPENCLAW_CONFIG" "$agent_id" "$agent_name_input" "$workspace" "$agent_dir" "$shared_dir" "$sandbox_image" "$storage_mode" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES" <<'PYEOF'
+        python3 - "$OPENCLAW_CONFIG" "$agent_id" "$agent_name_input" "$workspace" "$agent_dir" "$shared_source_dir" "$shared_dir" "$sandbox_image" "$storage_mode" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES" <<'PYEOF'
 import json
 import os
 import re
 import sys
 
-config_path, agent_id, agent_name_raw, workspace, agent_dir, shared_dir, sandbox_image, storage_mode, gateway_url, upload_token, upload_expires = sys.argv[1:12]
+config_path, agent_id, agent_name_raw, workspace, agent_dir, shared_source_dir, shared_dir, sandbox_image, storage_mode, gateway_url, upload_token, upload_expires = sys.argv[1:13]
 agent_name = (agent_name_raw or agent_id or '').strip() or agent_id
 
 with open(config_path, "r") as f:
@@ -1898,7 +2164,7 @@ docker_cfg = {
     "network": "bridge",
     "image": sandbox_image,
     "binds": [
-        f"{shared_dir}:/app/shared:rw"
+        f"{shared_source_dir}:{shared_dir}:rw"
     ],
     "setupCommand": "apt-get update && apt-get install -y git curl"
 }
@@ -1937,7 +2203,7 @@ target["tools"] = {
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 PYEOF
-        success "沙箱模板配置已写入（共享目录: ${shared_dir}，容器内路径: /app/shared）"
+        success "沙箱模板配置已写入（挂载源: ${shared_source_dir}，容器路径: ${shared_dir}）"
     else
         warn "未找到 python3，请手动配置沙箱"
     fi
@@ -2036,6 +2302,7 @@ configure_agents() {
         read -r agent_name </dev/tty
         agent_name="${agent_name:-$agent_id}"
 
+        echo "说明: 仅启用沙箱时才需要 Docker 和专用沙箱镜像；非沙箱 Agent 无需 Docker。"
         printf "%s" "是否启用 Docker 沙箱? (直接回车默认 Yes) [Y/n]: "
         read -r sandbox_yn </dev/tty
         sandbox_yn="${sandbox_yn:-y}"
@@ -2072,7 +2339,13 @@ configure_gateway_integration() {
     # 读取 Gateway 配置
     local gw_port gw_token
     gw_port=$(config_get "gateway.port" 2>/dev/null || echo "18789")
-    gw_token=$(_read_token_from_config_file "auth")
+    gw_token="${OPENCLAW_GATEWAY_TOKEN:-}"
+    if [[ -z "$gw_token" ]]; then
+        gw_token="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_GATEWAY_TOKEN")"
+    fi
+    if [[ -z "$gw_token" ]]; then
+        gw_token="$(_read_token_from_config_file "auth")"
+    fi
 
     echo "OpenClaw Gateway 配置:"
     echo -e "  端口: ${BOLD}${gw_port}${NC}"
@@ -2089,25 +2362,27 @@ configure_gateway_integration() {
         # 显示当前 Gateway 需要的 OpenClaw 连接信息
         echo ""
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
-        echo -e "  ${BOLD}OPENCLAW_URL${NC}=http://localhost:${gw_port}"
-        echo -e "  ${BOLD}OPENCLAW_TOKEN${NC}=${gw_token}"
+        echo -e "  ${BOLD}Gateway URL${NC}: http://localhost:${gw_port}"
+        echo -e "  ${BOLD}Gateway Token${NC}: ${gw_token}"
         echo ""
-        echo "在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
-        echo "不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。"
+        echo "在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 Gateway 地址和 Gateway Token。"
+        echo "Agent ID 同时作为 OpenClaw agent_id 与 SQLite 路由名。"
         echo ""
-        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /app/shared 访问）:"
-        echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
+        echo "共享文件目录（Gateway 向 Agent 下发的固定路径）:"
+        echo -e "  对外路径: ${BOLD}/app/shared/<agent_id>${NC}"
+        echo -e "  实际来源: ${BOLD}~/.openclaw/workspace-<agent_id>/shared${NC}（通过软链 + bind 暴露）"
     else
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
-        echo -e "  ${BOLD}OpenClaw URL${NC}: http://localhost:${gw_port}"
-        echo -e "  ${BOLD}OpenClaw Token${NC}: ${gw_token}"
+        echo -e "  ${BOLD}Gateway URL${NC}: http://localhost:${gw_port}"
+        echo -e "  ${BOLD}Gateway Token${NC}: ${gw_token}"
         echo ""
         echo "添加 Gateway Agent 绑定时使用:"
-        echo -e "  ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
-        echo "  在交互式提示中填入以上 URL 和 Token，以及对应的 openclaw_agent_id。"
+        echo -e "  ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add [agent_id]${NC}"
+        echo "  在交互式提示中填入以上 URL 和 Token，并保持 Agent ID 与路由名一致。"
         echo ""
-        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /app/shared 访问）:"
-        echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
+        echo "共享文件目录（Gateway 向 Agent 下发的固定路径）:"
+        echo -e "  对外路径: ${BOLD}/app/shared/<agent_id>${NC}"
+        echo -e "  实际来源: ${BOLD}~/.openclaw/workspace-<agent_id>/shared${NC}（通过软链 + bind 暴露）"
     fi
 
     echo ""
