@@ -195,6 +195,19 @@ _print_prereq_instructions() {
 check_prerequisites() {
     header "第一步：检查前置环境"
 
+    # --- 设置固定 Gateway Token（避免每次重新生成）---
+    if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
+        OPENCLAW_GATEWAY_TOKEN="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 32)"
+        export OPENCLAW_GATEWAY_TOKEN
+        step "已生成固定 Gateway Token: ${OPENCLAW_GATEWAY_TOKEN:0:16}..."
+        echo ""
+        echo -e "${YELLOW}提示：将以下内容添加到 ~/.bashrc 或 ~/.zshrc 以永久保存：${NC}"
+        echo -e "${DIM}export OPENCLAW_GATEWAY_TOKEN=\"${OPENCLAW_GATEWAY_TOKEN}\"${NC}"
+        echo ""
+    else
+        step "使用已有 Gateway Token: ${OPENCLAW_GATEWAY_TOKEN:0:16}..."
+    fi
+
     local missing=false
 
     # --- cmake / 构建工具 ---
