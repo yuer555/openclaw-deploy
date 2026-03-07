@@ -1639,6 +1639,52 @@ _resolve_file_storage_mode() {
 UPLOAD_SKILL_GATEWAY_URL=""
 UPLOAD_SKILL_TOKEN=""
 UPLOAD_SKILL_EXPIRES=""
+UPLOAD_SKILL_SANDBOX_GATEWAY_URL=""
+
+
+_resolve_sandbox_upload_skill_gateway_url() {
+    local gateway_url="$1"
+
+python3 - "$gateway_url" <<'PYEOF'
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+gateway_url = (sys.argv[1] or '').strip()
+if not gateway_url:
+    print('')
+    sys.exit(0)
+
+try:
+    parsed = urlsplit(gateway_url)
+except Exception:
+    print(gateway_url)
+    sys.exit(0)
+
+hostname = (parsed.hostname or '').strip().lower()
+if hostname not in {'localhost', '127.0.0.1', '::1'}:
+    print(gateway_url)
+    sys.exit(0)
+
+netloc = parsed.netloc
+if '@' in netloc:
+    userinfo, hostport = netloc.rsplit('@', 1)
+    prefix = f'{userinfo}@'
+else:
+    prefix = ''
+    hostport = netloc
+
+if hostport.startswith('['):
+    closing = hostport.find(']')
+    remainder = hostport[closing + 1:] if closing >= 0 else ''
+else:
+    remainder = ''
+    if ':' in hostport:
+        remainder = hostport[hostport.find(':'):]
+
+new_netloc = f'{prefix}host.docker.internal{remainder}'
+print(urlunsplit((parsed.scheme, new_netloc, parsed.path, parsed.query, parsed.fragment)))
+PYEOF
+}
 
 
 _resolve_gateway_skill_runtime_values() {
@@ -1670,6 +1716,7 @@ _resolve_gateway_skill_runtime_values() {
 
     UPLOAD_SKILL_GATEWAY_URL="${UPLOAD_SKILL_GATEWAY_URL:-http://localhost:8000}"
     UPLOAD_SKILL_EXPIRES="${UPLOAD_SKILL_EXPIRES:-86400}"
+    UPLOAD_SKILL_SANDBOX_GATEWAY_URL="$(_resolve_sandbox_upload_skill_gateway_url "$UPLOAD_SKILL_GATEWAY_URL")"
 }
 
 
@@ -1770,6 +1817,7 @@ _configure_gateway_skill_runtime_env() {
     local gateway_url="$2"
     local upload_token="$3"
     local expires_seconds="$4"
+    local sandbox_gateway_url
     local runtime_summary
 
     if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
@@ -1777,20 +1825,23 @@ _configure_gateway_skill_runtime_env() {
         return 0
     fi
 
+    sandbox_gateway_url="$(_resolve_sandbox_upload_skill_gateway_url "$gateway_url")"
     _write_upload_skill_env_to_openclaw_env_file "$gateway_url" "$upload_token" "$expires_seconds"
 
-    runtime_summary="$(python3 - "$OPENCLAW_CONFIG" "$GATEWAY_SKILL_NAME" "$enabled" "$gateway_url" "$upload_token" "$expires_seconds" <<'PYEOF'
+    runtime_summary="$(python3 - "$OPENCLAW_CONFIG" "$GATEWAY_SKILL_NAME" "$enabled" "$gateway_url" "$sandbox_gateway_url" "$upload_token" "$expires_seconds" <<'PYEOF'
 import json
 import re
 import sys
+from urllib.parse import urlsplit
 
-config_path, skill_key, enabled_raw, gateway_url, upload_token, expires_seconds = sys.argv[1:7]
+config_path, skill_key, enabled_raw, gateway_url, sandbox_gateway_url, upload_token, expires_seconds = sys.argv[1:8]
 enabled = enabled_raw.lower() == 'true'
 managed_keys = [
     'OPENCLAW_FILE_UPLOAD_GATEWAY_URL',
     'OPENCLAW_FILE_UPLOAD_TOKEN',
     'OPENCLAW_FILE_UPLOAD_EXPIRES',
 ]
+managed_extra_host = 'host.docker.internal:host-gateway'
 
 with open(config_path, 'r', encoding='utf-8') as f:
     content = f.read()
@@ -1816,6 +1867,12 @@ if isinstance(entry_env, dict):
 
 updates = {
     'OPENCLAW_FILE_UPLOAD_GATEWAY_URL': gateway_url if enabled else '',
+    'OPENCLAW_FILE_UPLOAD_TOKEN': upload_token if enabled else '',
+    'OPENCLAW_FILE_UPLOAD_EXPIRES': expires_seconds if enabled else '',
+}
+
+sandbox_updates = {
+    'OPENCLAW_FILE_UPLOAD_GATEWAY_URL': sandbox_gateway_url if enabled else '',
     'OPENCLAW_FILE_UPLOAD_TOKEN': upload_token if enabled else '',
     'OPENCLAW_FILE_UPLOAD_EXPIRES': expires_seconds if enabled else '',
 }
@@ -1856,6 +1913,30 @@ def apply_updates_to_docker_env(docker_cfg, values):
         docker_cfg.pop('env', None)
 
 
+def ensure_managed_extra_host(docker_cfg, enabled_flag):
+    extra_hosts = docker_cfg.get('extraHosts')
+    if not isinstance(extra_hosts, list):
+        extra_hosts = []
+
+    normalized = [item for item in extra_hosts if isinstance(item, str) and item.strip()]
+    normalized = [item for item in normalized if item != managed_extra_host]
+    if enabled_flag:
+        normalized.append(managed_extra_host)
+
+    if normalized:
+        docker_cfg['extraHosts'] = normalized
+    else:
+        docker_cfg.pop('extraHosts', None)
+
+
+def needs_host_gateway_alias(url):
+    try:
+        hostname = (urlsplit(url).hostname or '').strip().lower()
+    except Exception:
+        return False
+    return hostname == 'host.docker.internal'
+
+
 sandbox_agent_ids = []
 for agent in agents.get('list', []):
     sandbox = agent.get('sandbox')
@@ -1864,7 +1945,8 @@ for agent in agents.get('list', []):
 
     docker = sandbox.setdefault('docker', {})
     if sandbox_enabled(agent):
-        apply_updates_to_docker_env(docker, updates)
+        apply_updates_to_docker_env(docker, sandbox_updates)
+        ensure_managed_extra_host(docker, bool(enabled and sandbox_gateway_url and needs_host_gateway_alias(sandbox_gateway_url)))
         sandbox_agent_ids.append((agent.get('id') or '').strip())
     else:
         apply_updates_to_docker_env(docker, {
@@ -1872,6 +1954,7 @@ for agent in agents.get('list', []):
             'OPENCLAW_FILE_UPLOAD_TOKEN': '',
             'OPENCLAW_FILE_UPLOAD_EXPIRES': '',
         })
+        ensure_managed_extra_host(docker, False)
 
 with open(config_path, 'w', encoding='utf-8') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
@@ -1914,6 +1997,9 @@ setup_gateway_file_upload_skill() {
     echo -e "  ${DIM}如果 OpenClaw 当前已在运行，必须重启 OpenClaw 进程后才会生效${NC}"
     if [[ "${UPLOAD_SKILL_SANDBOX_AGENT_COUNT:-0}" -gt 0 ]]; then
         echo -e "  ${DIM}沙箱 Agent：变量已写入 ${UPLOAD_SKILL_SANDBOX_AGENT_COUNT} 个 agent 的 sandbox.docker.env${NC}"
+        if [[ "${UPLOAD_SKILL_SANDBOX_GATEWAY_URL:-}" != "${UPLOAD_SKILL_GATEWAY_URL}" ]]; then
+            echo -e "  ${DIM}检测到上传地址使用 localhost，沙箱内已自动改为: ${UPLOAD_SKILL_SANDBOX_GATEWAY_URL}${NC}"
+        fi
         if [[ -n "${UPLOAD_SKILL_SANDBOX_AGENT_IDS:-}" ]]; then
             echo -e "  ${DIM}涉及的沙箱 Agent: ${UPLOAD_SKILL_SANDBOX_AGENT_IDS}${NC}"
         fi
@@ -2441,13 +2527,14 @@ _configure_sandbox() {
     mkdir -p "$agent_dir"
 
     if cmd_exists python3; then
-        python3 - "$OPENCLAW_CONFIG" "$agent_id" "$agent_name_input" "$workspace" "$agent_dir" "$shared_source_dir" "$shared_dir" "$sandbox_image" "$storage_mode" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES" <<'PYEOF'
+        python3 - "$OPENCLAW_CONFIG" "$agent_id" "$agent_name_input" "$workspace" "$agent_dir" "$shared_source_dir" "$shared_dir" "$sandbox_image" "$storage_mode" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_SANDBOX_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES" <<'PYEOF'
 import json
 import os
 import re
 import sys
+from urllib.parse import urlsplit
 
-config_path, agent_id, agent_name_raw, workspace, agent_dir, shared_source_dir, shared_dir, sandbox_image, storage_mode, gateway_url, upload_token, upload_expires = sys.argv[1:13]
+config_path, agent_id, agent_name_raw, workspace, agent_dir, shared_source_dir, shared_dir, sandbox_image, storage_mode, gateway_url, sandbox_gateway_url, upload_token, upload_expires = sys.argv[1:14]
 agent_name = (agent_name_raw or agent_id or '').strip() or agent_id
 
 with open(config_path, "r") as f:
@@ -2491,13 +2578,21 @@ docker_cfg = {
 }
 
 if gateway_url:
-    docker_cfg["env"]["OPENCLAW_FILE_UPLOAD_GATEWAY_URL"] = gateway_url
+    docker_cfg["env"]["OPENCLAW_FILE_UPLOAD_GATEWAY_URL"] = sandbox_gateway_url or gateway_url
 if upload_token:
     docker_cfg["env"]["OPENCLAW_FILE_UPLOAD_TOKEN"] = upload_token
 if upload_expires:
     docker_cfg["env"]["OPENCLAW_FILE_UPLOAD_EXPIRES"] = str(upload_expires)
 if not docker_cfg["env"]:
     docker_cfg.pop("env", None)
+
+try:
+    sandbox_gateway_host = (urlsplit(sandbox_gateway_url or '').hostname or '').strip().lower()
+except Exception:
+    sandbox_gateway_host = ''
+
+if sandbox_gateway_host == 'host.docker.internal':
+    docker_cfg["extraHosts"] = ["host.docker.internal:host-gateway"]
 
 target["sandbox"] = {
     "mode": "all",

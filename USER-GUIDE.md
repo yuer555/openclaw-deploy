@@ -1668,7 +1668,9 @@ sudo crontab -e
   - `OPENCLAW_FILE_UPLOAD_TOKEN` ← `FILE_UPLOAD_INTERNAL_TOKEN`
   - `OPENCLAW_FILE_UPLOAD_EXPIRES` ← `FILE_STORAGE_PRESIGN_EXPIRES`
 - 非沙箱 Agent：写入 `~/.openclaw/.env`；如果 OpenClaw 当前已在运行，必须重启 OpenClaw 后生效。
-- 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；如果沙箱容器已存在，执行 `openclaw sandbox recreate --agent <agent_id>`。
+- 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；如果原始地址是 `localhost/127.0.0.1`，脚本会自动改成 `host.docker.internal`，并补 `extraHosts: ["host.docker.internal:host-gateway"]`。
+- 沙箱容器已存在时，执行 `openclaw sandbox recreate --agent <agent_id>`。
+- 这里自动转换的是 **上传 Skill 使用的 `OPENCLAW_FILE_UPLOAD_GATEWAY_URL`**；`GATEWAY_URL` 本身仍保留原值，继续给管理脚本回调 `/admin/reload` 使用。
 
 #### S3 模式配置（`FILE_STORAGE_MODE=s3`）
 
@@ -1779,7 +1781,8 @@ sudo systemctl restart openclaw-gateway
   - `OPENCLAW_FILE_UPLOAD_EXPIRES` = `FILE_STORAGE_PRESIGN_EXPIRES`
 - 下发位置：
   - 非沙箱 Agent：写入 `~/.openclaw/.env`；若 OpenClaw 已在运行，必须重启 OpenClaw 后生效
-  - 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；若容器已存在，执行 `openclaw sandbox recreate --agent <agent_id>`
+  - 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；若原始地址是 `localhost/127.0.0.1`，脚本会自动改成 `host.docker.internal`，并补 `extraHosts: ["host.docker.internal:host-gateway"]`
+  - 沙箱容器已存在时，执行 `openclaw sandbox recreate --agent <agent_id>`
 
 #### 启用 S3 模式
 
