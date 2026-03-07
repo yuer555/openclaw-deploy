@@ -292,6 +292,8 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER
 newgrp docker
+# 如果仍报 permission denied while trying to connect to the docker API
+sudo chmod 666 /var/run/docker.sock
 ```
 
 ```bash
@@ -303,7 +305,14 @@ sudo yum install -y docker-ce docker-ce-cli containerd.io
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER
 newgrp docker
+# 如果仍报 permission denied while trying to connect to the docker API
+sudo chmod 666 /var/run/docker.sock
 ```
+
+补充说明：
+- 推荐优先使用重新登录或 `newgrp docker` 让用户组权限生效。
+- 如果仍出现 `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`，可临时执行 `sudo chmod 666 /var/run/docker.sock` 作为兜底。
+- 这一步主要用于解决 OpenClaw 沙箱报错，例如：`Failed to inspect sandbox image: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`。
 
 ```bash
 # 2) 配置镜像加速（各系统通用，腾讯云机器优先）

@@ -63,6 +63,7 @@ bash bin/03-install-openclaw.sh --add-provider
 - 需要 Node.js 22+
 - Docker **仅在创建沙箱 Agent 时需要**
 - 如果启用沙箱但 Docker / 沙箱镜像未准备，脚本会提示安装 Docker、配置镜像加速和构建镜像
+- 如果启用沙箱后仍报 `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`，可先执行 `newgrp docker`；仍未恢复时，再执行 `sudo chmod 666 /var/run/docker.sock` 兜底
 - Ubuntu 系统已知兼容性提示：
   - OpenClaw `2026.03.02`（2026 年 3 月 2 日版本）在 Ubuntu 上存在自启动兼容性问题，`03-install-openclaw.sh` 可能无法通过 `openclaw onboard --install-daemon` 正常注册自启动
   - 当前更推荐使用 OpenClaw `2026.02.26`（2026 年 2 月 26 日版本）

@@ -312,6 +312,8 @@ _print_sandbox_runtime_instructions() {
     echo "  sudo systemctl enable --now docker"
     echo "  sudo usermod -aG docker \$USER"
     echo "  newgrp docker   # 或重新登录"
+    echo "  # 如果仍报 permission denied while trying to connect to the docker API"
+    echo "  sudo chmod 666 /var/run/docker.sock   # 临时兜底方案"
     echo ""
     echo -e "${CYAN}▸ 2. 配置镜像加速${NC}（腾讯云机器优先）"
     echo ""
@@ -504,6 +506,7 @@ check_prerequisites() {
             echo ""
             echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
             echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
+            echo "  方式三（临时兜底）：执行 'sudo chmod 666 /var/run/docker.sock' 后再运行脚本"
             echo ""
         else
             warn "未检测到可用 Docker（若后续启用 Docker 沙箱 Agent，请先安装并启动 Docker）"
@@ -1540,6 +1543,7 @@ require_custom_sandbox_image() {
             echo ""
             echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
             echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
+            echo "  方式三（临时兜底）：执行 'sudo chmod 666 /var/run/docker.sock' 后再运行脚本"
             echo ""
         else
             error "Docker 未运行，无法启用 Docker 沙箱"
