@@ -65,6 +65,7 @@ GATEWAY_TOKEN_SYNC_CHANGED=false
 GATEWAY_TOKEN_PREPARE_REQUIRED=false
 UPLOAD_SKILL_SANDBOX_AGENT_COUNT=0
 UPLOAD_SKILL_SANDBOX_AGENT_IDS=""
+PLAN_CREATE_SANDBOX_AGENT=""
 
 # ---------------------------------------------------------------------------
 # 参数解析
@@ -313,24 +314,24 @@ _print_sandbox_runtime_instructions() {
     echo "  sudo usermod -aG docker \$USER"
     echo "  newgrp docker   # 或重新登录"
     echo "  # 如果仍报 permission denied while trying to connect to the docker API"
-    echo "  sudo chmod 666 /var/run/docker.sock   # 临时兜底方案"
+    echo "  sudo chmod 777 /var/run/docker.sock   # 临时兜底方案"
     echo ""
     echo -e "${CYAN}▸ 2. 配置镜像加速${NC}（腾讯云机器优先）"
     echo ""
     cat <<'EOF'
-  sudo mkdir -p /etc/docker
-  sudo tee /etc/docker/daemon.json > /dev/null <<'JSON'
-  {
-    "registry-mirrors": [
-      "https://mirror.ccs.tencentyun.com",
-      "https://hub-mirror.c.163.com",
-      "https://mirror.baidubce.com"
-    ]
-  }
-  JSON
-  sudo systemctl daemon-reload
-  sudo systemctl restart docker
-  docker info | sed -n '/Registry Mirrors/,$p'
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json > /dev/null <<'JSON'
+{
+  "registry-mirrors": [
+    "https://mirror.ccs.tencentyun.com",
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com"
+  ]
+}
+JSON
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+docker info | sed -n '/Registry Mirrors/,$p'
 EOF
     echo ""
     echo -e "${CYAN}▸ 3. 构建专用沙箱镜像${NC}"
@@ -365,29 +366,49 @@ _sandbox_image_available() {
 }
 
 
-maybe_offer_sandbox_runtime_instructions() {
-    local show_help_yn="n"
-
+prompt_sandbox_plan_if_needed() {
     if [[ "${ADD_PROVIDER_ONLY}" == "true" ]]; then
+        PLAN_CREATE_SANDBOX_AGENT="false"
+        return 0
+    fi
+
+    if [[ -n "${PLAN_CREATE_SANDBOX_AGENT}" ]]; then
         return 0
     fi
 
     if [[ ! -r /dev/tty ]]; then
+        PLAN_CREATE_SANDBOX_AGENT="true"
         return 0
     fi
 
     echo ""
-    printf "%s" "如果你准备稍后创建沙箱 Agent，现在要查看准备命令并先退出脚本吗？[y/N]: "
-    read -r show_help_yn </dev/tty || show_help_yn="n"
-    show_help_yn="${show_help_yn:-n}"
-
-    if [[ "$show_help_yn" =~ ^[Yy] ]]; then
-        _print_sandbox_runtime_instructions
-        echo ""
-        info "已为你展示 Docker / 沙箱镜像准备命令。"
-        info "准备完成后，请重新运行本脚本继续安装。"
-        exit 0
+    echo "说明: 只有本次需要创建 Docker 沙箱 Agent 时，才需要 Docker 和专用沙箱镜像。"
+    if confirm "本次是否计划创建 Docker 沙箱 Agent? (直接回车默认 Yes)" "y"; then
+        PLAN_CREATE_SANDBOX_AGENT="true"
+        info "已选择创建沙箱 Agent；后续会先检查 Docker 和专用沙箱镜像。"
+    else
+        PLAN_CREATE_SANDBOX_AGENT="false"
+        info "已选择非沙箱流程；后续只有你明确为某个 Agent 启用沙箱时，才会再检查 Docker。"
     fi
+}
+
+
+ensure_planned_sandbox_runtime_ready() {
+    if [[ "${PLAN_CREATE_SANDBOX_AGENT}" != "true" ]]; then
+        return 0
+    fi
+
+    echo ""
+    step "你已选择创建 Docker 沙箱 Agent，先检查沙箱运行环境..."
+    if require_custom_sandbox_image; then
+        success "Docker 与专用沙箱镜像已就绪，将继续后续引导"
+        return 0
+    fi
+
+    echo ""
+    info "当前 Docker 或专用沙箱镜像未准备完成，已停止后续引导。"
+    info "请按上面的提示准备完成后，重新运行本脚本。"
+    exit 0
 }
 
 # 打印前置依赖安装指南
@@ -496,8 +517,7 @@ check_prerequisites() {
             if docker image inspect "$OPENCLAW_SANDBOX_IMAGE" >/dev/null 2>&1; then
                 success "已检测到沙箱镜像: ${OPENCLAW_SANDBOX_IMAGE}"
             else
-                step "未检测到沙箱镜像（只有创建 Docker 沙箱 Agent 时才需要）"
-                maybe_offer_sandbox_runtime_instructions
+                step "未检测到沙箱镜像（仅当你后续创建 Docker 沙箱 Agent 时才需要）"
             fi
         elif sudo docker info &>/dev/null 2>&1; then
             echo ""
@@ -506,7 +526,7 @@ check_prerequisites() {
             echo ""
             echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
             echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
-            echo "  方式三（临时兜底）：执行 'sudo chmod 666 /var/run/docker.sock' 后再运行脚本"
+            echo "  方式三（临时兜底）：执行 'sudo chmod 777 /var/run/docker.sock' 后再运行脚本"
             echo ""
         else
             warn "未检测到可用 Docker（若后续启用 Docker 沙箱 Agent，请先安装并启动 Docker）"
@@ -528,6 +548,8 @@ check_prerequisites() {
         error "请安装以上缺失依赖后重新运行本脚本"
         exit 1
     fi
+
+    ensure_planned_sandbox_runtime_ready
 
     echo ""
 
@@ -564,16 +586,12 @@ check_prerequisites() {
         ensure_gateway_token
     fi
 
-    # --- 确保 Gateway 已启动 ---
-    ensure_gateway_running
-
     # --- 对齐 Gateway token（auth/remote）---
     echo ""
     step "同步 Gateway token 配置..."
     sync_gateway_tokens
     if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
-        step "检测到 token 变更，重启 Gateway 使配置生效..."
-        restart_gateway_after_token_change || true
+        step "检测到 token 变更，将在后续统一重启 Gateway 使配置生效"
     fi
 }
 
@@ -765,6 +783,22 @@ restart_gateway_after_token_change() {
     }
     sleep 2
     return 0
+}
+
+
+restart_gateway_for_stage() {
+    local stage_label="${1:-应用配置}"
+
+    echo ""
+    step "统一重启 OpenClaw Gateway（${stage_label}）..."
+    ensure_gateway_running
+    if restart_gateway_after_token_change; then
+        success "OpenClaw Gateway 重启完成（${stage_label}）"
+        return 0
+    fi
+
+    warn "OpenClaw Gateway 重启失败（${stage_label}），请稍后手动处理"
+    return 1
 }
 
 # JSON5 配置读取（通过 openclaw config get）
@@ -1543,7 +1577,7 @@ require_custom_sandbox_image() {
             echo ""
             echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
             echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
-            echo "  方式三（临时兜底）：执行 'sudo chmod 666 /var/run/docker.sock' 后再运行脚本"
+            echo "  方式三（临时兜底）：执行 'sudo chmod 777 /var/run/docker.sock' 后再运行脚本"
             echo ""
         else
             error "Docker 未运行，无法启用 Docker 沙箱"
@@ -1998,7 +2032,7 @@ setup_gateway_file_upload_skill() {
     _sync_gateway_skill_to_all_workspaces
     step "已写入 Skill 运行环境（Gateway: ${UPLOAD_SKILL_GATEWAY_URL}，Expires: ${UPLOAD_SKILL_EXPIRES}s）"
     echo -e "  ${DIM}非沙箱 Agent：变量已写入 ${OPENCLAW_ENV_FILE}${NC}"
-    echo -e "  ${DIM}如果 OpenClaw 当前已在运行，必须重启 OpenClaw 进程后才会生效${NC}"
+    echo -e "  ${DIM}脚本结束前会统一重启一次 OpenClaw Gateway，使非沙箱 Agent 配置生效${NC}"
     if [[ "${UPLOAD_SKILL_SANDBOX_AGENT_COUNT:-0}" -gt 0 ]]; then
         echo -e "  ${DIM}沙箱 Agent：变量已写入 ${UPLOAD_SKILL_SANDBOX_AGENT_COUNT} 个 agent 的 sandbox.docker.env${NC}"
         if [[ "${UPLOAD_SKILL_SANDBOX_GATEWAY_URL:-}" != "${UPLOAD_SKILL_GATEWAY_URL}" ]]; then
@@ -2689,6 +2723,14 @@ edit_agent_persona() {
 
 configure_agents() {
     header "第三步：创建和配置 Agent"
+    local sandbox_default_yn="y"
+    local sandbox_prompt_suffix="(直接回车默认 Yes) [Y/n]"
+    local gateway_restarted_before_agents="false"
+
+    if [[ "${PLAN_CREATE_SANDBOX_AGENT}" != "true" ]]; then
+        sandbox_default_yn="n"
+        sandbox_prompt_suffix="(直接回车默认 No) [y/N]"
+    fi
 
     # 显示当前 Agent
     step "当前已配置的 Agent:"
@@ -2713,6 +2755,11 @@ configure_agents() {
             break
         fi
 
+        if [[ "$gateway_restarted_before_agents" != "true" ]]; then
+            restart_gateway_for_stage "添加 Agent 前" || true
+            gateway_restarted_before_agents="true"
+        fi
+
         echo ""
         printf "%s" "Agent ID (英文标识, 如 development, testing, service): "
         read -r agent_id </dev/tty
@@ -2726,9 +2773,9 @@ configure_agents() {
         agent_name="${agent_name:-$agent_id}"
 
         echo "说明: 仅启用沙箱时才需要 Docker 和专用沙箱镜像；非沙箱 Agent 无需 Docker。"
-        printf "%s" "是否启用 Docker 沙箱? (直接回车默认 Yes) [Y/n]: "
+        printf "%s" "是否启用 Docker 沙箱? ${sandbox_prompt_suffix}: "
         read -r sandbox_yn </dev/tty
-        sandbox_yn="${sandbox_yn:-y}"
+        sandbox_yn="${sandbox_yn:-$sandbox_default_yn}"
         if [[ "$sandbox_yn" =~ ^[Yy] ]]; then
             use_sandbox="true"
         else
@@ -2829,26 +2876,27 @@ final_check() {
     openclaw models list 2>/dev/null || echo "  (无)"
     echo ""
 
-    # 健康检查
-    step "OpenClaw 健康检查..."
-    if openclaw health 2>/dev/null; then
-        success "OpenClaw Gateway 运行正常"
-    else
-        warn "OpenClaw Gateway 未运行。启动命令: $(gateway_start_hint)"
-    fi
-
     # 对于 --skip-install / --add-agent 模式，也要确保 token 配置对齐
     step "同步 Gateway token 配置..."
     sync_gateway_tokens
     if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
-        step "检测到 token 变更，重启 Gateway 使配置生效..."
-        restart_gateway_after_token_change || true
+        step "检测到 token 变更，将在最终统一重启 Gateway 使配置生效"
     fi
 
     step "安装/刷新每个 Agent workspace 下的文件上传 Skill..."
     if ! setup_gateway_file_upload_skill; then
         error "文件上传 Skill 配置失败"
         exit 1
+    fi
+
+    restart_gateway_for_stage "最终配置完成后" || true
+
+    # 健康检查
+    step "OpenClaw 健康检查..."
+    if openclaw health 2>/dev/null; then
+        success "OpenClaw Gateway 运行正常"
+    else
+        warn "OpenClaw Gateway 未运行。启动命令: $(gateway_start_hint)"
     fi
 
     # 硬校验：沙箱共享目录契约
@@ -2893,6 +2941,8 @@ main() {
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════╝${NC}"
     echo ""
 
+    prompt_sandbox_plan_if_needed
+
     # 快捷模式
     if [[ "$ADD_AGENT_ONLY" == "true" ]]; then
         if ! cmd_exists openclaw; then
@@ -2900,6 +2950,7 @@ main() {
             _print_prereq_instructions
             exit 1
         fi
+        ensure_planned_sandbox_runtime_ready
         configure_agents
         final_check
         return 0
@@ -2925,6 +2976,7 @@ main() {
             exit 1
         fi
         success "跳过安装，OpenClaw $(openclaw --version)"
+        ensure_planned_sandbox_runtime_ready
     fi
 
     configure_models

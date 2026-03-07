@@ -91,7 +91,14 @@ Ubuntu 兼容性提示：
 
 ### 2.1.1 第一步：检查环境 & 安装 OpenClaw
 
-脚本会自动检测 Node.js (22+)、npm；Docker 仅在你创建沙箱 Agent 时才需要。
+脚本一开始会先问你：**本次是否计划创建 Docker 沙箱 Agent**（默认 Yes）。
+
+- 如果你选择 **否**：脚本按普通 Agent 流程继续，不会提前把 Docker 准备指南打到你脸上。
+- 如果你选择 **是**：脚本会在正式进入安装/初始化引导前，先检查 Docker 和专用沙箱镜像。
+- 如果沙箱运行环境未准备好：脚本会直接停止后续引导，展示 Docker 安装、镜像加速、沙箱镜像构建命令，等你准备完成后再重新运行。
+- 为避免中途频繁重启，`03-install-openclaw.sh` 会把 Gateway 重启收口成两次：首次新建 Agent 前统一一次、脚本结束时统一一次。
+
+脚本也会自动检测 Node.js (22+)、npm；Docker 仅在你创建沙箱 Agent 时才需要。
 如果本机残留过历史 OpenClaw 沙箱容器，脚本在首次初始化和“清理重装”前都会先执行一次沙箱清理。
 
 #### 场景 A：OpenClaw 未安装
@@ -273,7 +280,7 @@ Agent ID (英文标识, 如 development, testing, service): development
 
 如果你选择启用沙箱，脚本会检查 Docker 和专用沙箱镜像是否已准备好：
 - 已准备好：继续创建 Agent。
-- 未准备好：在第一步和实际启用沙箱时都会提示你是否查看安装 Docker、配置镜像加速、构建沙箱镜像的命令；如果你选择查看，脚本会先退出，等你准备完成后再重新运行。
+- 未准备好：脚本会直接退出当前引导，展示安装 Docker、配置镜像加速、构建沙箱镜像的命令；准备完成后再重新运行。
 
 沙箱准备命令（仅沙箱 Agent 需要，脚本会按当前系统提示对应命令）：
 
@@ -292,8 +299,6 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER
 newgrp docker
-# 如果仍报 permission denied while trying to connect to the docker API
-sudo chmod 666 /var/run/docker.sock
 ```
 
 ```bash
@@ -305,14 +310,17 @@ sudo yum install -y docker-ce docker-ce-cli containerd.io
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER
 newgrp docker
-# 如果仍报 permission denied while trying to connect to the docker API
-sudo chmod 666 /var/run/docker.sock
 ```
 
 补充说明：
 - 推荐优先使用重新登录或 `newgrp docker` 让用户组权限生效。
-- 如果仍出现 `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`，可临时执行 `sudo chmod 666 /var/run/docker.sock` 作为兜底。
-- 这一步主要用于解决 OpenClaw 沙箱报错，例如：`Failed to inspect sandbox image: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`。
+- `sudo chmod 777 /var/run/docker.sock` 不作为 Docker 安装步骤的一部分，而是运行期排障兜底命令。
+- 它主要用于这种场景：**沙箱 Agent 已创建完成，也已经和 SQLite 路由绑定成功，但在真正收发消息时**，OpenClaw 报错：`Failed to inspect sandbox image: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`。
+- 如果出现上述报错，可执行：
+  ```bash
+  sudo chmod 777 /var/run/docker.sock
+  ```
+- 这一步执行后**无需重启 Docker、无需重启 OpenClaw、也无需重启 Gateway**，直接重新发消息验证即可。
 
 ```bash
 # 2) 配置镜像加速（各系统通用，腾讯云机器优先）
@@ -1298,9 +1306,44 @@ bash /opt/openclaw/gateway/scripts/gateway-ctl.sh list-agents
 
 ---
 
-### 8.3 数据问题
+### 8.3 沙箱运行问题
 
-#### Q6: 如何查看历史消息？
+#### Q6: 沙箱 Agent 已创建并绑定，但一发消息就报 docker.sock 权限错误
+
+**典型报错**：
+
+```text
+Failed to inspect sandbox image: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock
+```
+
+**出现时机**：
+- Agent 已经创建成功
+- SQLite 路由绑定也已经完成
+- 真正和这个沙箱 Agent 通信时才触发
+
+**处理方法**：
+
+1. 先尝试让 Docker 用户组权限生效：
+   ```bash
+   newgrp docker
+   ```
+
+2. 如果仍然报同样错误，执行兜底命令：
+   ```bash
+   sudo chmod 777 /var/run/docker.sock
+   ```
+
+3. 直接重新发消息验证
+
+**注意**：
+- 这是运行期权限修复，不是 Docker 安装步骤。
+- 执行 `sudo chmod 777 /var/run/docker.sock` 后，**不需要重启 Docker，不需要重启 OpenClaw，也不需要重启 Gateway**。
+
+---
+
+### 8.4 数据问题
+
+#### Q7: 如何查看历史消息？
 
 ```bash
 # 查看最近 20 条消息
@@ -1313,7 +1356,7 @@ sqlite3 /opt/openclaw/data/gateway/gateway.db \
 
 ---
 
-#### Q7: 如何清空历史记录？
+#### Q8: 如何清空历史记录？
 
 ```bash
 # ⚠️ 慎用！会删除所有历史记录
@@ -1322,7 +1365,7 @@ sqlite3 /opt/openclaw/data/gateway/gateway.db "DELETE FROM task_logs;"
 
 ---
 
-#### Q8: 数据库太大怎么办？
+#### Q9: 数据库太大怎么办？
 
 **定期清理旧记录**：
 
@@ -1346,9 +1389,9 @@ sudo crontab -e
 
 ---
 
-### 8.4 升级和维护
+### 8.5 升级和维护
 
-#### Q9: 如何升级 Gateway？
+#### Q10: 如何升级 Gateway？
 
 ```bash
 # 1. 停止服务
@@ -1370,7 +1413,7 @@ sudo systemctl start openclaw-gateway
 
 ---
 
-#### Q10: 如何卸载？
+#### Q11: 如何卸载？
 
 ```bash
 cd ~/openclaw-deploy
@@ -1688,7 +1731,7 @@ sudo crontab -e
   - `OPENCLAW_FILE_UPLOAD_GATEWAY_URL` ← `GATEWAY_URL`
   - `OPENCLAW_FILE_UPLOAD_TOKEN` ← `FILE_UPLOAD_INTERNAL_TOKEN`
   - `OPENCLAW_FILE_UPLOAD_EXPIRES` ← `FILE_STORAGE_PRESIGN_EXPIRES`
-- 非沙箱 Agent：写入 `~/.openclaw/.env`；如果 OpenClaw 当前已在运行，必须重启 OpenClaw 后生效。
+- 非沙箱 Agent：写入 `~/.openclaw/.env`；如果通过 `03-install-openclaw.sh` 配置，脚本结束前会统一重启一次；手工修改时仍需自行重启。
 - 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；如果原始地址是 `localhost/127.0.0.1`，脚本会自动改成 `host.docker.internal`，并补 `extraHosts: ["host.docker.internal:host-gateway"]`。
 - 沙箱容器已存在时，执行 `openclaw sandbox recreate --agent <agent_id>`。
 - 这里自动转换的是 **上传 Skill 使用的 `OPENCLAW_FILE_UPLOAD_GATEWAY_URL`**；`GATEWAY_URL` 本身仍保留原值，继续给管理脚本回调 `/admin/reload` 使用。
@@ -1803,7 +1846,7 @@ sudo systemctl restart openclaw-gateway
   - `OPENCLAW_FILE_UPLOAD_TOKEN` = `FILE_UPLOAD_INTERNAL_TOKEN`
   - `OPENCLAW_FILE_UPLOAD_EXPIRES` = `FILE_STORAGE_PRESIGN_EXPIRES`
 - 下发位置：
-  - 非沙箱 Agent：写入 `~/.openclaw/.env`；若 OpenClaw 已在运行，必须重启 OpenClaw 后生效
+  - 非沙箱 Agent：写入 `~/.openclaw/.env`；若通过 `03-install-openclaw.sh` 配置，脚本结束前会统一重启一次；手工修改时仍需自行重启
   - 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；若原始地址是 `localhost/127.0.0.1`，脚本会自动改成 `host.docker.internal`，并补 `extraHosts: ["host.docker.internal:host-gateway"]`
   - 沙箱容器已存在时，执行 `openclaw sandbox recreate --agent <agent_id>`
 

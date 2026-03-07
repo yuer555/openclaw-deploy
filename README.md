@@ -62,8 +62,11 @@ bash bin/03-install-openclaw.sh --add-provider
 说明：
 - 需要 Node.js 22+
 - Docker **仅在创建沙箱 Agent 时需要**
-- 如果启用沙箱但 Docker / 沙箱镜像未准备，脚本会提示安装 Docker、配置镜像加速和构建镜像
-- 如果启用沙箱后仍报 `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`，可先执行 `newgrp docker`；仍未恢复时，再执行 `sudo chmod 666 /var/run/docker.sock` 兜底
+- 脚本一开始会先问你“本次是否计划创建沙箱 Agent”，默认 Yes
+- 如果你选择创建沙箱，但 Docker / 沙箱镜像未准备，脚本会直接停止后续引导，并提示安装 Docker、配置镜像加速和构建镜像；准备完成后重新运行即可
+- `03-install-openclaw.sh` 会把 Gateway 重启收口成两次：首次新建 Agent 前统一一次、脚本结束时统一一次
+- 如果沙箱 Agent 已创建并完成绑定，但在实际通信时出现 `Failed to inspect sandbox image: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`，可先执行 `newgrp docker`；仍未恢复时，再执行 `sudo chmod 777 /var/run/docker.sock` 兜底
+- 上述 `chmod` 属于运行期权限修复，执行后**无需重启 Docker / OpenClaw / Gateway**，直接重新发消息即可验证
 - Ubuntu 系统已知兼容性提示：
   - OpenClaw `2026.03.02`（2026 年 3 月 2 日版本）在 Ubuntu 上存在自启动兼容性问题，`03-install-openclaw.sh` 可能无法通过 `openclaw onboard --install-daemon` 正常注册自启动
   - 当前更推荐使用 OpenClaw `2026.02.26`（2026 年 2 月 26 日版本）
@@ -161,7 +164,7 @@ python3 src/gateway/wecom_gateway.py
   - `OPENCLAW_FILE_UPLOAD_GATEWAY_URL` ← `GATEWAY_URL`
   - `OPENCLAW_FILE_UPLOAD_TOKEN` ← `FILE_UPLOAD_INTERNAL_TOKEN`
   - `OPENCLAW_FILE_UPLOAD_EXPIRES` ← `FILE_STORAGE_PRESIGN_EXPIRES`
-- 非沙箱 Agent：写入 `~/.openclaw/.env`；如果 OpenClaw 已在运行，必须重启 OpenClaw 后生效。
+- 非沙箱 Agent：写入 `~/.openclaw/.env`；如果是通过 `03-install-openclaw.sh` 配置，脚本结束前会统一重启一次；手工修改时仍需自行重启。
 - 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；如果原始地址是 `localhost/127.0.0.1`，脚本会自动改成 `host.docker.internal`，并补 `extraHosts: ["host.docker.internal:host-gateway"]`。
 - 沙箱配置变更后，如果容器已存在，执行 `openclaw sandbox recreate --agent <agent_id>`。
 - 这里自动转换的是 **上传 Skill 使用的 `OPENCLAW_FILE_UPLOAD_GATEWAY_URL`**；`GATEWAY_URL` 本身仍保留原值，继续给管理脚本回调 `/admin/reload` 使用。
