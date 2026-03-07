@@ -88,6 +88,7 @@ bash bin/03-install-openclaw.sh --add-provider
 ### 2.1.1 第一步：检查环境 & 安装 OpenClaw
 
 脚本会自动检测 Node.js (22+)、npm；Docker 仅在你创建沙箱 Agent 时才需要。
+如果本机残留过历史 OpenClaw 沙箱容器，脚本在首次初始化和“清理重装”前都会先执行一次沙箱清理。
 
 #### 场景 A：OpenClaw 未安装
 
@@ -264,9 +265,9 @@ Agent ID (英文标识, 如 development, testing, service): development
 
 如果你选择启用沙箱，脚本会检查 Docker 和专用沙箱镜像是否已准备好：
 - 已准备好：继续创建 Agent。
-- 未准备好：输出安装 Docker、配置镜像加速、构建沙箱镜像的命令；执行完成后重新运行脚本。
+- 未准备好：在第一步和实际启用沙箱时都会提示你是否查看安装 Docker、配置镜像加速、构建沙箱镜像的命令；如果你选择查看，脚本会先退出，等你准备完成后再重新运行。
 
-沙箱准备命令（仅沙箱 Agent 需要）：
+沙箱准备命令（仅沙箱 Agent 需要，脚本会按当前系统提示对应命令）：
 
 ```bash
 # 1) 安装 Docker（Ubuntu / Debian）
@@ -283,8 +284,21 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER
 newgrp docker
+```
 
-# 2) 配置镜像加速（腾讯云机器优先）
+```bash
+# 1) 安装 Docker（RHEL / Rocky / AlmaLinux / CentOS）
+sudo yum install -y yum-utils
+sudo yum-config-manager --add-repo \
+  https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+sudo yum install -y docker-ce docker-ce-cli containerd.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+```bash
+# 2) 配置镜像加速（各系统通用，腾讯云机器优先）
 sudo mkdir -p /etc/docker
 sudo tee /etc/docker/daemon.json > /dev/null <<'JSON'
 {
@@ -298,7 +312,9 @@ JSON
 sudo systemctl daemon-reload
 sudo systemctl restart docker
 docker info | sed -n '/Registry Mirrors/,$p'
+```
 
+```bash
 # 3) 构建专用沙箱镜像
 docker build \
   --build-arg OPENCLAW_SANDBOX_BASE_IMAGE=debian:bookworm-slim \
@@ -334,8 +350,7 @@ docker image inspect openclaw-sandbox:gateway-devtools-bookworm
         "OPENCLAW_FILE_UPLOAD_GATEWAY_URL": "http://your-gateway:8000",
         "OPENCLAW_FILE_UPLOAD_TOKEN": "***",
         "OPENCLAW_FILE_UPLOAD_EXPIRES": "86400"
-      },
-      "setupCommand": "apt-get update && apt-get install -y git curl"
+      }
     }
   },
   "tools": {
@@ -352,17 +367,22 @@ docker image inspect openclaw-sandbox:gateway-devtools-bookworm
 }
 ```
 
+说明：
+- 这里的 `sandbox.docker.env` 只针对**沙箱 Agent**。
+- 非沙箱 Agent 不走这里，改为从宿主机 `~/.openclaw/.env` 读取 `OPENCLAW_FILE_UPLOAD_*`；修改后需要重启 OpenClaw。
+
 | 字段 | 值 | 说明 |
 |------|-----|------|
 | `image` | `openclaw-sandbox:gateway-devtools-bookworm` | 需提前准备好的专用沙箱镜像；脚本仅检查，不自动构建 |
 | `network` | `bridge` | 容器需要联网（API 调用等） |
 | `readOnlyRoot` | `false` | 容器根文件系统可写 |
 | `binds` | `~/.openclaw/workspace-<agent_id>/shared:/app/shared/<agent_id>:rw` | 显式挂载 workspace 内共享目录到 agent 固定对外路径 |
-| `setupCommand` | `apt-get update && apt-get install -y git curl` | 新容器首次创建后执行，补齐常用工具 |
 | `tools.allow` | `group:fs/group:runtime/group:memory/group:sessions` | Agent 允许的工具分组 |
 | `tools.deny` | `apply_patch` | 禁止危险补丁工具 |
 
 Gateway 对外下发的共享文件路径固定为 `/app/shared/<agent_id>`；宿主机上该路径通过软链指向 `~/.openclaw/workspace-<agent_id>/shared`。
+
+> 说明：不要依赖 `setupCommand` 在沙箱启动时执行 `apt-get`。OpenClaw 默认会把沙箱用户映射成 workspace 对应的普通用户，运行时临时安装系统包很容易触发权限错误。需要的系统工具请直接预装到 `bin/openclaw-sandbox-devtools.Dockerfile`。
 
 创建完成后同样会询问是否编辑人格设定。子 Agent 的模型配置（`auth-profiles.json`、`models.json`）会自动从主 Agent 同步。
 
@@ -395,7 +415,7 @@ Gateway 对外下发的共享文件路径固定为 `/app/shared/<agent_id>`；�
 - 列出所有已配置的 Agent
 - OpenClaw 健康检查
 - 同步 Gateway token 配置
-- 按 `FILE_STORAGE_MODE` 刷新文件上传 Skill
+- 安装/刷新每个 Agent workspace 下的文件上传 Skill
 - 校验共享目录契约和 token 健康状态
 
 ```
@@ -547,7 +567,13 @@ cat ~/.openclaw/openclaw.json | grep -A 5 gateway
    - 因为 Agent 直接运行在宿主机
    - 只要 OpenClaw 进程本身有权限访问 `/app/shared/<agent_id>`（软链路径）即可
 
-5. **`/app/shared` 必须提前创建并放权**
+5. **上传 Skill 是另一条线**
+   - `FILE_STORAGE_MODE=local|s3` 只决定“企业微信发来的文件”怎么交给 Agent
+   - `gateway-file-upload` skill + `OPENCLAW_FILE_UPLOAD_*` 决定“Agent 能不能主动上传自己的产物”
+   - 非沙箱 Agent：把 `OPENCLAW_FILE_UPLOAD_*` 写入 `~/.openclaw/.env`，并在修改后重启 OpenClaw
+   - 沙箱 Agent：把 `OPENCLAW_FILE_UPLOAD_*` 写入对应 agent 的 `sandbox.docker.env`，并在修改后重建沙箱容器
+
+6. **`/app/shared` 必须提前创建并放权**
    - 至少保证 Gateway 和 OpenClaw 运行用户可读写
    - 推荐：
      ```bash
@@ -592,6 +618,7 @@ sudo ln -s ~/.openclaw/workspace-team-dev/shared /app/shared/team-dev
 #### 什么时候必须重新建沙箱容器？
 
 - 你修改了 `sandbox.docker.binds`
+- 你删除或修改了旧版 `sandbox.docker.setupCommand`
 - 你切换了 `FILE_STORAGE_MODE`
 - 你给 Agent 新增了上传 Skill 相关环境变量
 
@@ -602,6 +629,8 @@ openclaw sandbox recreate --agent <agent_id>
 ```
 
 > 注意：如果你把 sandbox `scope` 改成 `shared`，每个 Agent 的自定义 bind 可能不会按预期生效。当前项目文档和脚本都按 `scope: "agent"` 设计。
+>
+> 旧版本如果已经把 `setupCommand: "apt-get ..."` 写进了 `~/.openclaw/openclaw.json`，建议重新运行一次 `bash bin/03-install-openclaw.sh --skip-install` 同步配置，然后执行上面的 `recreate`。
 
 ---
 
@@ -1631,7 +1660,15 @@ sudo crontab -e
 | `FILE_STORAGE_MODE` | `local` | 是 | 文件存储模式（`local` / `s3`） |
 | `FILE_STORAGE_PRESIGN_EXPIRES` | `86400` | 否 | 预签名下载链接有效期（秒） |
 | `MAX_INTERNAL_UPLOAD_FILE_SIZE` | `52428800` | 否 | OpenClaw skill 通过内部接口上传时的大小限制 |
-| `FILE_UPLOAD_INTERNAL_TOKEN` | 空 | 条件必填 | 仅当使用 OpenClaw 上传 skill 时必填 |
+| `FILE_UPLOAD_INTERNAL_TOKEN` | 空 | 条件必填 | Gateway 内部上传接口鉴权；`03` 会据此生成 `OPENCLAW_FILE_UPLOAD_TOKEN` |
+
+上传 Skill 运行时变量说明：
+- `03-install-openclaw.sh` 会自动生成：
+  - `OPENCLAW_FILE_UPLOAD_GATEWAY_URL` ← `GATEWAY_URL`
+  - `OPENCLAW_FILE_UPLOAD_TOKEN` ← `FILE_UPLOAD_INTERNAL_TOKEN`
+  - `OPENCLAW_FILE_UPLOAD_EXPIRES` ← `FILE_STORAGE_PRESIGN_EXPIRES`
+- 非沙箱 Agent：写入 `~/.openclaw/.env`；如果 OpenClaw 当前已在运行，必须重启 OpenClaw 后生效。
+- 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；如果沙箱容器已存在，执行 `openclaw sandbox recreate --agent <agent_id>`。
 
 #### S3 模式配置（`FILE_STORAGE_MODE=s3`）
 
@@ -1698,6 +1735,19 @@ sudo systemctl restart openclaw-gateway
 
 默认模式：`FILE_STORAGE_MODE=local`。
 
+先记住一句话：
+- **`FILE_STORAGE_MODE` 决定“企业微信发来的文件怎么交给 Agent”**。
+- **`gateway-file-upload` skill 决定“Agent 能不能把自己的产物再上传出去”**。
+
+#### 四种组合速查
+
+| 组合 | 企微来件怎么交给 Agent | Agent 能否主动上传 |
+|------|------------------------|--------------------|
+| `local` + 无 skill | `/app/shared/<agent_id>/...` 本地绝对路径 | 否 |
+| `local` + 有 skill | `/app/shared/<agent_id>/...` 本地绝对路径 | 是 |
+| `s3` + 无 skill | S3 / 对象存储下载链接 | 否 |
+| `s3` + 有 skill | S3 / 对象存储下载链接 | 是 |
+
 #### 企业微信回复策略（markdown.content 限制）
 
 - 企业微信主动回复 `markdown.content` 最大为 `20480` 字节（UTF-8）。
@@ -1714,6 +1764,23 @@ sudo systemctl restart openclaw-gateway
 - OpenClaw 执行超时后主动回复：`处理超时，请重试。`
 - 等待消息排队超过 `MAX_QUEUE_WAIT_SECONDS` 后，会主动回复：`前序任务处理时间较长，本次请求未执行，请重试。`
 
+#### 主动上传能力的开关
+
+- `03-install-openclaw.sh` 会将 `gateway-file-upload` 安装到每个 Agent 的 `<workspace>/skills`。
+- 这一步不区分 `FILE_STORAGE_MODE=local` 还是 `s3`。
+- Agent 只有在以下条件同时满足时，才具备“主动上传文件/文本”的能力：
+  - `gateway-file-upload` 已同步到该 Agent 的 workspace
+  - `OPENCLAW_FILE_UPLOAD_GATEWAY_URL`
+  - `OPENCLAW_FILE_UPLOAD_TOKEN`
+  - `OPENCLAW_FILE_UPLOAD_EXPIRES`
+- 这三个运行时变量来源于 Gateway 配置：
+  - `OPENCLAW_FILE_UPLOAD_GATEWAY_URL` = `GATEWAY_URL`
+  - `OPENCLAW_FILE_UPLOAD_TOKEN` = `FILE_UPLOAD_INTERNAL_TOKEN`
+  - `OPENCLAW_FILE_UPLOAD_EXPIRES` = `FILE_STORAGE_PRESIGN_EXPIRES`
+- 下发位置：
+  - 非沙箱 Agent：写入 `~/.openclaw/.env`；若 OpenClaw 已在运行，必须重启 OpenClaw 后生效
+  - 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；若容器已存在，执行 `openclaw sandbox recreate --agent <agent_id>`
+
 #### 启用 S3 模式
 
 1. 在 Gateway `.env` 中设置（与 Java 代码兼容推荐）：
@@ -1729,7 +1796,7 @@ S3_SIGNATURE_VERSION=s3
 S3_ADDRESSING_STYLE=path
 S3_SSE_MODE=
 
-# 仅当使用 OpenClaw 上传 skill 时需要
+# 仅当需要让 Agent 调用上传 Skill 时需要
 FILE_UPLOAD_INTERNAL_TOKEN=your-random-token
 ```
 
@@ -1742,15 +1809,17 @@ bash bin/03-install-openclaw.sh --skip-install
 
 说明：
 - 微信文件会上传到 S3，并把预签名下载链接发给 Agent。
-- `FILE_STORAGE_MODE!=local` 时，会将 `gateway-file-upload` 安装到每个 Agent 的 `<workspace>/skills`。
-- 每次新增 Agent 后，会自动同步该 Skill 到新 Agent 的 workspace。
-- 当用户明确要求“上传文件并给下载链接”时，Agent 会调用 `gateway-file-upload` 执行上传。
-- 如果不使用上传 skill，可以不配置 `FILE_UPLOAD_INTERNAL_TOKEN`。
-- 若该 Agent 的沙箱容器已在运行，需执行 `openclaw sandbox recreate --agent <agent_id>` 使新的 `sandbox.docker.env` 生效。
+- 这只改变“企微来件怎么交给 Agent”，不等于自动开启 Agent 的主动上传能力。
+- 如果还需要 Agent 主动上传文件/文本，请同时配置 `FILE_UPLOAD_INTERNAL_TOKEN`，让 `03-install-openclaw.sh` 继续生成 `OPENCLAW_FILE_UPLOAD_*`。
+- 如果不使用上传 skill，可以不配置 `FILE_UPLOAD_INTERNAL_TOKEN`；此时 Skill 仍会被同步，但调用上传接口会失败。
 
 #### local 模式行为
 
-- `FILE_STORAGE_MODE=local` 时，不安装上传 Skill，继续使用本地绝对路径。
+- `FILE_STORAGE_MODE=local` 时，企业微信文件会直接保存到本地，再把绝对路径交给 Agent。
+- 这只改变“企微来件怎么交给 Agent”，不影响是否安装上传 Skill。
+- 如果还需要 Agent 主动上传文件/文本，仍然要让 `OPENCLAW_FILE_UPLOAD_*` 生效：
+  - 非沙箱 Agent 走 `~/.openclaw/.env`
+  - 沙箱 Agent 走 `sandbox.docker.env`
 - Gateway 会把企业微信文件保存到 `/app/shared/<agent_id>/<日期>/...`，并把这个绝对路径直接下发给 Agent。
 - 宿主机上的 `/app/shared/<agent_id>` 建议做成软链，指向 `~/.openclaw/workspace-<agent_id>/shared`。
 - 因此 `local` 模式下，最关键的约束是：`agent_id` 同名、`/app/shared/<agent_id>` 正确指向 workspace 内真实目录、沙箱 bind source 位于该 workspace 内。

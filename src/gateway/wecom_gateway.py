@@ -869,6 +869,73 @@ def _publish_file_local(local_path, shared_dir=''):
     }
 
 
+NON_ACTIONABLE_MESSAGE_NOTICES = {
+    '[用户发送了一张图片，但无法获取]',
+    '[用户发送了一张图片，上传失败]',
+    '[用户发送了一张图片，下载失败]',
+    '[用户发送了一个文件，但无法获取]',
+    '[用户发送了一个文件，文件有风险，已删除]',
+    '[用户发送了一个文件，下载失败]',
+    '[用户发送了一个文件，上传失败]',
+}
+
+USER_VISIBLE_NOTICE_MAP = {
+    '[用户发送了一张图片，但无法获取]': '收到图片，但暂时无法获取图片内容，请稍后重试。',
+    '[用户发送了一张图片，上传失败]': '收到图片，但保存失败，请稍后重试。',
+    '[用户发送了一张图片，下载失败]': '收到图片，但下载失败，请稍后重试。',
+    '[用户发送了一个文件，但无法获取]': '收到文件，但暂时无法获取文件内容，请稍后重试。',
+    '[用户发送了一个文件，文件有风险，已删除]': '收到文件，但检测到安全风险，系统已拒绝处理。',
+    '[用户发送了一个文件，下载失败]': '收到文件，但下载失败，请稍后重试。',
+    '[用户发送了一个文件，上传失败]': '收到文件，但保存失败，请稍后重试。',
+}
+
+
+def _dedupe_keep_order(items):
+    """按出现顺序去重"""
+    seen = set()
+    result = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _is_non_actionable_notice_line(line):
+    """判断一行提取文本是否只是系统提示，不应继续发送给 agent"""
+    stripped = (line or '').strip()
+    if not stripped:
+        return False
+    return stripped in NON_ACTIONABLE_MESSAGE_NOTICES or stripped.startswith('[不支持的消息类型:')
+
+
+def _split_actionable_content_and_notices(content):
+    """拆分可发送正文与系统提示"""
+    if content is None:
+        return '', []
+
+    text = str(content)
+    actionable_lines = []
+    notices = []
+    for line in text.splitlines():
+        if _is_non_actionable_notice_line(line):
+            notices.append(line.strip())
+            continue
+        actionable_lines.append(line)
+
+    actionable_text = '\n'.join(actionable_lines).strip()
+    return actionable_text, _dedupe_keep_order(notices)
+
+
+def _render_user_visible_notices(notices):
+    """将内部系统提示转换为用户可读回复"""
+    rendered = []
+    for notice in _dedupe_keep_order(notices):
+        rendered.append(USER_VISIBLE_NOTICE_MAP.get(notice, notice))
+    return '\n'.join(rendered)
+
+
 def _publish_file_s3(local_path, object_key, content_type='', expires_seconds=None):
     """s3 模式：上传并返回预签名下载链接"""
     client = _get_s3_client()
@@ -1473,21 +1540,25 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='',
 
 
 def extract_message_content(msg, user_id='', encoding_aes_key='', shared_dir='', agent_name=''):
-    """提取完整消息内容，返回文本内容"""
-    content = extract_single_content(msg, user_id=user_id,
-                                     encoding_aes_key=encoding_aes_key,
-                                     shared_dir=shared_dir,
-                                     agent_name=agent_name)
+    """提取完整消息内容，返回 (正文, 系统提示列表)"""
+    raw_content = extract_single_content(msg, user_id=user_id,
+                                         encoding_aes_key=encoding_aes_key,
+                                         shared_dir=shared_dir,
+                                         agent_name=agent_name)
+    content, notices = _split_actionable_content_and_notices(raw_content)
 
     quote = msg.get('quote')
     if quote:
-        quote_content = extract_single_content(quote, user_id=user_id,
-                                               encoding_aes_key=encoding_aes_key,
-                                               shared_dir=shared_dir,
-                                               agent_name=agent_name)
-        content = f"{content}\n\n[引用消息] {quote_content}"
+        raw_quote_content = extract_single_content(quote, user_id=user_id,
+                                                   encoding_aes_key=encoding_aes_key,
+                                                   shared_dir=shared_dir,
+                                                   agent_name=agent_name)
+        quote_content, quote_notices = _split_actionable_content_and_notices(raw_quote_content)
+        notices = _dedupe_keep_order(notices + quote_notices)
+        if content and quote_content and quote_content != content:
+            content = f"{content}\n\n[引用消息] {quote_content}"
 
-    return content
+    return content, notices
 
 
 # ============= 异步处理（全局 worker 池 + 单用户串行）=============
@@ -1522,6 +1593,13 @@ def _send_wecom_response(response_url, agent_name, reply_text):
     except Exception as e:
         logger.error(f"[{agent_name}] 主动回复失败: {e}")
         return False
+
+
+def _build_wecom_markdown_reply(crypto, timestamp, nonce, reply_text):
+    """构造企业微信 markdown 被动回复包"""
+    wecom_reply = truncate_message(reply_text, max_len=WECOM_MSG_MAX_LEN)
+    reply_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": wecom_reply}})
+    return crypto.build_reply(reply_msg, int(timestamp), nonce)
 
 
 def _ensure_scheduler_workers():
@@ -1834,11 +1912,21 @@ def wecom_callback(agent_name):
                 return jsonify({}), 200
 
             if msg_type in ('text', 'image', 'file', 'voice', 'mixed'):
-                content = extract_message_content(msg, user_id=from_user,
-                                                  encoding_aes_key=agent_cfg['wecom_encoding_aes_key'],
-                                                  shared_dir=agent_cfg.get('shared_dir', ''),
-                                                  agent_name=agent_name)
+                content, notices = extract_message_content(msg, user_id=from_user,
+                                                           encoding_aes_key=agent_cfg['wecom_encoding_aes_key'],
+                                                           shared_dir=agent_cfg.get('shared_dir', ''),
+                                                           agent_name=agent_name)
                 logger.info(f"[{agent_name}] 消息内容: {content[:200]}, from: {from_user}")
+                if content and notices:
+                    logger.info(f"[{agent_name}] 已过滤系统提示: {' | '.join(notices)}")
+
+                if not content:
+                    notice_text = _render_user_visible_notices(notices) or '收到消息，但暂无可处理内容，请重试。'
+                    logger.info(f"[{agent_name}] 消息未进入 Agent，仅回复用户: {notice_text}")
+                    reply_pkg = _build_wecom_markdown_reply(crypto, timestamp, nonce, notice_text)
+                    if reply_pkg:
+                        return jsonify(reply_pkg), 200
+                    return jsonify({}), 200
 
                 task_id = str(uuid.uuid4())
 
@@ -1850,8 +1938,7 @@ def wecom_callback(agent_name):
                 else:
                     passive_text = PASSIVE_REPLY_BUSY
 
-                processing_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": passive_text}})
-                reply_pkg = crypto.build_reply(processing_msg, int(timestamp), nonce)
+                reply_pkg = _build_wecom_markdown_reply(crypto, timestamp, nonce, passive_text)
 
                 if reply_pkg:
                     return jsonify(reply_pkg), 200

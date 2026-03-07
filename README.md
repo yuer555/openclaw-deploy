@@ -22,10 +22,18 @@ Gateway **不负责** OpenClaw 的镜像、容器和生命周期管理；它只�
 - **local 文件路径固定**：Gateway 下发给 Agent 的本地文件路径固定为 `/app/shared/<agent_id>/...`。
 - **宿主机真实目录**：`/app/shared/<agent_id>` 应指向 `~/.openclaw/workspace-<agent_id>/shared`。
 - **沙箱 bind 规则**：Docker 沙箱必须挂载 workspace 内 source，例如 `~/.openclaw/workspace-<agent_id>/shared:/app/shared/<agent_id>:rw`。
+- **系统依赖安装策略**：沙箱里不要依赖运行时 `apt-get`；需要的系统工具应直接预装到 `bin/openclaw-sandbox-devtools.Dockerfile`。
+
+升级提示：
+- 如果旧版本沙箱配置里残留了 `setupCommand: "apt-get ..."`，请重新运行 `bash bin/03-install-openclaw.sh --skip-install`，然后执行 `openclaw sandbox recreate --agent <agent_id>`。
 
 这样设计的原因是同时满足：
 - Gateway 能稳定下发绝对路径
 - OpenClaw 沙箱 allowed roots 要求 bind source 位于 workspace 内
+
+一句话区分：
+- **`FILE_STORAGE_MODE` 决定“企业微信发来的文件怎么交给 Agent”**。
+- **`gateway-file-upload` skill 决定“Agent 能不能把自己的产物再上传出去”**。
 
 ## 权限规则
 
@@ -140,9 +148,30 @@ python3 src/gateway/wecom_gateway.py
 | `GATEWAY_URL` | `http://localhost:8000` | 管理脚本回调 `/admin/reload` 使用 |
 | `FILE_STORAGE_MODE` | `local` | `local` / `s3` |
 | `FILE_STORAGE_PRESIGN_EXPIRES` | `86400` | S3 预签名有效期 |
-| `FILE_UPLOAD_INTERNAL_TOKEN` | 空 | 仅上传 Skill 需要 |
+| `FILE_UPLOAD_INTERNAL_TOKEN` | 空 | Gateway 内部上传接口鉴权；`03` 会据此生成 `OPENCLAW_FILE_UPLOAD_TOKEN` |
 | `MAX_INTERNAL_UPLOAD_FILE_SIZE` | `52428800` | 内部上传大小限制 |
 | `FILE_STORAGE_KEY_PREFIX` | `openclaw-gateway` | 对象存储 key 前缀 |
+
+上传 Skill 运行时变量说明：
+- `03-install-openclaw.sh` 会自动生成：
+  - `OPENCLAW_FILE_UPLOAD_GATEWAY_URL` ← `GATEWAY_URL`
+  - `OPENCLAW_FILE_UPLOAD_TOKEN` ← `FILE_UPLOAD_INTERNAL_TOKEN`
+  - `OPENCLAW_FILE_UPLOAD_EXPIRES` ← `FILE_STORAGE_PRESIGN_EXPIRES`
+- 非沙箱 Agent：写入 `~/.openclaw/.env`；如果 OpenClaw 已在运行，必须重启 OpenClaw 后生效。
+- 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；如果容器已存在，执行 `openclaw sandbox recreate --agent <agent_id>`。
+
+不要混淆这两件事：
+- **入站文件处理**：`FILE_STORAGE_MODE=local` 时下发 `/app/shared/<agent_id>/...` 绝对路径；`FILE_STORAGE_MODE=s3` 时下发对象存储下载链接。
+- **主动上传能力**：与 `local/s3` 无直接绑定；只要安装了 `gateway-file-upload` 且 `OPENCLAW_FILE_UPLOAD_*` 生效，Agent 就可以主动上传文件或文本。
+
+快速对照：
+
+| 组合 | 企微来件怎么交给 Agent | Agent 能否主动上传 |
+|------|------------------------|--------------------|
+| `local` + 无 skill | 本地绝对路径 | 否 |
+| `local` + 有 skill | 本地绝对路径 | 是 |
+| `s3` + 无 skill | S3 下载链接 | 否 |
+| `s3` + 有 skill | S3 下载链接 | 是 |
 
 ### S3 模式
 
@@ -183,6 +212,9 @@ python3 scripts/manage-agent.py sync-token [--url <openclaw_url>]
 - `agent_id = Gateway 路由名 = SQLite agents.name`
 - Gateway 对外下发的 local 文件路径固定为 `/app/shared/<agent_id>/...`
 - 宿主机上的 `/app/shared/<agent_id>` 指向 `~/.openclaw/workspace-<agent_id>/shared`
+- 若使用仓库自带上传 Skill，请将 `openclaw-skills/gateway-file-upload` 同步到 `~/.openclaw/workspace-<agent_id>/skills/gateway-file-upload`
+- 非沙箱 Agent 若要使用上传 Skill，请把 `OPENCLAW_FILE_UPLOAD_*` 写入 `~/.openclaw/.env`，并在修改后重启 OpenClaw
+- 沙箱 Agent 若要使用上传 Skill，请把同名变量写入该 agent 的 `sandbox.docker.env`，并在修改后重建沙箱容器
 - 若启用沙箱，bind source 必须位于 workspace 内，例如：
 
 ```json
