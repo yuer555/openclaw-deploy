@@ -33,7 +33,7 @@ Gateway **不负责** OpenClaw 的镜像、容器和生命周期管理；它只�
 
 一句话区分：
 - **`FILE_STORAGE_MODE` 决定“企业微信发来的文件怎么交给 Agent”**。
-- **`gateway-file-upload` skill 决定“Agent 能不能把自己的产物再上传出去”**。
+- **`gateway-file-upload` skill + S3 配置 决定“Agent 能不能把自己的产物再上传出去”**。
 
 ## 权限规则
 
@@ -63,6 +63,9 @@ bash bin/03-install-openclaw.sh --add-provider
 - 需要 Node.js 22+
 - Docker **仅在创建沙箱 Agent 时需要**
 - 如果启用沙箱但 Docker / 沙箱镜像未准备，脚本会提示安装 Docker、配置镜像加速和构建镜像
+- Ubuntu 系统已知兼容性提示：
+  - OpenClaw `2026.03.02`（2026 年 3 月 2 日版本）在 Ubuntu 上存在自启动兼容性问题，`03-install-openclaw.sh` 可能无法通过 `openclaw onboard --install-daemon` 正常注册自启动
+  - 当前更推荐使用 OpenClaw `2026.02.26`（2026 年 2 月 26 日版本）
 
 ### 2) 部署 Gateway
 
@@ -145,7 +148,7 @@ python3 src/gateway/wecom_gateway.py
 | `MAX_GATEWAY_WORKERS` | `8` | Gateway 全局 worker 数 |
 | `MAX_PER_USER_PENDING` | `1` | 单用户最多等待消息数 |
 | `MAX_QUEUE_WAIT_SECONDS` | `60` | 等待队列最大时长 |
-| `GATEWAY_URL` | `http://localhost:8000` | 管理脚本回调 `/admin/reload` 使用 |
+| `GATEWAY_URL` | `http://localhost:8000` | 管理脚本回调 `/admin/reload` 使用；上传 Skill 也会基于它访问 Gateway |
 | `FILE_STORAGE_MODE` | `local` | `local` / `s3` |
 | `FILE_STORAGE_PRESIGN_EXPIRES` | `86400` | S3 预签名有效期 |
 | `FILE_UPLOAD_INTERNAL_TOKEN` | 空 | Gateway 内部上传接口鉴权；`03` 会据此生成 `OPENCLAW_FILE_UPLOAD_TOKEN` |
@@ -164,16 +167,17 @@ python3 src/gateway/wecom_gateway.py
 
 不要混淆这两件事：
 - **入站文件处理**：`FILE_STORAGE_MODE=local` 时下发 `/app/shared/<agent_id>/...` 绝对路径；`FILE_STORAGE_MODE=s3` 时下发对象存储下载链接。
-- **主动上传能力**：与 `local/s3` 无直接绑定；只要安装了 `gateway-file-upload` 且 `OPENCLAW_FILE_UPLOAD_*` 生效，Agent 就可以主动上传文件或文本。
+- **主动上传能力**：只要安装了 `gateway-file-upload`、`OPENCLAW_FILE_UPLOAD_*` 生效且 S3 已配置，Agent 就可以主动上传文件或文本。
+- **内部上传返回**：`/internal/files/upload` 始终走 S3，返回对象存储下载链接，不再提供 Gateway 本地下载路由。
 
 快速对照：
 
 | 组合 | 企微来件怎么交给 Agent | Agent 能否主动上传 |
 |------|------------------------|--------------------|
 | `local` + 无 skill | 本地绝对路径 | 否 |
-| `local` + 有 skill | 本地绝对路径 | 是 |
+| `local` + 有 skill + S3 已配置 | 本地绝对路径 | 是（主动上传走 S3） |
 | `s3` + 无 skill | S3 下载链接 | 否 |
-| `s3` + 有 skill | S3 下载链接 | 是 |
+| `s3` + 有 skill + S3 已配置 | S3 下载链接 | 是（主动上传走 S3） |
 
 ### S3 模式
 
@@ -289,7 +293,7 @@ sudo bash bin/05-cleanup.sh
 | `GET` | `/stats` | 统计信息 |
 | `GET` | `/admin/agents` | 当前 Agent 绑定 |
 | `POST` | `/admin/reload` | 重载 Agent 配置 |
-| `POST` | `/internal/files/upload` | 内部上传接口（上传 Skill 用） |
+| `POST` | `/internal/files/upload` | 内部上传接口（上传 Skill 用，统一走 S3） |
 
 ## 消息处理流程
 

@@ -83,6 +83,10 @@ bash bin/03-install-openclaw.sh --add-agent
 bash bin/03-install-openclaw.sh --add-provider
 ```
 
+Ubuntu 兼容性提示：
+- 对于 Ubuntu 系统，OpenClaw `2026.03.02`（2026 年 3 月 2 日版本）当前存在已知兼容性问题，`03-install-openclaw.sh` 可能无法通过 `openclaw onboard --install-daemon` 正常加入自启动。
+- 当前更推荐使用 OpenClaw `2026.02.26`（2026 年 2 月 26 日版本）。
+
 ---
 
 ### 2.1.1 第一步：检查环境 & 安装 OpenClaw
@@ -106,6 +110,10 @@ bash bin/03-install-openclaw.sh --add-provider
 | **2** | 官方安装脚本，自动处理依赖和 PATH 配置（**推荐新手使用**） |
 
 安装完成后会自动运行 OpenClaw 初始化向导：若当前环境支持托管服务，则使用 `openclaw onboard --install-daemon`；若检测到 `systemctl --user` 不可用等情况，则自动改为跳过 daemon 安装的兼容模式（见 [2.1.6](#216-openclaw-onboard-初始化向导)）。
+
+补充说明：
+- Ubuntu 上如果使用 OpenClaw `2026.03.02`（2026 年 3 月 2 日版本），这里可能出现无法加入自启动的问题。
+- 如需稳定使用 `03-install-openclaw.sh` 的自启动流程，建议优先使用 OpenClaw `2026.02.26`（2026 年 2 月 26 日版本）。
 
 #### 场景 B：OpenClaw 已安装
 
@@ -489,6 +497,10 @@ Select [1-3]: _
 
 若当前环境支持托管服务，向导会自动注册系统服务（Linux 下为 systemd，macOS 下为 launchd），使 OpenClaw Gateway 开机自启；若当前环境不支持，则脚本会跳过此步骤，并提示使用 `openclaw gateway run` 兼容启动。
 
+Ubuntu 版本说明：
+- OpenClaw `2026.03.02`（2026 年 3 月 2 日版本）在 Ubuntu 上已知可能无法正常完成这一阶段的自启动注册。
+- 建议在 Ubuntu 上优先使用 OpenClaw `2026.02.26`（2026 年 2 月 26 日版本）。
+
 #### 完成
 
 ```
@@ -569,7 +581,7 @@ cat ~/.openclaw/openclaw.json | grep -A 5 gateway
 
 5. **上传 Skill 是另一条线**
    - `FILE_STORAGE_MODE=local|s3` 只决定“企业微信发来的文件”怎么交给 Agent
-   - `gateway-file-upload` skill + `OPENCLAW_FILE_UPLOAD_*` 决定“Agent 能不能主动上传自己的产物”
+   - `gateway-file-upload` skill + S3 配置 + `OPENCLAW_FILE_UPLOAD_*` 决定“Agent 能不能主动上传自己的产物”
    - 非沙箱 Agent：把 `OPENCLAW_FILE_UPLOAD_*` 写入 `~/.openclaw/.env`，并在修改后重启 OpenClaw
    - 沙箱 Agent：把 `OPENCLAW_FILE_UPLOAD_*` 写入对应 agent 的 `sandbox.docker.env`，并在修改后重建沙箱容器
 
@@ -1739,16 +1751,17 @@ sudo systemctl restart openclaw-gateway
 
 先记住一句话：
 - **`FILE_STORAGE_MODE` 决定“企业微信发来的文件怎么交给 Agent”**。
-- **`gateway-file-upload` skill 决定“Agent 能不能把自己的产物再上传出去”**。
+- **`gateway-file-upload` skill + S3 配置** 决定“Agent 能不能把自己的产物再上传出去”。
+- **`/internal/files/upload` 始终走 S3**：不区分 `FILE_STORAGE_MODE`，返回对象存储下载链接。
 
 #### 四种组合速查
 
 | 组合 | 企微来件怎么交给 Agent | Agent 能否主动上传 |
 |------|------------------------|--------------------|
 | `local` + 无 skill | `/app/shared/<agent_id>/...` 本地绝对路径 | 否 |
-| `local` + 有 skill | `/app/shared/<agent_id>/...` 本地绝对路径 | 是 |
+| `local` + 有 skill + S3 已配置 | `/app/shared/<agent_id>/...` 本地绝对路径 | 是（主动上传走 S3） |
 | `s3` + 无 skill | S3 / 对象存储下载链接 | 否 |
-| `s3` + 有 skill | S3 / 对象存储下载链接 | 是 |
+| `s3` + 有 skill + S3 已配置 | S3 / 对象存储下载链接 | 是（主动上传走 S3） |
 
 #### 企业微信回复策略（markdown.content 限制）
 
@@ -1772,6 +1785,7 @@ sudo systemctl restart openclaw-gateway
 - 这一步不区分 `FILE_STORAGE_MODE=local` 还是 `s3`。
 - Agent 只有在以下条件同时满足时，才具备“主动上传文件/文本”的能力：
   - `gateway-file-upload` 已同步到该 Agent 的 workspace
+  - Gateway 已配置可用的 S3 参数
   - `OPENCLAW_FILE_UPLOAD_GATEWAY_URL`
   - `OPENCLAW_FILE_UPLOAD_TOKEN`
   - `OPENCLAW_FILE_UPLOAD_EXPIRES`
@@ -1812,6 +1826,7 @@ bash bin/03-install-openclaw.sh --skip-install
 
 说明：
 - 微信文件会上传到 S3，并把预签名下载链接发给 Agent。
+- OpenClaw 主动上传文件/文本也会统一走 S3。
 - 这只改变“企微来件怎么交给 Agent”，不等于自动开启 Agent 的主动上传能力。
 - 如果还需要 Agent 主动上传文件/文本，请同时配置 `FILE_UPLOAD_INTERNAL_TOKEN`，让 `03-install-openclaw.sh` 继续生成 `OPENCLAW_FILE_UPLOAD_*`。
 - 如果不使用上传 skill，可以不配置 `FILE_UPLOAD_INTERNAL_TOKEN`；此时 Skill 仍会被同步，但调用上传接口会失败。
@@ -1820,6 +1835,7 @@ bash bin/03-install-openclaw.sh --skip-install
 
 - `FILE_STORAGE_MODE=local` 时，企业微信文件会直接保存到本地，再把绝对路径交给 Agent。
 - 这只改变“企微来件怎么交给 Agent”，不影响是否安装上传 Skill。
+- 如果 Agent 需要主动上传文件/文本，这部分仍然统一走 S3，不会走本地下载路由。
 - 如果还需要 Agent 主动上传文件/文本，仍然要让 `OPENCLAW_FILE_UPLOAD_*` 生效：
   - 非沙箱 Agent 走 `~/.openclaw/.env`
   - 沙箱 Agent 走 `sandbox.docker.env`

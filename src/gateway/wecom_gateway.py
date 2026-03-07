@@ -176,6 +176,7 @@ MAX_QUEUE_WAIT_SECONDS = _read_positive_int_env('MAX_QUEUE_WAIT_SECONDS', 60)
 
 # Gateway 端口
 GATEWAY_PORT = int(os.getenv('GATEWAY_PORT', '8000'))
+GATEWAY_URL = os.getenv('GATEWAY_URL', f'http://localhost:{GATEWAY_PORT}').strip().rstrip('/')
 
 # 文件存储模式（local | s3）
 FILE_STORAGE_MODE = os.getenv('FILE_STORAGE_MODE', 'local').strip().lower()
@@ -676,10 +677,21 @@ def log_file_record(user_id, file_path, file_name, file_type, content_type, file
             "INSERT INTO file_records (user_id, file_path, file_name, file_type, content_type, file_size, source_url, msg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, file_path, file_name, file_type, content_type, file_size, source_url, msg_type)
         )
+        record_id = cursor.lastrowid
         conn.commit()
         conn.close()
+        return record_id
     except Exception as e:
         logger.error(f"记录文件存档失败: {e}")
+        return None
+
+
+def _log_published_file_record(user_id, local_path, publish_result, file_type, content_type, file_size,
+                               source_url, msg_type):
+    """按最终发布结果记录文件信息"""
+    storage_uri = (publish_result or {}).get('storage_uri', '').strip() or local_path
+    file_name = os.path.basename(local_path)
+    return log_file_record(user_id, storage_uri, file_name, file_type, content_type, file_size, source_url, msg_type)
 
 
 # ============= 长消息截断 =============
@@ -970,10 +982,13 @@ def _publish_file_s3(local_path, object_key, content_type='', expires_seconds=No
 
 
 def publish_file(local_path, shared_dir='', user_id='', msg_type='', source_url='', agent_name='',
-                 content_type='', source='wecom', expires_seconds=None):
+                 content_type='', source='wecom', expires_seconds=None, force_s3=False):
     """统一文件发布入口：按模式发布并返回引用信息"""
     object_key = _build_storage_object_key(local_path, source=source, agent_name=agent_name or 'default')
 
+    if force_s3:
+        return _publish_file_s3(local_path, object_key=object_key,
+                                content_type=content_type, expires_seconds=expires_seconds)
     if FILE_STORAGE_MODE == 'local':
         return _publish_file_local(local_path, shared_dir=shared_dir)
     if FILE_STORAGE_MODE == 's3':
@@ -1429,9 +1444,6 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
             except Exception as e:
                 logger.warning(f"读取文本文件内容失败: {e}")
 
-        file_type = 'text' if is_text else content_type.split('/')[0]
-        log_file_record(user_id, local_path, filename, file_type, content_type, file_size, url, msg_type)
-
         logger.info(f"文件已下载: {local_path} (type={content_type}, text={text_content is not None})")
         return local_path, text_content, 'ok'
     except Exception as e:
@@ -1476,6 +1488,18 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='',
                     content_type=content_type,
                     source='wecom-image',
                 )
+                file_size = os.path.getsize(path)
+                file_type = content_type.split('/')[0] if '/' in content_type else content_type
+                _log_published_file_record(
+                    user_id,
+                    path,
+                    publish_result,
+                    file_type,
+                    content_type,
+                    file_size,
+                    url,
+                    'image',
+                )
             except Exception as e:
                 logger.error(f"图片发布失败: {e}")
                 return '[用户发送了一张图片，上传失败]'
@@ -1510,6 +1534,18 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='',
                 agent_name=agent_name,
                 content_type=content_type,
                 source='wecom-file',
+            )
+            file_size = os.path.getsize(path)
+            file_type = 'text' if text_content is not None else (content_type.split('/')[0] if '/' in content_type else content_type)
+            _log_published_file_record(
+                user_id,
+                path,
+                publish_result,
+                file_type,
+                content_type,
+                file_size,
+                url,
+                'file',
             )
         except Exception as e:
             logger.error(f"文件发布失败: {e}")
@@ -2036,13 +2072,14 @@ def internal_upload_file():
             content_type=content_type,
             source=source,
             expires_seconds=expires_seconds,
+            force_s3=True,
         )
 
         file_type = content_type.split('/')[0] if '/' in content_type else content_type
-        log_file_record(
+        file_record_id = _log_published_file_record(
             user_id,
-            publish_result.get('storage_uri', local_path),
-            os.path.basename(local_path),
+            local_path,
+            publish_result,
             file_type,
             content_type,
             file_size,
@@ -2060,6 +2097,7 @@ def internal_upload_file():
             'file_name': os.path.basename(local_path),
             'file_size': file_size,
             'agent_name': agent_name,
+            'file_record_id': file_record_id,
         })
     except ValueError as e:
         logger.warning(f"内部上传参数错误: {e}")
@@ -2158,7 +2196,8 @@ if __name__ == '__main__':
         f"队列配置: workers={MAX_GATEWAY_WORKERS}, "
         f"per_user_pending={MAX_PER_USER_PENDING}, queue_wait={MAX_QUEUE_WAIT_SECONDS}s"
     )
-    logger.info(f"文件存储模式: {FILE_STORAGE_MODE}")
+    logger.info(f"企微来件文件模式: {FILE_STORAGE_MODE}")
+    logger.info("OpenClaw 主动上传文件模式: s3")
     if FILE_STORAGE_MODE == 's3':
         logger.info(f"S3 Bucket: {S3_BUCKET or '(未配置)'}")
     if AGENTS:
