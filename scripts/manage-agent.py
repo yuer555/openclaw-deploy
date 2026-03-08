@@ -3,10 +3,10 @@
 OpenClaw 企业微信桥接网关 — Agent 绑定管理工具
 
 用法:
-  python3 manage-agent.py add <name>       交互式添加 agent-企业微信绑定
-  python3 manage-agent.py remove <name>    删除绑定（需确认）
+  python3 manage-agent.py add [agent_id]   交互式添加 agent-企业微信绑定
+  python3 manage-agent.py remove <agent_id> 删除绑定（需确认）
   python3 manage-agent.py list             列出所有绑定
-  python3 manage-agent.py update <name>    更新绑定（同名覆盖，需确认）
+  python3 manage-agent.py update <agent_id> 更新绑定（可重命名，需确认）
   python3 manage-agent.py sync-token       同步 openclaw token（批量更新）
 """
 
@@ -14,9 +14,16 @@ import sys
 import os
 import re
 import json
+import shutil
 import sqlite3
 import unicodedata
 import requests
+
+# 必须使用普通用户运行，避免将 OpenClaw home 落到 /root/.openclaw
+if os.getuid() == 0:
+    print("错误: 请不要使用 root 或 sudo 运行 manage-agent.py")
+    print("提示: 请使用 Gateway 运行用户执行 04-manage-agent.sh（不要 sudo）")
+    sys.exit(1)
 
 # 数据库路径（与 Gateway 一致）
 DB_PATH = os.getenv('DB_PATH', '/opt/openclaw/data/gateway/gateway.db')
@@ -24,10 +31,9 @@ DB_PATH = os.getenv('DB_PATH', '/opt/openclaw/data/gateway/gateway.db')
 # Gateway 地址（用于通知重载）
 GATEWAY_URL = os.getenv('GATEWAY_URL', 'http://localhost:8000')
 
-# 默认 OpenClaw 地址
+# 默认 Gateway/OpenClaw 地址
 DEFAULT_OPENCLAW_URL = 'http://localhost:18789'
 
-# 默认共享目录基础路径（位于 agent workspace 内，容器内通过 /app/shared 访问）
 # 如果以 sudo 运行，使用实际调用者的 home 目录（避免展开为 /root/.openclaw）
 _openclaw_home_env = os.getenv('OPENCLAW_HOME', '')
 if _openclaw_home_env:
@@ -45,27 +51,119 @@ CONTAINER_SHARED_PATH = '/app/shared'
 
 def _agent_workspace(agent_id):
     """根据 agent_id 计算 OpenClaw workspace 路径"""
-    if agent_id and agent_id != 'main':
-        return os.path.join(OPENCLAW_HOME, f'workspace-{agent_id}')
-    return os.path.join(OPENCLAW_HOME, 'workspace')
+    if agent_id == 'main':
+        return os.path.join(OPENCLAW_HOME, 'workspace')
+    return os.path.join(OPENCLAW_HOME, f'workspace-{agent_id}')
 
 
-def _default_shared_dir(agent_id):
-    """共享目录固定使用 <workspace>/shared"""
+def _default_shared_source_dir(agent_id):
+    """共享目录真实存储位置：保持在 workspace 内，满足沙箱 allowed roots 约束"""
     return os.path.join(_agent_workspace(agent_id), 'shared')
 
 
-def _validate_shared_dir(shared_dir, agent_id):
-    """校验共享目录必须是 <workspace>/shared，确保容器内路径稳定"""
-    shared_abs = os.path.realpath(os.path.expanduser(shared_dir))
-    expected_abs = os.path.realpath(os.path.expanduser(_default_shared_dir(agent_id)))
-    if shared_abs != expected_abs:
-        print("错误: 共享目录必须使用当前 Agent workspace 的 shared 目录")
-        print(f"  当前: {shared_abs}")
-        print(f"  建议: {expected_abs}")
-        print(f"  原因: Gateway 会将路径转换为容器内固定路径 {CONTAINER_SHARED_PATH}")
+def _default_shared_dir(agent_id):
+    """共享目录对外暴露路径固定使用 /app/shared/<agent_id>"""
+    return os.path.join(CONTAINER_SHARED_PATH, agent_id)
+
+
+def _validate_agent_id(agent_id):
+    """校验 agent_id / 路由名格式"""
+    if not NAME_PATTERN.match(agent_id):
+        print(f"错误: agent_id 格式不合法（英文小写+数字+连字符，3-30 字符）: {agent_id}")
         sys.exit(1)
-    return shared_abs
+    return agent_id
+
+
+def _ensure_shared_dir(agent_id, shared_dir):
+    """确保共享目录布局存在：workspace 内真实目录 + /app/shared 软链"""
+    source_dir = _default_shared_source_dir(agent_id)
+    try:
+        os.makedirs(source_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(shared_dir), exist_ok=True)
+
+        if os.path.islink(shared_dir):
+            current_target = os.path.realpath(shared_dir)
+            expected_target = os.path.realpath(source_dir)
+            if current_target != expected_target:
+                os.remove(shared_dir)
+                os.symlink(source_dir, shared_dir)
+                print(f"已修正共享目录软链: {shared_dir} -> {source_dir}")
+            else:
+                print(f"共享目录已就绪: {shared_dir} -> {source_dir}")
+            return
+
+        if os.path.isdir(shared_dir):
+            if os.path.realpath(shared_dir) == os.path.realpath(source_dir):
+                print(f"共享目录已就绪: {shared_dir} -> {source_dir}")
+                return
+
+            existing_entries = os.listdir(shared_dir)
+            conflicting_entries = [name for name in existing_entries if os.path.exists(os.path.join(source_dir, name))]
+            if conflicting_entries:
+                print(f"注意: 共享目录 {shared_dir} 已存在且包含冲突文件，未自动迁移")
+                print(f"  请手动整理后改为软链: {shared_dir} -> {source_dir}")
+                return
+
+            for name in existing_entries:
+                shutil.move(os.path.join(shared_dir, name), os.path.join(source_dir, name))
+            os.rmdir(shared_dir)
+            os.symlink(source_dir, shared_dir)
+            print(f"已迁移共享目录并创建软链: {shared_dir} -> {source_dir}")
+            return
+
+        if os.path.lexists(shared_dir):
+            print(f"注意: 路径已存在且无法自动处理: {shared_dir}")
+            print(f"  请手动改为软链: {shared_dir} -> {source_dir}")
+            return
+
+        os.symlink(source_dir, shared_dir)
+        print(f"已创建共享目录软链: {shared_dir} -> {source_dir}")
+        return
+    except PermissionError:
+        print(f"注意: 无权创建共享目录布局 {shared_dir}")
+        print(f"  真实目录应位于: {source_dir}")
+        print(f"  请确保 {CONTAINER_SHARED_PATH} 对当前用户可写")
+        print(f"  例如: sudo mkdir -p {CONTAINER_SHARED_PATH} && sudo chown $(whoami):$(id -gn) {CONTAINER_SHARED_PATH} && sudo chmod 775 {CONTAINER_SHARED_PATH}")
+    except OSError as e:
+        print(f"注意: 创建共享目录布局失败: {e}")
+        print(f"  请手动确认软链: {shared_dir} -> {source_dir}")
+
+
+def _read_gateway_token(prompt, current_token=''):
+    """读取 Gateway token，支持自动读取本地 token 与一致性校验"""
+    token_input = input(prompt).strip()
+    if not token_input:
+        if current_token:
+            return current_token
+        local_token = _try_read_local_token()
+        if local_token:
+            print(f"  已从本地配置读取 token: {mask(local_token)}")
+            return local_token
+        print("错误: Gateway Token 不能为空（跨机部署请手动输入）")
+        sys.exit(1)
+
+    if token_input == 'auto':
+        local_token = _try_read_local_token()
+        if local_token:
+            print(f"  已从本地配置读取 token: {mask(local_token)}")
+            return local_token
+        if not current_token:
+            print("错误: 无法读取本地配置中的 Gateway Token")
+            sys.exit(1)
+        print("  无法读取本地配置，保持原值")
+        return current_token
+
+    token = token_input
+    system_token = _try_read_local_token()
+    if system_token and token != system_token:
+        print(f"\n⚠️  注意: 输入的 token 与系统配置不一致")
+        print(f"  系统 token: {mask(system_token)}")
+        print(f"  输入 token: {mask(token)}")
+        confirm = input("  是否使用系统 token？[Y/n] ").strip().lower()
+        if confirm != 'n':
+            token = system_token
+            print(f"  已使用系统 token: {mask(token)}")
+    return token
 
 
 def display_width(s):
@@ -83,19 +181,43 @@ def pad(s, width):
 
 
 def _try_read_local_token():
-    """尝试从本地 OpenClaw 配置读取 gateway token（best-effort）
-    
+    """尝试读取 OpenClaw gateway token（优先级：环境变量 → .env 文件 → openclaw.json）
+
     适用于 Gateway 与 OpenClaw 同机部署的场景。
     跨机部署时返回 None，用户需手动输入。
     """
+    # 1. 优先从环境变量读取
+    env_token = os.getenv('OPENCLAW_GATEWAY_TOKEN', '').strip()
+    if env_token:
+        return env_token
+
+    # 2. 尝试从 .env 文件读取
+    env_file = os.path.join(OPENCLAW_HOME, '.env')
+    if os.path.isfile(env_file):
+        try:
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('OPENCLAW_GATEWAY_TOKEN='):
+                        token = line.split('=', 1)[1].strip().strip('"').strip("'")
+                        if token:
+                            return token
+        except Exception:
+            pass
+
+    # 3. 回退到 openclaw.json（可能是变量引用或实际 token）
     config_path = os.path.join(OPENCLAW_HOME, 'openclaw.json')
     try:
         with open(config_path, 'r') as f:
             config = json.load(f)
         token = config.get('gateway', {}).get('auth', {}).get('token', '')
-        return token if token else None
+        # 如果是变量引用格式，返回 None（需要用户手动输入）
+        if token and not token.startswith('${'):
+            return token
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return None
+        pass
+
+    return None
 
 
 def get_db():
@@ -158,71 +280,58 @@ def mask(s, show=4):
     return s[:show] + '...'
 
 
-def cmd_add(name):
+def cmd_add(initial_agent_id=''):
     """添加 agent 绑定"""
-    if not NAME_PATTERN.match(name):
-        print(f"错误: name 格式不合法（英文小写+数字+连字符，3-30 字符）: {name}")
+    print("\n添加 agent 绑定")
+    print("-" * 40)
+
+    openclaw_url = input(f"Gateway 地址（回车使用默认 {DEFAULT_OPENCLAW_URL}）: ").strip()
+    if not openclaw_url:
+        openclaw_url = DEFAULT_OPENCLAW_URL
+    openclaw_url = openclaw_url.rstrip('/')
+
+    prompt_suffix = f"（回车使用 {initial_agent_id}）" if initial_agent_id else ''
+    agent_id = input(f"Agent ID（路由名，同 OpenClaw agent_id）{prompt_suffix}: ").strip() or initial_agent_id
+    if not agent_id:
+        print("错误: Agent ID 不能为空")
         sys.exit(1)
+    agent_id = _validate_agent_id(agent_id)
 
     conn = get_db()
-    existing = conn.execute("SELECT name FROM agents WHERE name = ?", (name,)).fetchone()
+    existing = conn.execute("SELECT name FROM agents WHERE name = ?", (agent_id,)).fetchone()
     if existing:
-        print(f"错误: agent '{name}' 已存在，请使用 update 命令修改")
+        print(f"错误: agent '{agent_id}' 已存在，请使用 update 命令修改")
         conn.close()
         sys.exit(1)
 
-    print(f"\n添加 agent 绑定: {name}")
-    print("-" * 40)
+    shared_dir = _default_shared_dir(agent_id)
+    print(f"共享文件目录（自动生成，不可修改）: {shared_dir}")
 
-    display_name = input("显示名（如 '开发工程师小明'）: ").strip()
-    if not display_name:
-        print("错误: 显示名不能为空")
-        sys.exit(1)
+    openclaw_token = _read_gateway_token("Gateway Token: ")
 
     wecom_token = input("企业微信 Token: ").strip()
     if not wecom_token:
         print("错误: Token 不能为空")
+        conn.close()
         sys.exit(1)
 
     wecom_aes_key = input("企业微信 EncodingAESKey: ").strip()
     if not wecom_aes_key:
         print("错误: AESKey 不能为空")
+        conn.close()
         sys.exit(1)
 
-    openclaw_url = input(f"openclaw 地址（回车使用默认 {DEFAULT_OPENCLAW_URL}）: ").strip()
-    if not openclaw_url:
-        openclaw_url = DEFAULT_OPENCLAW_URL
-    openclaw_url = openclaw_url.rstrip('/')
-
-    openclaw_token = input("openclaw Token: ").strip()
-    if not openclaw_token:
-        # 尝试从本地 OpenClaw 配置自动获取（同机部署场景）
-        local_token = _try_read_local_token()
-        if local_token:
-            openclaw_token = local_token
-            print(f"  已从本地配置读取 token: {mask(openclaw_token)}")
-        else:
-            print("错误: openclaw Token 不能为空（跨机部署请手动输入）")
-            sys.exit(1)
-
-    openclaw_agent_id = input("openclaw Agent ID（回车跳过，默认 main）: ").strip()
-
-    # 共享目录：Gateway 下载的文件保存到此目录，容器内通过 /app/shared 访问
-    openclaw_agent = openclaw_agent_id or 'main'
-    default_shared = _default_shared_dir(openclaw_agent)
-    shared_dir = input(f"共享文件目录（回车使用默认 {default_shared}）: ").strip()
-    if not shared_dir:
-        shared_dir = default_shared
-    shared_dir = _validate_shared_dir(shared_dir, openclaw_agent)
+    display_name = input(f"显示名（回车使用 {agent_id}）: ").strip() or agent_id
 
     # 确认
     print(f"\n确认添加？")
-    print(f"  路由名:     {name}")
+    print(f"  Agent ID:   {agent_id}")
     print(f"  显示名:     {display_name}")
-    print(f"  企业微信:   Token={mask(wecom_token)} AESKey={mask(wecom_aes_key)}")
-    print(f"  openclaw:   {openclaw_url} (agent: {openclaw_agent_id or 'main'})")
+    print(f"  Gateway:    {openclaw_url}")
     print(f"  共享目录:   {shared_dir}")
-    print(f"  容器路径:   {CONTAINER_SHARED_PATH}")
+    print(f"  GatewayToken={mask(openclaw_token)}")
+    print(f"  企业微信:   Token={mask(wecom_token)} AESKey={mask(wecom_aes_key)}")
+    print(f"  回调地址:   https://your-domain/{agent_id}/wecom/callback")
 
     confirm = input("\n[Y/n] ").strip().lower()
     if confirm and confirm != 'y':
@@ -234,23 +343,16 @@ def cmd_add(name):
         "INSERT INTO agents (name, display_name, wecom_token, wecom_aes_key, "
         "openclaw_url, openclaw_token, openclaw_agent_id, shared_dir) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token,
-         openclaw_agent_id, shared_dir)
+        (agent_id, display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token,
+         agent_id, shared_dir)
     )
     conn.commit()
     conn.close()
 
-    # 尝试创建共享目录（权限不足时给出提示，不阻塞绑定创建）
-    try:
-        os.makedirs(shared_dir, exist_ok=True)
-        print(f"已创建共享目录: {shared_dir}")
-    except PermissionError:
-        print(f"注意: 无权创建共享目录 {shared_dir}")
-        print(f"  请手动执行: mkdir -p {shared_dir}")
-        print(f"  Gateway 启动时也会自动创建此目录")
+    _ensure_shared_dir(agent_id, shared_dir)
 
-    print(f"已添加 agent '{name}'")
-    print(f"企业微信回调地址: https://your-domain/{name}/wecom/callback")
+    print(f"已添加 agent '{agent_id}'")
+    print(f"企业微信回调地址: https://your-domain/{agent_id}/wecom/callback")
     notify_reload()
 
 
@@ -268,9 +370,9 @@ def cmd_remove(name):
 
     _, display, token, url, agent_id, shared_dir = row
     print(f"\n即将删除:")
-    print(f"  路由名: {name} ({display})")
+    print(f"  Agent ID: {name} ({display})")
     print(f"  企业微信: Token={mask(token)}")
-    print(f"  openclaw: {url} (agent: {agent_id or 'main'})")
+    print(f"  Gateway:  {url} (agent: {agent_id or name})")
     print(f"  共享目录: {shared_dir or '(未设置)'}")
 
     confirm = input("\n确认删除？此操作不可恢复。[y/N] ").strip().lower()
@@ -302,56 +404,46 @@ def cmd_update(name):
         sys.exit(1)
 
     _, old_display, old_token, old_aes, old_url, old_oc_token, old_agent_id, old_shared_dir = row
+    old_effective_agent_id = name
 
     print(f"\n更新 agent 绑定: {name}")
     print(f"当前配置:")
+    print(f"  Agent ID:   {old_effective_agent_id}")
     print(f"  显示名:     {old_display}")
+    print(f"  Gateway:    {old_url}")
+    print(f"  共享目录:   {old_shared_dir or _default_shared_dir(old_effective_agent_id)}")
     print(f"  企业微信:   Token={mask(old_token)} AESKey={mask(old_aes)}")
-    print(f"  openclaw:   {old_url} (agent: {old_agent_id or 'main'})")
-    print(f"  共享目录:   {old_shared_dir or '(未设置)'}")
 
     print(f"\n输入新值（回车保持不变）:")
 
-    display_name = input(f"显示名 [{old_display}]: ").strip() or old_display
+    openclaw_url = input(f"Gateway 地址 [{old_url}]: ").strip() or old_url
+    openclaw_url = openclaw_url.rstrip('/')
+    agent_id = input(f"Agent ID（路由名，同 OpenClaw agent_id） [{old_effective_agent_id}]: ").strip() or old_effective_agent_id
+    agent_id = _validate_agent_id(agent_id)
+    if agent_id != name:
+        existing = conn.execute("SELECT name FROM agents WHERE name = ?", (agent_id,)).fetchone()
+        if existing:
+            print(f"错误: agent '{agent_id}' 已存在，无法重命名")
+            conn.close()
+            sys.exit(1)
+
+    shared_dir = _default_shared_dir(agent_id)
+    print(f"共享文件目录（自动生成，不可修改）: {shared_dir}")
+
+    openclaw_token = _read_gateway_token(f"Gateway Token [{mask(old_oc_token)}]: ", current_token=old_oc_token)
     wecom_token = input(f"企业微信 Token [{mask(old_token)}]: ").strip() or old_token
     wecom_aes_key = input(f"企业微信 AES Key [{mask(old_aes)}]: ").strip() or old_aes
-    openclaw_url = input(f"openclaw 地址 [{old_url}]: ").strip() or old_url
-    openclaw_url = openclaw_url.rstrip('/')
-    openclaw_token = input(f"openclaw Token [{mask(old_oc_token)}]: ").strip()
-    if not openclaw_token:
-        openclaw_token = old_oc_token
-    elif openclaw_token == 'auto':
-        local_token = _try_read_local_token()
-        if local_token:
-            openclaw_token = local_token
-            print(f"  已从本地配置读取 token: {mask(openclaw_token)}")
-        else:
-            print("  无法读取本地配置，保持原值")
-            openclaw_token = old_oc_token
-    openclaw_agent_id = input(f"openclaw Agent ID [{old_agent_id or 'main'}]: ").strip()
-    if not openclaw_agent_id:
-        openclaw_agent_id = old_agent_id
-
-    openclaw_agent = openclaw_agent_id or old_agent_id or 'main'
-    default_shared = _default_shared_dir(openclaw_agent)
-    if old_shared_dir:
-        old_shared_norm = os.path.realpath(os.path.expanduser(old_shared_dir))
-        default_shared_norm = os.path.realpath(os.path.expanduser(default_shared))
-        if old_shared_norm != default_shared_norm:
-            print("注意: 当前共享目录与推荐路径不一致，建议修正为默认路径")
-            print(f"  当前: {old_shared_norm}")
-            print(f"  建议: {default_shared_norm}")
-    shared_dir = input(f"共享文件目录 [{default_shared}]: ").strip() or default_shared
-    shared_dir = _validate_shared_dir(shared_dir, openclaw_agent)
+    display_name = input(f"显示名 [{old_display or agent_id}]: ").strip() or old_display or agent_id
 
     # 确认
     print(f"\n确认更新？")
-    print(f"  路由名:     {name}")
+    print(f"  Agent ID:   {agent_id}")
     print(f"  显示名:     {display_name}")
-    print(f"  企业微信:   Token={mask(wecom_token)} AESKey={mask(wecom_aes_key)}")
-    print(f"  openclaw:   {openclaw_url} (agent: {openclaw_agent_id or 'main'})")
+    print(f"  Gateway:    {openclaw_url}")
     print(f"  共享目录:   {shared_dir}")
-    print(f"  容器路径:   {CONTAINER_SHARED_PATH}")
+    print(f"  GatewayToken={mask(openclaw_token)}")
+    print(f"  企业微信:   Token={mask(wecom_token)} AESKey={mask(wecom_aes_key)}")
+    print(f"  回调地址:   https://your-domain/{agent_id}/wecom/callback")
 
     confirm = input("\n[Y/n] ").strip().lower()
     if confirm and confirm != 'y':
@@ -360,23 +452,23 @@ def cmd_update(name):
         return
 
     conn.execute(
-        "UPDATE agents SET display_name=?, wecom_token=?, wecom_aes_key=?, "
+        "UPDATE agents SET name=?, display_name=?, wecom_token=?, wecom_aes_key=?, "
         "openclaw_url=?, openclaw_token=?, openclaw_agent_id=?, shared_dir=?, updated_at=CURRENT_TIMESTAMP "
         "WHERE name=?",
-        (display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token, openclaw_agent_id, shared_dir, name)
+        (agent_id, display_name, wecom_token, wecom_aes_key, openclaw_url, openclaw_token, agent_id, shared_dir, name)
     )
     conn.commit()
     conn.close()
 
-    # 确保共享目录存在
-    if shared_dir:
-        try:
-            os.makedirs(shared_dir, exist_ok=True)
-        except PermissionError:
-            print(f"注意: 无权创建共享目录 {shared_dir}")
-            print(f"  请手动执行: mkdir -p {shared_dir}")
+    _ensure_shared_dir(agent_id, shared_dir)
 
-    print(f"已更新 agent '{name}'")
+    if old_shared_dir and old_shared_dir != shared_dir:
+        print(f"注意: 旧共享目录 {old_shared_dir} 未删除，如需清理请手动处理")
+
+    if agent_id == name:
+        print(f"已更新 agent '{agent_id}'")
+    else:
+        print(f"已更新 agent '{name}' -> '{agent_id}'")
     notify_reload()
 
 
@@ -390,21 +482,21 @@ def cmd_list():
 
     if not rows:
         print("当前无 agent 绑定")
-        print("使用 python3 manage-agent.py add <name> 添加")
+        print("使用 python3 manage-agent.py add [agent_id] 添加")
         return
 
     print(f"\n共 {len(rows)} 个 agent 绑定:")
     print("-" * 100)
-    print(f"{pad('名称', 12)} {pad('显示名', 16)} {pad('openclaw 地址', 28)} {pad('Agent ID', 10)} {pad('共享目录', 30)} 创建时间")
+    print(f"{pad('路由名', 12)} {pad('显示名', 16)} {pad('Gateway 地址', 28)} {pad('OpenClaw', 10)} {pad('共享目录', 30)} 创建时间")
     print("-" * 100)
     for name, display, url, agent_id, shared_dir, created, updated in rows:
         print(f"{pad(name, 12)} {pad(display, 16)} {pad(url, 28)} {pad(agent_id or 'main', 10)} {pad(shared_dir or '-', 30)} {created}")
     print("-" * 100)
-    print(f"\n回调地址格式: https://your-domain/<name>/wecom/callback")
+    print(f"\n回调地址格式: https://your-domain/<agent_id>/wecom/callback")
 
 
 def cmd_sync_token():
-    """同步 openclaw token — 批量更新 DB 中 agent 的 token
+    """同步 Gateway token — 批量更新 DB 中 agent 的 token
     
     支持两种方式：
     - 自动从本地 OpenClaw 配置读取（同机部署）
@@ -443,7 +535,7 @@ def cmd_sync_token():
     for name, url, token in rows:
         by_url.setdefault(url, []).append((name, token))
 
-    print(f"\n将更新以下 agent 的 openclaw token:")
+    print(f"\n将更新以下 agent 的 Gateway token:")
     for url, agents in by_url.items():
         print(f"\n  openclaw: {url}")
         for name, token in agents:
@@ -492,7 +584,7 @@ def cmd_sync_token():
     conn.close()
 
     updated = len(rows)
-    print(f"\n已更新 {updated} 个 agent 的 token: {mask(new_token)}")
+    print(f"\n已更新 {updated} 个 agent 的 Gateway token: {mask(new_token)}")
     notify_reload()
 
 
@@ -506,18 +598,15 @@ def main():
     if command == 'list':
         cmd_list()
     elif command == 'add':
-        if len(sys.argv) < 3:
-            print("用法: python3 manage-agent.py add <name>")
-            sys.exit(1)
-        cmd_add(sys.argv[2])
+        cmd_add(sys.argv[2] if len(sys.argv) >= 3 else '')
     elif command == 'remove':
         if len(sys.argv) < 3:
-            print("用法: python3 manage-agent.py remove <name>")
+            print("用法: python3 manage-agent.py remove <agent_id>")
             sys.exit(1)
         cmd_remove(sys.argv[2])
     elif command == 'update':
         if len(sys.argv) < 3:
-            print("用法: python3 manage-agent.py update <name>")
+            print("用法: python3 manage-agent.py update <agent_id>")
             sys.exit(1)
         cmd_update(sys.argv[2])
     elif command == 'sync-token':

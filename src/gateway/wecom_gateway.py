@@ -7,15 +7,29 @@ import os
 import logging
 import json
 import base64
+import shutil
+import tempfile
 from Crypto.Cipher import AES
 import struct
+import ssl
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import threading
 import queue
+from collections import deque
 import mimetypes
 import zipfile
 import websocket
+
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+    from botocore.exceptions import BotoCoreError, ClientError
+except Exception:
+    boto3 = None
+    BotoConfig = None
+    BotoCoreError = Exception
+    ClientError = Exception
 
 app = Flask(__name__)
 
@@ -26,17 +40,181 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+LOCAL_SHARED_ROOT = '/app/shared'
+
+
+_REQUESTS_VERIFY_PATH = None
+_REQUESTS_VERIFY_FAILED = False
+
+
+def _is_valid_ca_path(path):
+    return bool(path) and os.path.exists(path)
+
+
+def _resolve_requests_verify():
+    """解析 requests 使用的 CA 路径，优先返回显式有效路径，避免遗留 certifi 路径导致失败"""
+    global _REQUESTS_VERIFY_PATH, _REQUESTS_VERIFY_FAILED
+
+    if _is_valid_ca_path(_REQUESTS_VERIFY_PATH):
+        return _REQUESTS_VERIFY_PATH
+
+    candidates = []
+    seen = set()
+
+    def add_candidate(path):
+        normalized = (path or '').strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    for env_key in ('REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE'):
+        env_value = os.getenv(env_key, '').strip()
+        if env_value and not _is_valid_ca_path(env_value):
+            logger.warning(f"检测到无效 {env_key}={env_value}，已忽略并回退系统证书")
+            os.environ.pop(env_key, None)
+            continue
+        add_candidate(env_value)
+
+    try:
+        import requests.adapters as req_adapters
+        add_candidate(getattr(req_adapters, 'DEFAULT_CA_BUNDLE_PATH', ''))
+    except Exception:
+        req_adapters = None
+
+    try:
+        import requests.certs as req_certs
+        add_candidate(req_certs.where())
+    except Exception:
+        pass
+
+    try:
+        import certifi
+        add_candidate(certifi.where())
+    except Exception:
+        pass
+
+    try:
+        default_paths = ssl.get_default_verify_paths()
+        add_candidate(default_paths.cafile)
+        add_candidate(default_paths.capath)
+        add_candidate(default_paths.openssl_cafile)
+        add_candidate(default_paths.openssl_capath)
+    except Exception as e:
+        logger.warning(f"读取系统 TLS 默认路径失败: {e}")
+
+    fallback_paths = [
+        '/etc/ssl/certs/ca-certificates.crt',
+        '/etc/pki/tls/certs/ca-bundle.crt',
+        '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem',
+        '/etc/ssl/cert.pem',
+        '/etc/ssl/certs',
+    ]
+    for path in fallback_paths:
+        add_candidate(path)
+
+    for path in candidates:
+        if _is_valid_ca_path(path):
+            _REQUESTS_VERIFY_PATH = path
+            if req_adapters is not None:
+                req_adapters.DEFAULT_CA_BUNDLE_PATH = path
+            return path
+
+    if not _REQUESTS_VERIFY_FAILED:
+        logger.error("未找到可用系统 CA 证书文件或目录，HTTPS 请求可能失败")
+        _REQUESTS_VERIFY_FAILED = True
+    return True
+
+
+def _sanitize_requests_tls_env():
+    """启动时预热 TLS 证书路径解析，尽早清理遗留环境变量"""
+    _resolve_requests_verify()
+
+
+def _requests_request(method, url, **kwargs):
+    """统一 requests 调用，显式指定 verify，避免被遗留环境变量覆盖"""
+    kwargs.setdefault('verify', _resolve_requests_verify())
+    return requests.request(method, url, **kwargs)
+
+
+_sanitize_requests_tls_env()
+
 # ============= 配置（从环境变量读取）=============
 
 # 数据库配置
 DB_PATH = os.getenv('DB_PATH', '/opt/openclaw/data/gateway/gateway.db')
 
 # 通信协议（全局默认）
-OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '2700'))
+OPENCLAW_TIMEOUT = int(os.getenv('OPENCLAW_TIMEOUT', '180'))
 OPENCLAW_PROTOCOL = os.getenv('OPENCLAW_PROTOCOL', 'ws')
+
+
+def _read_positive_int_env(name, default_value):
+    """读取正整数环境变量，非法值回退默认值"""
+    raw_value = os.getenv(name, str(default_value)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning(f"环境变量 {name} 非法: {raw_value}，回退默认值 {default_value}")
+        return default_value
+    if value <= 0:
+        logger.warning(f"环境变量 {name} 必须为正整数，回退默认值 {default_value}")
+        return default_value
+    return value
+
+
+OPENCLAW_CONNECT_TIMEOUT = _read_positive_int_env('OPENCLAW_CONNECT_TIMEOUT', 10)
+OPENCLAW_WS_IDLE_TIMEOUT = _read_positive_int_env('OPENCLAW_WS_IDLE_TIMEOUT', 30)
+OPENCLAW_WS_TOTAL_TIMEOUT = _read_positive_int_env('OPENCLAW_WS_TOTAL_TIMEOUT', 180)
+OPENCLAW_SSE_IDLE_TIMEOUT = _read_positive_int_env('OPENCLAW_SSE_IDLE_TIMEOUT', 30)
+OPENCLAW_SSE_TOTAL_TIMEOUT = _read_positive_int_env('OPENCLAW_SSE_TOTAL_TIMEOUT', 180)
+OPENCLAW_HTTP_TIMEOUT = _read_positive_int_env('OPENCLAW_HTTP_TIMEOUT', 180)
+
+MAX_GATEWAY_WORKERS = _read_positive_int_env('MAX_GATEWAY_WORKERS', 8)
+MAX_PER_USER_PENDING = _read_positive_int_env('MAX_PER_USER_PENDING', 1)
+MAX_QUEUE_WAIT_SECONDS = _read_positive_int_env('MAX_QUEUE_WAIT_SECONDS', 60)
 
 # Gateway 端口
 GATEWAY_PORT = int(os.getenv('GATEWAY_PORT', '8000'))
+GATEWAY_URL = os.getenv('GATEWAY_URL', f'http://localhost:{GATEWAY_PORT}').strip().rstrip('/')
+
+# 文件存储模式（local | s3）
+FILE_STORAGE_MODE = os.getenv('FILE_STORAGE_MODE', 'local').strip().lower()
+VALID_FILE_STORAGE_MODES = {'local', 's3'}
+if FILE_STORAGE_MODE not in VALID_FILE_STORAGE_MODES:
+    logger.warning(f"未知 FILE_STORAGE_MODE={FILE_STORAGE_MODE}，回退 local")
+    FILE_STORAGE_MODE = 'local'
+
+# 预签名下载默认有效期（秒）
+try:
+    FILE_STORAGE_PRESIGN_EXPIRES = int(os.getenv('FILE_STORAGE_PRESIGN_EXPIRES', '86400'))
+except ValueError:
+    logger.warning("FILE_STORAGE_PRESIGN_EXPIRES 非法，使用默认 86400")
+    FILE_STORAGE_PRESIGN_EXPIRES = 86400
+FILE_STORAGE_PRESIGN_EXPIRES = max(1, FILE_STORAGE_PRESIGN_EXPIRES)
+
+# Gateway 内部上传接口鉴权 Token（供 OpenClaw skill 调用）
+FILE_UPLOAD_INTERNAL_TOKEN = os.getenv('FILE_UPLOAD_INTERNAL_TOKEN', '').strip()
+
+# S3 配置（仅 FILE_STORAGE_MODE=s3 时生效）
+S3_BUCKET = os.getenv('S3_BUCKET', '').strip()
+S3_REGION = os.getenv('S3_REGION', 'us-east-1').strip()
+S3_ENDPOINT_URL = os.getenv('S3_ENDPOINT_URL', '').strip()
+S3_ACCESS_KEY_ID = os.getenv('S3_ACCESS_KEY_ID', '').strip()
+S3_SECRET_ACCESS_KEY = os.getenv('S3_SECRET_ACCESS_KEY', '').strip()
+S3_KEY_PREFIX = os.getenv('S3_KEY_PREFIX', 'openclaw-gateway').strip().strip('/')
+FILE_STORAGE_KEY_PREFIX = os.getenv('FILE_STORAGE_KEY_PREFIX', S3_KEY_PREFIX or 'openclaw-gateway').strip().strip('/')
+S3_SIGNATURE_VERSION = os.getenv('S3_SIGNATURE_VERSION', 's3').strip()
+S3_ADDRESSING_STYLE = os.getenv('S3_ADDRESSING_STYLE', 'path').strip()
+S3_SSE_MODE = os.getenv('S3_SSE_MODE', '').strip()
+S3_SSE_KMS_KEY_ID = os.getenv('S3_SSE_KMS_KEY_ID', '').strip()
+
+# OpenClaw skill 经 Gateway 上传时的文件大小限制（默认 50MB）
+try:
+    MAX_INTERNAL_UPLOAD_FILE_SIZE = int(os.getenv('MAX_INTERNAL_UPLOAD_FILE_SIZE', str(50 * 1024 * 1024)))
+except ValueError:
+    logger.warning("MAX_INTERNAL_UPLOAD_FILE_SIZE 非法，使用默认 50MB")
+    MAX_INTERNAL_UPLOAD_FILE_SIZE = 50 * 1024 * 1024
 
 # ============= Agent 绑定（从 SQLite 加载）=============
 
@@ -75,14 +253,21 @@ def load_agents_from_db():
     ).fetchall()
     agents = {}
     for name, display, token, aes_key, url, oc_token, agent_id, shared_dir in rows:
+        effective_agent_id = (agent_id or name or 'main').strip() or 'main'
+        expected_shared_dir = os.path.join(LOCAL_SHARED_ROOT, name)
+        configured_shared_dir = (shared_dir or '').strip()
+        if agent_id and agent_id != name:
+            logger.warning(f"[{name}] openclaw_agent_id 与路由名不一致，当前继续沿用 DB 中的 agent_id={agent_id}")
+        if configured_shared_dir and os.path.normpath(configured_shared_dir) != os.path.normpath(expected_shared_dir):
+            logger.warning(f"[{name}] shared_dir 与固定路径不一致，已改用 {expected_shared_dir}（原值: {configured_shared_dir}）")
         agents[name] = {
             'display_name': display,
             'wecom_token': token,
             'wecom_encoding_aes_key': aes_key,
             'openclaw_url': url,
             'openclaw_token': oc_token,
-            'openclaw_agent_id': agent_id or 'main',
-            'shared_dir': shared_dir or '',
+            'openclaw_agent_id': effective_agent_id,
+            'shared_dir': expected_shared_dir,
         }
     conn.close()
     return agents
@@ -96,6 +281,19 @@ AGENTS = load_agents_from_db()
 
 # ============= OpenClaw API 通用调用 =============
 
+
+class OpenClawTimeoutError(Exception):
+    """OpenClaw 调用超时"""
+
+    def __init__(self, stage, message):
+        super().__init__(message)
+        self.stage = stage
+
+
+def _timeout_message(stage, seconds):
+    """格式化超时错误消息"""
+    return f"openclaw {stage} 超时（{seconds}s）"
+
 def _extract_reply_text(data):
     """从 /v1/responses 返回数据中提取文本"""
     texts = []
@@ -107,64 +305,130 @@ def _extract_reply_text(data):
     return '\n'.join(texts).strip()
 
 
-def _call_openclaw_sse(url, message, session_key, timeout=2700, token='', agent_id='main'):
+def _call_openclaw_sse(url, message, session_key, timeout=None, token='', agent_id='main'):
     """单次 HTTP SSE 流式调用，返回回复文本。连接异常时抛出异常。"""
-    resp = requests.post(
-        f"{url}/v1/responses",
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-            'x-openclaw-agent-id': agent_id,
-        },
-        json={'model': 'openclaw', 'input': message, 'stream': True, 'user': session_key},
-        timeout=(10, timeout),
-        stream=True,
-    )
-    resp.raise_for_status()
+    start_time = time.monotonic()
+    try:
+        resp = _requests_request(
+            'post',
+            f"{url}/v1/responses",
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+                'x-openclaw-agent-id': agent_id,
+            },
+            json={'model': 'openclaw', 'input': message, 'stream': True, 'user': session_key},
+            timeout=(OPENCLAW_CONNECT_TIMEOUT, OPENCLAW_SSE_IDLE_TIMEOUT),
+            stream=True,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.Timeout as e:
+        raise OpenClawTimeoutError('sse_connect', _timeout_message('sse_connect', OPENCLAW_CONNECT_TIMEOUT)) from e
 
     final_data = None
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line or not line.startswith('data: '):
-            continue
-        payload = line[6:]
-        if payload == '[DONE]':
-            break
-        try:
-            evt = json.loads(payload)
-            if evt.get('type') == 'response.completed':
-                final_data = evt.get('response', {})
-        except json.JSONDecodeError:
-            continue
+    try:
+        for line in resp.iter_lines(decode_unicode=True):
+            if time.monotonic() - start_time > OPENCLAW_SSE_TOTAL_TIMEOUT:
+                raise OpenClawTimeoutError('sse_total', _timeout_message('sse_total', OPENCLAW_SSE_TOTAL_TIMEOUT))
+            if not line or not line.startswith('data: '):
+                continue
+            payload = line[6:]
+            if payload == '[DONE]':
+                break
+            try:
+                evt = json.loads(payload)
+                if evt.get('type') == 'response.completed':
+                    final_data = evt.get('response', {})
+            except json.JSONDecodeError:
+                continue
+    except OpenClawTimeoutError:
+        raise
+    except requests.exceptions.Timeout as e:
+        raise OpenClawTimeoutError('sse_idle', _timeout_message('sse_idle', OPENCLAW_SSE_IDLE_TIMEOUT)) from e
 
     if final_data:
         return _extract_reply_text(final_data)
     return ''
 
 
-def _call_openclaw_http(url, message, session_key, timeout=2700, token='', agent_id='main'):
+def _call_openclaw_http(url, message, session_key, timeout=None, token='', agent_id='main'):
     """同步 HTTP POST 调用，不使用流式，直接拿完整 JSON 响应"""
-    resp = requests.post(
-        f"{url}/v1/responses",
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-            'x-openclaw-agent-id': agent_id,
-        },
-        json={'model': 'openclaw', 'input': message, 'user': session_key},
-        timeout=(10, timeout),
-    )
-    resp.raise_for_status()
+    try:
+        resp = _requests_request(
+            'post',
+            f"{url}/v1/responses",
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+                'x-openclaw-agent-id': agent_id,
+            },
+            json={'model': 'openclaw', 'input': message, 'user': session_key},
+            timeout=(OPENCLAW_CONNECT_TIMEOUT, OPENCLAW_HTTP_TIMEOUT),
+        )
+        resp.raise_for_status()
+    except requests.exceptions.Timeout as e:
+        raise OpenClawTimeoutError('http', _timeout_message('http', OPENCLAW_HTTP_TIMEOUT)) from e
     return _extract_reply_text(resp.json())
 
 
-def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_id='main'):
+def _extract_ws_chat_text(message_obj):
+    """从 WS chat message 中提取文本内容"""
+    texts = []
+    if not isinstance(message_obj, dict):
+        return ''
+
+    for item in message_obj.get('content', []):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get('type')
+        if item_type in ('text', 'output_text') and item.get('text'):
+            texts.append(item['text'])
+            continue
+        if item_type == 'input_text' and item.get('text'):
+            texts.append(item['text'])
+
+    return '\n'.join(texts).strip()
+
+
+def _merge_ws_stream_text(accumulated_text, last_piece, current_piece):
+    """合并 WS 流式分段文本，兼容快照模式与增量模式"""
+    current_piece = (current_piece or '').strip()
+    if not current_piece:
+        return accumulated_text
+
+    if not accumulated_text:
+        return current_piece
+
+    # 快照模式：当前分段是此前内容的扩展
+    if current_piece.startswith(accumulated_text):
+        return current_piece
+
+    # 回退/重复片段，忽略
+    if accumulated_text.startswith(current_piece):
+        return accumulated_text
+    if current_piece == (last_piece or '').strip():
+        return accumulated_text
+    if accumulated_text.endswith(current_piece) or current_piece in accumulated_text:
+        return accumulated_text
+
+    # 增量模式：按顺序追加
+    return accumulated_text + current_piece
+
+
+def _call_openclaw_ws(url, message, session_key, timeout=None, token='', agent_id='main'):
     """WebSocket 协议调用：connect 握手 + chat.send，监听 chat state=final 获取回复"""
     ws_url = url.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
-    # 连接阶段使用短超时（10 秒），避免服务不可达时等待过长
-    ws = websocket.create_connection(ws_url, timeout=10)
+    start_time = time.monotonic()
     try:
-        # 连接成功后切换到长超时（等待 Agent 处理）
-        ws.settimeout(timeout)
+        ws = websocket.create_connection(ws_url, timeout=OPENCLAW_CONNECT_TIMEOUT)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if 'timed out' in err_msg or 'timeout' in err_msg:
+            raise OpenClawTimeoutError('ws_connect', _timeout_message('ws_connect', OPENCLAW_CONNECT_TIMEOUT)) from e
+        raise
+    try:
+        # 连接成功后切换到空闲超时（等待 Agent 处理）
+        ws.settimeout(OPENCLAW_WS_IDLE_TIMEOUT)
         # Step 1: 收 challenge
         ws.recv()
 
@@ -195,8 +459,15 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_i
         }))
 
         # 监听事件流，chat state=final 包含完整回复
+        accumulated_text = ''
+        last_piece = ''
         while True:
-            raw = ws.recv()
+            if time.monotonic() - start_time > OPENCLAW_WS_TOTAL_TIMEOUT:
+                raise OpenClawTimeoutError('ws_total', _timeout_message('ws_total', OPENCLAW_WS_TOTAL_TIMEOUT))
+            try:
+                raw = ws.recv()
+            except websocket.WebSocketTimeoutException as e:
+                raise OpenClawTimeoutError('ws_idle', _timeout_message('ws_idle', OPENCLAW_WS_IDLE_TIMEOUT)) from e
             evt = json.loads(raw)
             if evt.get('type') == 'event' and evt.get('event') == 'chat':
                 payload = evt.get('payload', {})
@@ -204,13 +475,19 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_i
                 evt_sk = (payload.get('sessionKey') or '').lower()
                 if evt_sk and session_key.lower() not in evt_sk:
                     continue
+                msg = payload.get('message', {})
+                piece_text = _extract_ws_chat_text(msg)
+                if piece_text:
+                    accumulated_text = _merge_ws_stream_text(accumulated_text, last_piece, piece_text)
+                    last_piece = piece_text
                 if payload.get('state') == 'final':
-                    msg = payload.get('message', {})
-                    texts = []
-                    for c in msg.get('content', []):
-                        if c.get('type') == 'text' and c.get('text'):
-                            texts.append(c['text'])
-                    return '\n'.join(texts).strip()
+                    final_text = piece_text.strip() if piece_text else ''
+                    if final_text:
+                        return final_text
+                    if accumulated_text:
+                        logger.warning("WS final 事件未携带完整文本，使用分段累计兜底")
+                        return accumulated_text.strip()
+                    return ''
             # RPC 错误
             if evt.get('type') == 'res' and evt.get('id') == req_id and not evt.get('ok'):
                 raise Exception(f"WS RPC 错误: {evt.get('error')}")
@@ -218,7 +495,7 @@ def _call_openclaw_ws(url, message, session_key, timeout=2700, token='', agent_i
         ws.close()
 
 
-def _call_openclaw(url, message, session_key, timeout=2700, token='', agent_id='main'):
+def _call_openclaw(url, message, session_key, timeout=None, token='', agent_id='main'):
     """统一调用入口，根据 OPENCLAW_PROTOCOL 选择协议"""
     protocol = OPENCLAW_PROTOCOL.lower()
 
@@ -227,30 +504,12 @@ def _call_openclaw(url, message, session_key, timeout=2700, token='', agent_id='
                                    token=token, agent_id=agent_id)
 
     elif protocol == 'ws':
-        try:
-            return _call_openclaw_ws(url, message, session_key, timeout,
-                                     token=token, agent_id=agent_id)
-        except Exception as e:
-            err_msg = str(e)
-            # 确定性错误（认证失败、RPC 错误）不重试
-            if 'connect 失败' in err_msg or 'RPC 错误' in err_msg:
-                raise
-            logger.warning(f"WS 调用失败: {e}，尝试重试")
-            retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
-            return _call_openclaw_ws(url, retry_msg, session_key, timeout,
-                                     token=token, agent_id=agent_id)
+        return _call_openclaw_ws(url, message, session_key, timeout,
+                                 token=token, agent_id=agent_id)
 
     else:  # 默认 sse
-        try:
-            return _call_openclaw_sse(url, message, session_key, timeout,
-                                      token=token, agent_id=agent_id)
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.ReadTimeout) as e:
-            logger.warning(f"SSE 连接断开: {e}，尝试重试")
-            retry_msg = "请重复你刚才的回复，不要做任何修改，原样输出即可。"
-            return _call_openclaw_sse(url, retry_msg, session_key, timeout,
-                                      token=token, agent_id=agent_id)
+        return _call_openclaw_sse(url, message, session_key, timeout,
+                                  token=token, agent_id=agent_id)
 
 
 _SANDBOX_MOUNT_ERROR_MARKERS = (
@@ -385,7 +644,7 @@ def log_task(task_id, user_id, agent_id, content, status='pending', result=''):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO task_logs (task_id, user_id, agent_id, task_content, status, result) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO task_logs (task_id, user_id, agent_id, task_content, status, result) VALUES (?, ?, ?, ?, ?, ?)",
             (task_id, user_id, agent_id, content, status, result)
         )
         conn.commit()
@@ -418,15 +677,31 @@ def log_file_record(user_id, file_path, file_name, file_type, content_type, file
             "INSERT INTO file_records (user_id, file_path, file_name, file_type, content_type, file_size, source_url, msg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, file_path, file_name, file_type, content_type, file_size, source_url, msg_type)
         )
+        record_id = cursor.lastrowid
         conn.commit()
         conn.close()
+        return record_id
     except Exception as e:
         logger.error(f"记录文件存档失败: {e}")
+        return None
+
+
+def _log_published_file_record(user_id, local_path, publish_result, file_type, content_type, file_size,
+                               source_url, msg_type):
+    """按最终发布结果记录文件信息"""
+    storage_uri = (publish_result or {}).get('storage_uri', '').strip() or local_path
+    file_name = os.path.basename(local_path)
+    return log_file_record(user_id, storage_uri, file_name, file_type, content_type, file_size, source_url, msg_type)
 
 
 # ============= 长消息截断 =============
 
-WECOM_MSG_MAX_LEN = 20000  # 企业微信 markdown 消息限制 20480 字节，留余量
+WECOM_MSG_MAX_LEN = 20000  # 企业微信 markdown 消息限制 20480 字节，预留安全余量
+
+
+def _utf8_len(text):
+    """返回 UTF-8 字节长度"""
+    return len((text or '').encode('utf-8'))
 
 
 def truncate_message(text, max_len=WECOM_MSG_MAX_LEN):
@@ -484,8 +759,253 @@ def _get_today_dir_for_agent(shared_dir):
     os.makedirs(path, exist_ok=True)
     return path
 
-# 容器内共享目录路径（避免使用 /workspace 下的保留挂载前缀）
-CONTAINER_SHARED_MOUNT = '/app/shared'
+# ============= 文件发布（local / s3） =============
+
+_s3_client = None
+_s3_client_lock = threading.Lock()
+
+
+def _sanitize_storage_segment(value, fallback='unknown'):
+    """规范化对象存储 key 片段"""
+    if not value:
+        return fallback
+    cleaned = ''.join(ch if (ch.isalnum() or ch in ('-', '_', '.')) else '-' for ch in str(value))
+    cleaned = cleaned.strip('-_.')
+    return cleaned or fallback
+
+
+def _resolve_presign_expires(expires_seconds=None):
+    """解析预签名有效期，AWS S3 最大 7 天"""
+    value = FILE_STORAGE_PRESIGN_EXPIRES if expires_seconds is None else expires_seconds
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = FILE_STORAGE_PRESIGN_EXPIRES
+    value = max(1, value)
+    return min(value, 604800)
+
+
+def _format_expires_at(expires_seconds):
+    """将有效期秒数转换为 ISO8601 UTC 时间"""
+    dt = datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)
+    return dt.isoformat()
+
+
+def _build_storage_object_key(local_path, source='wecom', agent_name='default'):
+    """构建对象存储 key"""
+    ext = os.path.splitext(local_path)[1].lower() or '.bin'
+    now = datetime.now().strftime('%Y/%m/%d')
+    source_part = _sanitize_storage_segment(source, 'source')
+    agent_part = _sanitize_storage_segment(agent_name, 'default')
+    object_name = f"{uuid.uuid4().hex[:24]}{ext}"
+
+    parts = []
+    if FILE_STORAGE_KEY_PREFIX:
+        parts.append(FILE_STORAGE_KEY_PREFIX)
+    parts.extend([source_part, agent_part, now, object_name])
+    return '/'.join(parts)
+
+
+def _get_s3_client():
+    """懒加载 S3 client"""
+    global _s3_client
+
+    if boto3 is None:
+        raise RuntimeError('boto3 未安装，无法使用 S3 模式')
+
+    with _s3_client_lock:
+        if _s3_client is not None:
+            return _s3_client
+
+        if not S3_BUCKET:
+            raise RuntimeError('S3_BUCKET 未配置')
+
+        kwargs = {}
+        if S3_REGION:
+            kwargs['region_name'] = S3_REGION
+        if S3_ENDPOINT_URL:
+            kwargs['endpoint_url'] = S3_ENDPOINT_URL
+        if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+            kwargs['aws_access_key_id'] = S3_ACCESS_KEY_ID
+            kwargs['aws_secret_access_key'] = S3_SECRET_ACCESS_KEY
+
+        if BotoConfig is not None:
+            kwargs['config'] = BotoConfig(
+                signature_version=S3_SIGNATURE_VERSION or 's3v4',
+                s3={'addressing_style': S3_ADDRESSING_STYLE or 'virtual'}
+            )
+
+        _s3_client = boto3.client('s3', **kwargs)
+        return _s3_client
+
+
+def _path_is_within(path, parent_dir):
+    """判断 path 是否位于 parent_dir 内"""
+    path_abs = os.path.abspath(path)
+    parent_abs = os.path.abspath(parent_dir)
+    return path_abs == parent_abs or path_abs.startswith(parent_abs + os.sep)
+
+
+def _ensure_local_file_in_shared_dir(local_path, shared_dir):
+    """local 模式下确保文件最终位于 agent 共享目录中"""
+    host_path = os.path.abspath(local_path)
+    if not shared_dir or _path_is_within(host_path, shared_dir):
+        return host_path
+
+    target_dir = _get_today_dir_for_agent(shared_dir)
+    file_name = os.path.basename(host_path)
+    base_name, ext = os.path.splitext(file_name)
+    target_path = os.path.join(target_dir, file_name)
+    counter = 1
+
+    while os.path.exists(target_path):
+        if os.path.abspath(target_path) == host_path:
+            return host_path
+        target_path = os.path.join(target_dir, f"{base_name}-{counter}{ext}")
+        counter += 1
+
+    shutil.move(host_path, target_path)
+    logger.info(f"local 文件已移动到共享目录: {target_path}")
+    return target_path
+
+
+def _publish_file_local(local_path, shared_dir=''):
+    """local 模式：返回 agent 可直接访问的绝对路径"""
+    host_path = _ensure_local_file_in_shared_dir(local_path, shared_dir)
+    return {
+        'storage_mode': 'local',
+        'storage_uri': f"file://{host_path}",
+        'download_url': '',
+        'expires_at': '',
+        'display_value': host_path,
+    }
+
+
+NON_ACTIONABLE_MESSAGE_NOTICES = {
+    '[用户发送了一张图片，但无法获取]',
+    '[用户发送了一张图片，上传失败]',
+    '[用户发送了一张图片，下载失败]',
+    '[用户发送了一个文件，但无法获取]',
+    '[用户发送了一个文件，文件有风险，已删除]',
+    '[用户发送了一个文件，下载失败]',
+    '[用户发送了一个文件，上传失败]',
+}
+
+USER_VISIBLE_NOTICE_MAP = {
+    '[用户发送了一张图片，但无法获取]': '收到图片，但暂时无法获取图片内容，请稍后重试。',
+    '[用户发送了一张图片，上传失败]': '收到图片，但保存失败，请稍后重试。',
+    '[用户发送了一张图片，下载失败]': '收到图片，但下载失败，请稍后重试。',
+    '[用户发送了一个文件，但无法获取]': '收到文件，但暂时无法获取文件内容，请稍后重试。',
+    '[用户发送了一个文件，文件有风险，已删除]': '收到文件，但检测到安全风险，系统已拒绝处理。',
+    '[用户发送了一个文件，下载失败]': '收到文件，但下载失败，请稍后重试。',
+    '[用户发送了一个文件，上传失败]': '收到文件，但保存失败，请稍后重试。',
+}
+
+
+def _dedupe_keep_order(items):
+    """按出现顺序去重"""
+    seen = set()
+    result = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _is_non_actionable_notice_line(line):
+    """判断一行提取文本是否只是系统提示，不应继续发送给 agent"""
+    stripped = (line or '').strip()
+    if not stripped:
+        return False
+    return stripped in NON_ACTIONABLE_MESSAGE_NOTICES or stripped.startswith('[不支持的消息类型:')
+
+
+def _split_actionable_content_and_notices(content):
+    """拆分可发送正文与系统提示"""
+    if content is None:
+        return '', []
+
+    text = str(content)
+    actionable_lines = []
+    notices = []
+    for line in text.splitlines():
+        if _is_non_actionable_notice_line(line):
+            notices.append(line.strip())
+            continue
+        actionable_lines.append(line)
+
+    actionable_text = '\n'.join(actionable_lines).strip()
+    return actionable_text, _dedupe_keep_order(notices)
+
+
+def _render_user_visible_notices(notices):
+    """将内部系统提示转换为用户可读回复"""
+    rendered = []
+    for notice in _dedupe_keep_order(notices):
+        rendered.append(USER_VISIBLE_NOTICE_MAP.get(notice, notice))
+    return '\n'.join(rendered)
+
+
+def _publish_file_s3(local_path, object_key, content_type='', expires_seconds=None):
+    """s3 模式：上传并返回预签名下载链接"""
+    client = _get_s3_client()
+    expires_seconds = _resolve_presign_expires(expires_seconds)
+    extra_args = {}
+    if content_type:
+        extra_args['ContentType'] = content_type
+    if S3_SSE_MODE:
+        extra_args['ServerSideEncryption'] = S3_SSE_MODE
+        if S3_SSE_MODE.lower() == 'aws:kms' and S3_SSE_KMS_KEY_ID:
+            extra_args['SSEKMSKeyId'] = S3_SSE_KMS_KEY_ID
+
+    if extra_args:
+        client.upload_file(local_path, S3_BUCKET, object_key, ExtraArgs=extra_args)
+    else:
+        client.upload_file(local_path, S3_BUCKET, object_key)
+
+    download_url = client.generate_presigned_url(
+        ClientMethod='get_object',
+        Params={'Bucket': S3_BUCKET, 'Key': object_key},
+        ExpiresIn=expires_seconds,
+        HttpMethod='GET',
+    )
+
+    return {
+        'storage_mode': 's3',
+        'storage_uri': f"s3://{S3_BUCKET}/{object_key}",
+        'download_url': download_url,
+        'expires_at': _format_expires_at(expires_seconds),
+        'display_value': download_url,
+    }
+
+
+def publish_file(local_path, shared_dir='', user_id='', msg_type='', source_url='', agent_name='',
+                 content_type='', source='wecom', expires_seconds=None, force_s3=False):
+    """统一文件发布入口：按模式发布并返回引用信息"""
+    object_key = _build_storage_object_key(local_path, source=source, agent_name=agent_name or 'default')
+
+    if force_s3:
+        return _publish_file_s3(local_path, object_key=object_key,
+                                content_type=content_type, expires_seconds=expires_seconds)
+    if FILE_STORAGE_MODE == 'local':
+        return _publish_file_local(local_path, shared_dir=shared_dir)
+    if FILE_STORAGE_MODE == 's3':
+        return _publish_file_s3(local_path, object_key=object_key,
+                                content_type=content_type, expires_seconds=expires_seconds)
+    raise RuntimeError(f'不支持的 FILE_STORAGE_MODE: {FILE_STORAGE_MODE}')
+
+
+def _format_link_with_expire(publish_result):
+    """格式化带过期时间提示的下载链接"""
+    download_url = publish_result.get('download_url', '')
+    expires_at = publish_result.get('expires_at', '')
+    if not download_url:
+        return publish_result.get('display_value', '')
+    if expires_at:
+        return f"{download_url}（过期时间: {expires_at}）"
+    return download_url
 
 
 # ============= 多类型消息处理 =============
@@ -853,14 +1373,14 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
     """下载临时 COS URL 到文件目录（按日期分区）
     返回 (local_path, text_content_or_none, status)
     
-    如果 shared_dir 已设置，文件保存到共享目录（供 Docker 沙箱访问）。
-    返回的 local_path 为宿主机路径，调用者需根据需要转换为容器内路径。
+    如果 shared_dir 已设置，文件保存到该 agent 的固定绝对路径共享目录。
+    返回的 local_path 为可直接下发给 agent 的绝对路径。
     status: ok | risky_deleted
     """
     tmp_path = None
     try:
         today_dir = _get_today_dir_for_agent(shared_dir)
-        resp = requests.get(url, timeout=30, stream=True)
+        resp = _requests_request('get', url, timeout=30, stream=True)
         resp.raise_for_status()
 
         tmp_filename = f"{prefix}-{uuid.uuid4().hex[:8]}.tmp"
@@ -924,9 +1444,6 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
             except Exception as e:
                 logger.warning(f"读取文本文件内容失败: {e}")
 
-        file_type = 'text' if is_text else content_type.split('/')[0]
-        log_file_record(user_id, local_path, filename, file_type, content_type, file_size, url, msg_type)
-
         logger.info(f"文件已下载: {local_path} (type={content_type}, text={text_content is not None})")
         return local_path, text_content, 'ok'
     except Exception as e:
@@ -938,28 +1455,10 @@ def download_temp_file(url, prefix='file', user_id='', msg_type='', encoding_aes
                 pass
         return None, None, 'error'
 
-
-def _to_container_path(host_path, shared_dir):
-    """将宿主机路径转换为容器内路径（/app/shared/...）
-    
-    如果 shared_dir 已配置且 host_path 在该目录下，将前缀替换为 /app/shared。
-    否则返回原始宿主机路径（适用于 main agent 等无沙箱场景）。
-    """
-    if shared_dir:
-        host_norm = os.path.normpath(host_path)
-        shared_norm = os.path.normpath(shared_dir)
-        if host_norm == shared_norm or host_norm.startswith(shared_norm + os.sep):
-            relative = host_norm[len(shared_norm):]
-            if not relative.startswith(os.sep):
-                relative = os.sep + relative
-            return (CONTAINER_SHARED_MOUNT + relative).replace(os.sep, '/')
-    return host_path
-
-
-def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir=''):
+def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='', agent_name=''):
     """提取单条消息内容（主消息或 quote 内的消息），返回文本描述
     
-    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，路径转为容器内路径 /app/shared/...
+    shared_dir: agent 的共享文件目录。设置后文件保存到此目录，并直接下发绝对路径。
     """
     msg_type = item.get('msgtype', '')
 
@@ -976,8 +1475,40 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='')
         path, _, _ = download_temp_file(url, prefix='img', user_id=user_id, msg_type='image',
                                         encoding_aes_key=encoding_aes_key, shared_dir=shared_dir)
         if path:
-            display_path = _to_container_path(path, shared_dir)
-            return f'[用户发送了一张图片，已保存到 {display_path}]'
+            try:
+                raw_content_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+                content_type, _ = _detect_file_type(path, raw_content_type)
+                publish_result = publish_file(
+                    path,
+                    shared_dir=shared_dir,
+                    user_id=user_id,
+                    msg_type='image',
+                    source_url=url,
+                    agent_name=agent_name,
+                    content_type=content_type,
+                    source='wecom-image',
+                )
+                file_size = os.path.getsize(path)
+                file_type = content_type.split('/')[0] if '/' in content_type else content_type
+                _log_published_file_record(
+                    user_id,
+                    path,
+                    publish_result,
+                    file_type,
+                    content_type,
+                    file_size,
+                    url,
+                    'image',
+                )
+            except Exception as e:
+                logger.error(f"图片发布失败: {e}")
+                return '[用户发送了一张图片，上传失败]'
+
+            if FILE_STORAGE_MODE == 'local':
+                return f"[用户发送了一张图片，已保存到 {publish_result.get('display_value', path)}]"
+
+            link_text = _format_link_with_expire(publish_result)
+            return f"[用户发送了一张图片，下载链接: {link_text}]"
         return '[用户发送了一张图片，下载失败]'
 
     elif msg_type == 'file':
@@ -990,78 +1521,245 @@ def extract_single_content(item, user_id='', encoding_aes_key='', shared_dir='')
             return '[用户发送了一个文件，文件有风险，已删除]'
         if not path:
             return '[用户发送了一个文件，下载失败]'
+
+        try:
+            raw_content_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+            content_type, _ = _detect_file_type(path, raw_content_type)
+            publish_result = publish_file(
+                path,
+                shared_dir=shared_dir,
+                user_id=user_id,
+                msg_type='file',
+                source_url=url,
+                agent_name=agent_name,
+                content_type=content_type,
+                source='wecom-file',
+            )
+            file_size = os.path.getsize(path)
+            file_type = 'text' if text_content is not None else (content_type.split('/')[0] if '/' in content_type else content_type)
+            _log_published_file_record(
+                user_id,
+                path,
+                publish_result,
+                file_type,
+                content_type,
+                file_size,
+                url,
+                'file',
+            )
+        except Exception as e:
+            logger.error(f"文件发布失败: {e}")
+            return '[用户发送了一个文件，上传失败]'
+
         if text_content is not None:
-            display_path = _to_container_path(path, shared_dir)
-            return f'[用户发送了一个文本文件 {display_path}]\n文件内容：\n{text_content}'
-        display_path = _to_container_path(path, shared_dir)
-        return f'[用户发送了一个文件，已保存到 {display_path}]'
+            if FILE_STORAGE_MODE == 'local':
+                return f"[用户发送了一个文本文件 {publish_result.get('display_value', path)}]\n文件内容：\n{text_content}"
+            link_text = _format_link_with_expire(publish_result)
+            return f"[用户发送了一个文本文件，下载链接: {link_text}]\n文件内容：\n{text_content}"
+
+        if FILE_STORAGE_MODE == 'local':
+            return f"[用户发送了一个文件，已保存到 {publish_result.get('display_value', path)}]"
+
+        link_text = _format_link_with_expire(publish_result)
+        return f"[用户发送了一个文件，下载链接: {link_text}]"
 
     elif msg_type == 'mixed':
         parts = []
         for sub_item in item.get('mixed', {}).get('msg_item', []):
             parts.append(extract_single_content(sub_item, user_id=user_id,
-                                                encoding_aes_key=encoding_aes_key, shared_dir=shared_dir))
+                                                encoding_aes_key=encoding_aes_key,
+                                                shared_dir=shared_dir,
+                                                agent_name=agent_name))
         return '\n'.join(parts)
 
     return f'[不支持的消息类型: {msg_type}]'
 
 
-def extract_message_content(msg, user_id='', encoding_aes_key='', shared_dir=''):
-    """提取完整消息内容，返回文本内容"""
-    content = extract_single_content(msg, user_id=user_id, encoding_aes_key=encoding_aes_key,
-                                     shared_dir=shared_dir)
+def extract_message_content(msg, user_id='', encoding_aes_key='', shared_dir='', agent_name=''):
+    """提取完整消息内容，返回 (正文, 系统提示列表)"""
+    raw_content = extract_single_content(msg, user_id=user_id,
+                                         encoding_aes_key=encoding_aes_key,
+                                         shared_dir=shared_dir,
+                                         agent_name=agent_name)
+    content, notices = _split_actionable_content_and_notices(raw_content)
 
     quote = msg.get('quote')
     if quote:
-        quote_content = extract_single_content(quote, user_id=user_id, encoding_aes_key=encoding_aes_key,
-                                               shared_dir=shared_dir)
-        content = f"{content}\n\n[引用消息] {quote_content}"
+        raw_quote_content = extract_single_content(quote, user_id=user_id,
+                                                   encoding_aes_key=encoding_aes_key,
+                                                   shared_dir=shared_dir,
+                                                   agent_name=agent_name)
+        quote_content, quote_notices = _split_actionable_content_and_notices(raw_quote_content)
+        notices = _dedupe_keep_order(notices + quote_notices)
+        if content and quote_content and quote_content != content:
+            content = f"{content}\n\n[引用消息] {quote_content}"
 
-    return content
+    return content, notices
 
 
-# ============= 异步处理（per-user per-agent 消息管道）=============
+# ============= 异步处理（全局 worker 池 + 单用户串行）=============
 
-_user_queues = {}   # queue_key -> queue.Queue
-_user_workers = {}  # queue_key -> Thread
+PASSIVE_REPLY_PROCESSING = '已收到，处理中...'
+PASSIVE_REPLY_QUEUED = '前序任务处理中，已进入等待队列，请稍候...'
+PASSIVE_REPLY_BUSY = '当前已有任务处理中，请稍后再试'
+ACTIVE_REPLY_TIMEOUT = '处理超时，请重试。'
+ACTIVE_REPLY_QUEUE_EXPIRED = '前序任务处理时间较长，本次请求未执行，请重试。'
+ACTIVE_REPLY_SYSTEM_ERROR = '系统异常，请稍后再试。'
+ACTIVE_REPLY_NO_RESPONSE = '处理失败，请稍后再试。'
+
+_dispatch_queue = queue.Queue()
+_user_task_states = {}  # queue_key -> {'running': bool, 'pending': deque()}
+_scheduler_workers = []
+_scheduler_started = False
 _queue_lock = threading.Lock()
 
 
-def _user_worker(queue_key):
-    """单个用户+agent 的消息 worker，串行处理"""
-    q = _user_queues[queue_key]
+def _send_wecom_response(response_url, agent_name, reply_text):
+    """通过 response_url 主动回复企业微信消息"""
+    if not response_url:
+        logger.warning(f"[{agent_name}] response_url 为空，无法主动回复")
+        return False
+
+    wecom_reply = truncate_message(reply_text, max_len=WECOM_MSG_MAX_LEN)
+    payload = {"msgtype": "markdown", "markdown": {"content": wecom_reply}}
+    try:
+        resp = _requests_request('post', response_url, json=payload, timeout=10)
+        logger.info(f"[{agent_name}] 主动回复: {resp.status_code}, 长度: {_utf8_len(wecom_reply)} bytes")
+        return True
+    except Exception as e:
+        logger.error(f"[{agent_name}] 主动回复失败: {e}")
+        return False
+
+
+def _build_wecom_markdown_reply(crypto, timestamp, nonce, reply_text):
+    """构造企业微信 markdown 被动回复包"""
+    wecom_reply = truncate_message(reply_text, max_len=WECOM_MSG_MAX_LEN)
+    reply_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": wecom_reply}})
+    return crypto.build_reply(reply_msg, int(timestamp), nonce)
+
+
+def _ensure_scheduler_workers():
+    """懒加载固定数量的调度 worker"""
+    global _scheduler_started
+    with _queue_lock:
+        if _scheduler_started:
+            return
+        for index in range(MAX_GATEWAY_WORKERS):
+            worker = threading.Thread(
+                target=_scheduler_worker,
+                name=f'gateway-worker-{index + 1}',
+                daemon=True,
+            )
+            _scheduler_workers.append(worker)
+            worker.start()
+        _scheduler_started = True
+        logger.info(f"已启动 Gateway worker 池，数量={MAX_GATEWAY_WORKERS}")
+
+
+def _build_task(queue_key, user_id, content, task_id, response_url, agent_name):
+    """构造调度任务对象"""
+    return {
+        'queue_key': queue_key,
+        'user_id': user_id,
+        'content': content,
+        'task_id': task_id,
+        'response_url': response_url,
+        'agent_name': agent_name,
+        'enqueued_at': time.time(),
+    }
+
+
+def _schedule_next_task_locked(queue_key):
+    """在持锁状态下调度同一用户的下一条任务"""
+    state = _user_task_states.get(queue_key)
+    if not state:
+        return
+    if state['pending']:
+        next_task = state['pending'].popleft()
+        state['running'] = True
+        _dispatch_queue.put(next_task)
+        logger.info(f"调度下一条任务: {queue_key}, 剩余等待={len(state['pending'])}")
+        return
+    del _user_task_states[queue_key]
+    logger.info(f"队列空闲释放: {queue_key}")
+
+
+def _scheduler_worker():
+    """固定 worker 池，从全局队列获取任务执行"""
     while True:
+        task = _dispatch_queue.get()
+        queue_key = task['queue_key']
         try:
-            task = q.get(timeout=300)
-        except queue.Empty:
-            with _queue_lock:
-                if q.empty():
-                    del _user_queues[queue_key]
-                    del _user_workers[queue_key]
-                    logger.info(f"Worker {queue_key} 空闲退出")
-                    return
-                continue
-        try:
-            _process_single_message(**task)
+            queue_wait_seconds = max(0.0, time.time() - task['enqueued_at'])
+            if queue_wait_seconds > MAX_QUEUE_WAIT_SECONDS:
+                logger.warning(f"队列等待超时: {queue_key}, task_id={task['task_id']}, wait={queue_wait_seconds:.2f}s")
+                update_task_status(task['task_id'], 'queue_expired', f'queue_wait_s={queue_wait_seconds:.2f}')
+                _send_wecom_response(task['response_url'], task['agent_name'], ACTIVE_REPLY_QUEUE_EXPIRED)
+            else:
+                _process_single_message(
+                    user_id=task['user_id'],
+                    content=task['content'],
+                    task_id=task['task_id'],
+                    response_url=task['response_url'],
+                    agent_name=task['agent_name'],
+                    queue_wait_seconds=queue_wait_seconds,
+                )
         except Exception as e:
             logger.error(f"处理消息失败 ({queue_key}): {e}")
         finally:
-            q.task_done()
+            with _queue_lock:
+                _schedule_next_task_locked(queue_key)
+            _dispatch_queue.task_done()
 
-def _process_single_message(user_id, content, task_id, response_url, agent_name):
+
+def _enqueue_message(user_id, content, task_id, response_url, agent_name):
+    """按单用户串行策略入调度器，返回决策结果"""
+    _ensure_scheduler_workers()
+    queue_key = f"{agent_name}:{user_id}"
+    task = _build_task(queue_key, user_id, content, task_id, response_url, agent_name)
+
+    with _queue_lock:
+        state = _user_task_states.get(queue_key)
+        if state is None:
+            _user_task_states[queue_key] = {
+                'running': True,
+                'pending': deque(),
+            }
+            log_task(task_id, user_id, agent_name, content[:200], status='pending', result='run_now')
+            _dispatch_queue.put(task)
+            logger.info(f"消息立即调度: {queue_key}, task_id={task_id}")
+            return 'run_now'
+
+        pending_count = len(state['pending'])
+        if pending_count >= MAX_PER_USER_PENDING:
+            log_task(task_id, user_id, agent_name, content[:200], status='busy_rejected',
+                     result=f'running=1 pending={pending_count}')
+            logger.warning(f"队列已满，拒绝新消息: {queue_key}, task_id={task_id}")
+            return 'reject_busy'
+
+        state['pending'].append(task)
+        pending_position = len(state['pending'])
+        log_task(task_id, user_id, agent_name, content[:200], status='queued',
+                 result=f'pending_position={pending_position}')
+        logger.info(f"消息进入等待队列: {queue_key}, task_id={task_id}, 等待数={pending_position}")
+        return 'queued'
+
+
+def _process_single_message(user_id, content, task_id, response_url, agent_name, queue_wait_seconds=0.0):
     """处理单条消息：调用对应 agent -> 回复"""
     agent_cfg = AGENTS.get(agent_name)
     if not agent_cfg:
         logger.error(f"Agent {agent_name} 不存在（可能已被删除）")
+        update_task_status(task_id, 'error', 'agent_missing')
+        _send_wecom_response(response_url, agent_name, ACTIVE_REPLY_SYSTEM_ERROR)
         return
 
     session_key = f"wecom:{agent_name}:{user_id}"
-    log_task(task_id, user_id, agent_name, content[:200], status='processing')
+    update_task_status(task_id, 'processing', f'queue_wait_s={queue_wait_seconds:.2f}')
 
     try:
         reply = _call_openclaw(
             agent_cfg['openclaw_url'], content, session_key,
-            timeout=OPENCLAW_TIMEOUT,
             token=agent_cfg['openclaw_token'],
             agent_id=agent_cfg['openclaw_agent_id'],
         )
@@ -1071,51 +1769,31 @@ def _process_single_message(user_id, content, task_id, response_url, agent_name)
             recovery_session_key = f"{session_key}:recovery:{uuid.uuid4().hex[:8]}"
             recovery_reply = _call_openclaw(
                 agent_cfg['openclaw_url'], content, recovery_session_key,
-                timeout=OPENCLAW_TIMEOUT,
                 token=agent_cfg['openclaw_token'],
                 agent_id=agent_cfg['openclaw_agent_id'],
             )
             if recovery_reply:
                 reply = recovery_reply
         if not reply:
-            reply = '处理失败，请稍后再试。'
+            reply = ACTIVE_REPLY_NO_RESPONSE
             update_task_status(task_id, 'failed', '无响应')
         else:
             update_task_status(task_id, 'success', reply[:500])
+    except OpenClawTimeoutError as e:
+        logger.warning(f"调用 agent {agent_name} 超时: {e}")
+        reply = ACTIVE_REPLY_TIMEOUT
+        update_task_status(task_id, 'timeout', e.stage)
     except Exception as e:
         logger.error(f"调用 agent {agent_name} 异常: {e}")
-        reply = '系统异常，请联系管理员。'
+        reply = ACTIVE_REPLY_SYSTEM_ERROR
         update_task_status(task_id, 'error', str(e)[:500])
 
-    reply = truncate_message(reply)
-    payload = {"msgtype": "markdown", "markdown": {"content": reply}}
-    try:
-        resp = requests.post(response_url, json=payload, timeout=10)
-        logger.info(f"[{agent_name}] 主动回复: {resp.status_code}, 长度: {len(reply)}")
-    except Exception as e:
-        logger.error(f"[{agent_name}] 主动回复失败: {e}")
+    _send_wecom_response(response_url, agent_name, reply)
 
 
 def process_message_async(user_id, content, task_id, response_url, agent_name):
-    """将消息放入 agent:user 队列，串行处理"""
-    task = {
-        'user_id': user_id,
-        'content': content,
-        'task_id': task_id,
-        'response_url': response_url,
-        'agent_name': agent_name,
-    }
-    queue_key = f"{agent_name}:{user_id}"
-    with _queue_lock:
-        if queue_key not in _user_queues:
-            _user_queues[queue_key] = queue.Queue()
-            t = threading.Thread(target=_user_worker, args=(queue_key,), daemon=True)
-            _user_workers[queue_key] = t
-            t.start()
-            logger.info(f"创建 worker: {queue_key}")
-        _user_queues[queue_key].put(task)
-        qsize = _user_queues[queue_key].qsize()
-    logger.info(f"消息已入队: {queue_key}, task_id={task_id}, 队列长度={qsize}")
+    """将消息放入调度器，返回决策结果"""
+    return _enqueue_message(user_id, content, task_id, response_url, agent_name)
 
 
 # ============= 消息去重 =============
@@ -1134,6 +1812,78 @@ def is_duplicate_msg(msgid):
         return True
     _processed_msgs[msgid] = now
     return False
+
+
+def _verify_internal_upload_auth(req):
+    """校验内部上传接口鉴权"""
+    if not FILE_UPLOAD_INTERNAL_TOKEN:
+        return False, 'FILE_UPLOAD_INTERNAL_TOKEN 未配置，内部上传接口已禁用'
+
+    auth = req.headers.get('Authorization', '').strip()
+    if not auth.startswith('Bearer '):
+        return False, '缺少 Bearer Token'
+
+    token = auth[7:].strip()
+    if token != FILE_UPLOAD_INTERNAL_TOKEN:
+        return False, '鉴权失败'
+
+    return True, ''
+
+
+def _safe_ext_from_filename(filename):
+    """从文件名提取安全扩展名"""
+    ext = os.path.splitext(filename or '')[1].lower()
+    if not ext:
+        return ''
+    ext = ''.join(ch for ch in ext if (ch.isalnum() or ch == '.'))
+    if not ext.startswith('.'):
+        return ''
+    if len(ext) > 16:
+        return ''
+    return ext
+
+
+def _save_internal_uploaded_file(file_storage):
+    """保存 OpenClaw skill 上传文件到本地临时目录，返回 (local_path, content_type, file_size)"""
+    tmp_path = None
+    try:
+        today_dir = _get_today_dir()
+        with tempfile.NamedTemporaryFile(dir=today_dir, prefix='upload-', suffix='.tmp', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            total_size = 0
+            while True:
+                chunk = file_storage.stream.read(DOWNLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_INTERNAL_UPLOAD_FILE_SIZE:
+                    raise ValueError(f"文件过大，超过限制 {MAX_INTERNAL_UPLOAD_FILE_SIZE} bytes")
+                tmp_file.write(chunk)
+
+        raw_content_type = (file_storage.content_type or 'application/octet-stream').split(';')[0].strip()
+        content_type, ext = _detect_file_type(tmp_path, raw_content_type)
+        if ext == '.jpe':
+            ext = '.jpg'
+        if not ext:
+            ext = _safe_ext_from_filename(file_storage.filename)
+        if not ext:
+            ext = '.bin'
+
+        if _is_risky_file_extension(ext):
+            raise ValueError(f"检测到高风险文件类型 {ext}，拒绝上传")
+
+        local_path = os.path.join(today_dir, f"upload-{uuid.uuid4().hex[:8]}{ext}")
+        os.rename(tmp_path, local_path)
+        tmp_path = None
+
+        file_size = os.path.getsize(local_path)
+        return local_path, content_type, file_size
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 # ============= Flask 路由 =============
@@ -1198,17 +1948,33 @@ def wecom_callback(agent_name):
                 return jsonify({}), 200
 
             if msg_type in ('text', 'image', 'file', 'voice', 'mixed'):
-                content = extract_message_content(msg, user_id=from_user,
-                                                  encoding_aes_key=agent_cfg['wecom_encoding_aes_key'],
-                                                  shared_dir=agent_cfg.get('shared_dir', ''))
+                content, notices = extract_message_content(msg, user_id=from_user,
+                                                           encoding_aes_key=agent_cfg['wecom_encoding_aes_key'],
+                                                           shared_dir=agent_cfg.get('shared_dir', ''),
+                                                           agent_name=agent_name)
                 logger.info(f"[{agent_name}] 消息内容: {content[:200]}, from: {from_user}")
+                if content and notices:
+                    logger.info(f"[{agent_name}] 已过滤系统提示: {' | '.join(notices)}")
+
+                if not content:
+                    notice_text = _render_user_visible_notices(notices) or '收到消息，但暂无可处理内容，请重试。'
+                    logger.info(f"[{agent_name}] 消息未进入 Agent，仅回复用户: {notice_text}")
+                    reply_pkg = _build_wecom_markdown_reply(crypto, timestamp, nonce, notice_text)
+                    if reply_pkg:
+                        return jsonify(reply_pkg), 200
+                    return jsonify({}), 200
 
                 task_id = str(uuid.uuid4())
 
-                processing_msg = json.dumps({"msgtype": "markdown", "markdown": {"content": "正在处理，请稍候..."}})
-                reply_pkg = crypto.build_reply(processing_msg, int(timestamp), nonce)
+                decision = process_message_async(from_user, content, task_id, response_url, agent_name)
+                if decision == 'run_now':
+                    passive_text = PASSIVE_REPLY_PROCESSING
+                elif decision == 'queued':
+                    passive_text = PASSIVE_REPLY_QUEUED
+                else:
+                    passive_text = PASSIVE_REPLY_BUSY
 
-                process_message_async(from_user, content, task_id, response_url, agent_name)
+                reply_pkg = _build_wecom_markdown_reply(crypto, timestamp, nonce, passive_text)
 
                 if reply_pkg:
                     return jsonify(reply_pkg), 200
@@ -1261,6 +2027,89 @@ def admin_list_agents():
     })
 
 
+@app.route('/internal/files/upload', methods=['POST'])
+def internal_upload_file():
+    """内部文件上传接口（供 OpenClaw skill 调用）"""
+    authorized, reason = _verify_internal_upload_auth(request)
+    if not authorized:
+        status_code = 503 if '未配置' in reason else 401
+        return jsonify({'error': reason}), status_code
+
+    upload = request.files.get('file')
+    if upload is None:
+        return jsonify({'error': '缺少文件字段 file'}), 400
+
+    agent_name = request.form.get('agent_name', '').strip()
+    user_id = request.form.get('user_id', '').strip()
+    source = request.form.get('source', 'openclaw-skill').strip() or 'openclaw-skill'
+    msg_type = request.form.get('msg_type', 'internal_upload').strip() or 'internal_upload'
+
+    expires_seconds = None
+    expires_raw = request.form.get('expires_seconds', '').strip()
+    if expires_raw:
+        try:
+            expires_seconds = int(expires_raw)
+        except ValueError:
+            return jsonify({'error': 'expires_seconds 必须是整数'}), 400
+
+    shared_dir = ''
+    if agent_name:
+        agent_cfg = AGENTS.get(agent_name)
+        if not agent_cfg:
+            return jsonify({'error': f'unknown agent: {agent_name}'}), 404
+        shared_dir = agent_cfg.get('shared_dir', '')
+
+    try:
+        local_path, content_type, file_size = _save_internal_uploaded_file(upload)
+
+        publish_result = publish_file(
+            local_path,
+            shared_dir=shared_dir,
+            user_id=user_id,
+            msg_type=msg_type,
+            source_url='internal_upload',
+            agent_name=agent_name,
+            content_type=content_type,
+            source=source,
+            expires_seconds=expires_seconds,
+            force_s3=True,
+        )
+
+        file_type = content_type.split('/')[0] if '/' in content_type else content_type
+        file_record_id = _log_published_file_record(
+            user_id,
+            local_path,
+            publish_result,
+            file_type,
+            content_type,
+            file_size,
+            'internal_upload',
+            msg_type,
+        )
+
+        return jsonify({
+            'status': 'ok',
+            'storage_mode': publish_result.get('storage_mode', FILE_STORAGE_MODE),
+            'storage_uri': publish_result.get('storage_uri', ''),
+            'download_url': publish_result.get('download_url', ''),
+            'expires_at': publish_result.get('expires_at', ''),
+            'display_value': publish_result.get('display_value', ''),
+            'file_name': os.path.basename(local_path),
+            'file_size': file_size,
+            'agent_name': agent_name,
+            'file_record_id': file_record_id,
+        })
+    except ValueError as e:
+        logger.warning(f"内部上传参数错误: {e}")
+        return jsonify({'error': str(e)}), 400
+    except (BotoCoreError, ClientError) as e:
+        logger.error(f"内部上传 S3 失败: {e}")
+        return jsonify({'error': '上传到 S3 失败'}), 500
+    except Exception as e:
+        logger.error(f"内部上传失败: {e}")
+        return jsonify({'error': f'上传失败: {e}'}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """健康检查接口"""
@@ -1269,6 +2118,9 @@ def health():
         'timestamp': int(time.time()),
         'service': 'openclaw-wecom-gateway',
         'protocol': OPENCLAW_PROTOCOL,
+        'file_storage_mode': FILE_STORAGE_MODE,
+        'active_user_queues': len(_user_task_states),
+        'dispatch_queue_size': _dispatch_queue.qsize(),
         'agents': len(AGENTS),
         'agent_names': list(AGENTS.keys()),
     })
@@ -1290,14 +2142,36 @@ def stats():
         cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'failed'")
         failed_tasks = cursor.fetchone()[0]
 
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'timeout'")
+        timeout_tasks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'queue_expired'")
+        queue_expired_tasks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'busy_rejected'")
+        busy_rejected_tasks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'queued'")
+        queued_tasks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM task_logs WHERE status = 'processing'")
+        processing_tasks = cursor.fetchone()[0]
+
         conn.close()
 
         return jsonify({
             'total_tasks': total_tasks,
             'success_tasks': success_tasks,
             'failed_tasks': failed_tasks,
+            'timeout_tasks': timeout_tasks,
+            'queue_expired_tasks': queue_expired_tasks,
+            'busy_rejected_tasks': busy_rejected_tasks,
+            'queued_tasks': queued_tasks,
+            'processing_tasks': processing_tasks,
             'success_rate': f"{success_tasks / total_tasks * 100:.2f}%" if total_tasks > 0 else "0%",
             'agents': len(AGENTS),
+            'active_user_queues': len(_user_task_states),
+            'dispatch_queue_size': _dispatch_queue.qsize(),
             'timestamp': int(time.time())
         })
     except Exception as e:
@@ -1310,7 +2184,22 @@ if __name__ == '__main__':
     logger.info("OpenClaw 企业微信桥接网关启动中...")
     logger.info(f"数据库路径: {DB_PATH}")
     logger.info(f"通信协议: {OPENCLAW_PROTOCOL}")
-    logger.info(f"超时时间: {OPENCLAW_TIMEOUT}s")
+    logger.info(f"旧版超时兼容值: {OPENCLAW_TIMEOUT}s")
+    logger.info(
+        "OpenClaw 超时配置: "
+        f"connect={OPENCLAW_CONNECT_TIMEOUT}s, "
+        f"ws_idle={OPENCLAW_WS_IDLE_TIMEOUT}s, ws_total={OPENCLAW_WS_TOTAL_TIMEOUT}s, "
+        f"sse_idle={OPENCLAW_SSE_IDLE_TIMEOUT}s, sse_total={OPENCLAW_SSE_TOTAL_TIMEOUT}s, "
+        f"http={OPENCLAW_HTTP_TIMEOUT}s"
+    )
+    logger.info(
+        f"队列配置: workers={MAX_GATEWAY_WORKERS}, "
+        f"per_user_pending={MAX_PER_USER_PENDING}, queue_wait={MAX_QUEUE_WAIT_SECONDS}s"
+    )
+    logger.info(f"企微来件文件模式: {FILE_STORAGE_MODE}")
+    logger.info("OpenClaw 主动上传文件模式: s3")
+    if FILE_STORAGE_MODE == 's3':
+        logger.info(f"S3 Bucket: {S3_BUCKET or '(未配置)'}")
     if AGENTS:
         logger.info(f"已加载 {len(AGENTS)} 个 Agent 绑定:")
         for name, cfg in AGENTS.items():

@@ -4,6 +4,7 @@
 # 快速执行常见运维操作
 
 INSTALL_DIR="/opt/openclaw/gateway"
+FALLBACK_ENV_FILE="/opt/openclaw/.env"
 
 case "$1" in
     start)
@@ -66,7 +67,14 @@ case "$1" in
         ;;
     db)
         echo "🗄️  打开数据库 (输入 .quit 退出):"
-        DB_PATH=$(grep DB_PATH "$INSTALL_DIR/.env" | cut -d= -f2)
+        ENV_FILE="$INSTALL_DIR/.env"
+        if [ ! -f "$ENV_FILE" ] && [ -f "$FALLBACK_ENV_FILE" ]; then
+            ENV_FILE="$FALLBACK_ENV_FILE"
+        fi
+        DB_PATH=$(grep '^DB_PATH=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
+        if [ -z "$DB_PATH" ]; then
+            DB_PATH="/opt/openclaw/data/gateway/gateway.db"
+        fi
         sudo -u "$USER" sqlite3 "$DB_PATH"
         ;;
     *)
@@ -79,7 +87,7 @@ case "$1" in
         echo "  stop               停止服务"
         echo "  restart            重启服务"
         echo "                     (仅重启，不会同步新代码)"
-        echo "                     更新代码后请执行: sudo bash /opt/openclaw/bin/02-install-gateway.sh"
+        echo "                     更新代码后请执行: sudo bash /opt/openclaw/gateway/bin/02-install-gateway.sh"
         echo "  status             查看服务状态"
         echo "  logs               实时查看日志"
         echo ""

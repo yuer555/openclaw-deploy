@@ -14,7 +14,8 @@
 #   bash bin/03-install-openclaw.sh --add-agent      # 只添加新 Agent
 #   bash bin/03-install-openclaw.sh --add-provider   # 只添加模型提供商
 #
-# 要求：Node.js 22+, Docker（沙箱 agent 需要）
+# 要求：Node.js 22+；Docker 仅在沙箱 agent 需要
+# 注意：请使用普通用户运行，不要 sudo，不要 root
 # ============================================================================
 
 set -euo pipefail
@@ -43,12 +44,28 @@ success() { echo -e "${GREEN}✓${NC} $*"; }
 # ---------------------------------------------------------------------------
 OPENCLAW_HOME="${HOME}/.openclaw"
 OPENCLAW_CONFIG="${OPENCLAW_HOME}/openclaw.json"
+OPENCLAW_ENV_FILE="${OPENCLAW_HOME}/.env"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OPENCLAW_SANDBOX_IMAGE="${OPENCLAW_SANDBOX_IMAGE:-openclaw-sandbox:gateway-devtools-bookworm}"
+OPENCLAW_SANDBOX_DOCKERFILE="${OPENCLAW_SANDBOX_DOCKERFILE:-${REPO_ROOT}/bin/openclaw-sandbox-devtools.Dockerfile}"
+OPENCLAW_SANDBOX_BASE_IMAGE="${OPENCLAW_SANDBOX_BASE_IMAGE:-debian:bookworm-slim}"
+GATEWAY_SKILL_NAME="gateway-file-upload"
+GATEWAY_SKILL_SOURCE_DIR="${REPO_ROOT}/openclaw-skills/${GATEWAY_SKILL_NAME}"
+GATEWAY_SKILL_TARGET_DIR="${OPENCLAW_HOME}/skills/${GATEWAY_SKILL_NAME}"
+OPENCLAW_GATEWAY_RUN_PID_FILE="${OPENCLAW_HOME}/gateway-run.pid"
+OPENCLAW_GATEWAY_RUN_LOG_FILE="${OPENCLAW_HOME}/gateway-run.log"
+OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG=""
 EDITOR="${EDITOR:-${VISUAL:-nano}}"
 MIN_NODE_VERSION=22
+HOST_SHARED_ROOT="/app/shared"
 SKIP_INSTALL=false
 ADD_AGENT_ONLY=false
 ADD_PROVIDER_ONLY=false
 GATEWAY_TOKEN_SYNC_CHANGED=false
+GATEWAY_TOKEN_PREPARE_REQUIRED=false
+UPLOAD_SKILL_SANDBOX_AGENT_COUNT=0
+UPLOAD_SKILL_SANDBOX_AGENT_IDS=""
+PLAN_CREATE_SANDBOX_AGENT=""
 
 # ---------------------------------------------------------------------------
 # 参数解析
@@ -72,12 +89,717 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "$(id -u)" -eq 0 ]; then
+    echo "错误: 请不要使用 root 或 sudo 运行此脚本"
+    echo "原因: OpenClaw 的 workspace/sandbox 目录必须位于普通用户家目录，root 会落到 /root/.openclaw 并触发沙箱安全限制"
+    echo "正确方式:"
+    echo "  普通用户执行: bash bin/03-install-openclaw.sh"
+    echo "  仅 Gateway 安装脚本使用 sudo: sudo bash bin/02-install-gateway.sh"
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
 
 # 检查命令是否存在
 cmd_exists() { command -v "$1" &>/dev/null; }
+
+_ensure_openclaw_env_file() {
+    local env_file_created=false
+
+    mkdir -p "$OPENCLAW_HOME"
+    if [[ ! -f "$OPENCLAW_ENV_FILE" ]]; then
+        touch "$OPENCLAW_ENV_FILE"
+        env_file_created=true
+    fi
+    chmod 600 "$OPENCLAW_ENV_FILE" 2>/dev/null || true
+
+    if [[ "$env_file_created" == "true" ]]; then
+        success "已创建 OpenClaw 环境文件: ${OPENCLAW_ENV_FILE}"
+    fi
+}
+
+
+_append_gateway_token_to_env_file_if_missing() {
+    local token="$1"
+
+    _ensure_openclaw_env_file
+
+    if grep -Eq '^[[:space:]]*OPENCLAW_GATEWAY_TOKEN=' "$OPENCLAW_ENV_FILE" 2>/dev/null; then
+        return 1
+    fi
+
+    [[ -s "$OPENCLAW_ENV_FILE" ]] && echo "" >> "$OPENCLAW_ENV_FILE"
+    echo "OPENCLAW_GATEWAY_TOKEN=${token}" >> "$OPENCLAW_ENV_FILE"
+    success "已写入 Gateway Token 到 ${OPENCLAW_ENV_FILE}"
+    return 0
+}
+
+
+_upsert_env_values_in_file() {
+    local env_file="$1"
+    shift
+
+    if [[ -z "$env_file" ]]; then
+        return 1
+    fi
+
+python3 - "$env_file" "$@" <<'PYEOF'
+import os
+import sys
+
+env_file = os.path.expanduser(sys.argv[1])
+args = sys.argv[2:]
+updates = {}
+for raw in args:
+    if '=' not in raw:
+        continue
+    key, value = raw.split('=', 1)
+    updates[key] = value
+
+os.makedirs(os.path.dirname(env_file), exist_ok=True)
+if not os.path.exists(env_file):
+    open(env_file, 'a', encoding='utf-8').close()
+
+with open(env_file, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+written = set()
+result = []
+pending_append = []
+for raw in lines:
+    stripped = raw.strip()
+    if not stripped or stripped.startswith('#') or '=' not in raw:
+        result.append(raw)
+        continue
+
+    key = raw.split('=', 1)[0].strip()
+    if key not in updates:
+        result.append(raw)
+        continue
+
+    if key in written:
+        continue
+
+    written.add(key)
+    value = updates[key]
+    if value == '':
+        continue
+    result.append(f"{key}={value}\n")
+
+for key in updates:
+    if key in written:
+        continue
+    value = updates[key]
+    if value == '':
+        continue
+    pending_append.append(f"{key}={value}\n")
+
+if pending_append and result and result[-1].strip():
+    result.append('\n')
+
+result.extend(pending_append)
+
+with open(env_file, 'w', encoding='utf-8') as f:
+    f.writelines(result)
+PYEOF
+}
+
+
+_write_upload_skill_env_to_openclaw_env_file() {
+    local gateway_url="$1"
+    local upload_token="$2"
+    local expires_seconds="$3"
+
+    _ensure_openclaw_env_file
+
+    _upsert_env_values_in_file \
+        "$OPENCLAW_ENV_FILE" \
+        "OPENCLAW_FILE_UPLOAD_GATEWAY_URL=${gateway_url}" \
+        "OPENCLAW_FILE_UPLOAD_TOKEN=${upload_token}" \
+        "OPENCLAW_FILE_UPLOAD_EXPIRES=${expires_seconds}"
+
+    export OPENCLAW_FILE_UPLOAD_GATEWAY_URL="$gateway_url"
+    if [[ -n "$upload_token" ]]; then
+        export OPENCLAW_FILE_UPLOAD_TOKEN="$upload_token"
+    else
+        unset OPENCLAW_FILE_UPLOAD_TOKEN 2>/dev/null || true
+    fi
+    export OPENCLAW_FILE_UPLOAD_EXPIRES="$expires_seconds"
+}
+
+ensure_gateway_token() {
+    local env_token config_token generated_token=""
+
+    _ensure_openclaw_env_file
+
+    env_token="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_GATEWAY_TOKEN")"
+    if [[ -n "$env_token" ]]; then
+        if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" && "${OPENCLAW_GATEWAY_TOKEN}" != "$env_token" ]]; then
+            warn "${OPENCLAW_ENV_FILE} 中已有 OPENCLAW_GATEWAY_TOKEN，当前 shell 中的同名变量将仅在本次进程内生效"
+        fi
+        OPENCLAW_GATEWAY_TOKEN="$env_token"
+        export OPENCLAW_GATEWAY_TOKEN
+        return 0
+    fi
+
+    if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
+        _append_gateway_token_to_env_file_if_missing "$OPENCLAW_GATEWAY_TOKEN" || true
+        export OPENCLAW_GATEWAY_TOKEN
+        return 0
+    fi
+
+    config_token="$(_read_token_from_config_file "auth")"
+    if [[ -n "$config_token" && "$config_token" != "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+        OPENCLAW_GATEWAY_TOKEN="$config_token"
+        export OPENCLAW_GATEWAY_TOKEN
+        _append_gateway_token_to_env_file_if_missing "$OPENCLAW_GATEWAY_TOKEN" || true
+        step "检测到现有 gateway.auth.token，已同步到 ${OPENCLAW_ENV_FILE}"
+        return 0
+    fi
+
+    generated_token="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 32)"
+    OPENCLAW_GATEWAY_TOKEN="$generated_token"
+    export OPENCLAW_GATEWAY_TOKEN
+    _append_gateway_token_to_env_file_if_missing "$OPENCLAW_GATEWAY_TOKEN" || true
+    success "已生成新的 Gateway Token，并写入 ${OPENCLAW_ENV_FILE}"
+}
+
+_print_sandbox_runtime_instructions() {
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  Docker 沙箱准备指南${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "  仅当你要创建 Docker 沙箱 Agent 时才需要以下步骤。"
+    echo "  不启用沙箱则无需安装 Docker。"
+    echo ""
+    echo -e "${CYAN}▸ 1. 安装 Docker${NC}"
+    echo ""
+    if cmd_exists apt-get; then
+        echo "  当前系统: Ubuntu / Debian"
+        echo ""
+        echo "  sudo apt-get install -y ca-certificates curl"
+        echo "  sudo install -m 0755 -d /etc/apt/keyrings"
+        echo "  curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg \\"
+        echo "    | sudo tee /etc/apt/keyrings/docker.asc > /dev/null"
+        echo "  echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \\"
+        echo "    https://mirrors.aliyun.com/docker-ce/linux/ubuntu \\"
+        echo "    \$(. /etc/os-release && echo \$VERSION_CODENAME) stable\" \\"
+        echo "    | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null"
+        echo "  sudo apt-get update"
+        echo "  sudo apt-get install -y docker-ce docker-ce-cli containerd.io"
+    elif cmd_exists dnf; then
+        echo "  当前系统: RHEL / Rocky / AlmaLinux（dnf）"
+        echo ""
+        echo "  sudo dnf install -y dnf-plugins-core"
+        echo "  sudo dnf config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo"
+        echo "  sudo dnf install -y docker-ce docker-ce-cli containerd.io"
+    elif cmd_exists yum; then
+        echo "  当前系统: CentOS / RHEL（yum）"
+        echo ""
+        echo "  sudo yum install -y yum-utils"
+        echo "  sudo yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo"
+        echo "  sudo yum install -y docker-ce docker-ce-cli containerd.io"
+    else
+        echo "  未识别包管理器，请按你的发行版选择其一："
+        echo ""
+        echo "  # Ubuntu/Debian:"
+        echo "  sudo apt-get update && sudo apt-get install -y docker.io"
+        echo "  # RHEL/Rocky/CentOS:"
+        echo "  sudo yum install -y docker"
+    fi
+    echo "  sudo systemctl enable --now docker"
+    echo "  sudo usermod -aG docker \$USER"
+    echo "  newgrp docker   # 或重新登录"
+    echo "  # 如果仍报 permission denied while trying to connect to the docker API"
+    echo "  sudo chmod 777 /var/run/docker.sock   # 临时兜底方案"
+    echo ""
+    echo -e "${CYAN}▸ 2. 配置镜像加速${NC}（腾讯云机器优先）"
+    echo ""
+    cat <<'EOF'
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json > /dev/null <<'JSON'
+{
+  "registry-mirrors": [
+    "https://mirror.ccs.tencentyun.com",
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com"
+  ]
+}
+JSON
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+docker info | sed -n '/Registry Mirrors/,$p'
+EOF
+    echo ""
+    echo -e "${CYAN}▸ 3. 构建专用沙箱镜像${NC}"
+    echo -e "  当前基础镜像: ${BOLD}${OPENCLAW_SANDBOX_BASE_IMAGE}${NC}"
+    echo ""
+    echo "  # 如基础镜像拉取慢，可改成你自己的 SWR / 私有仓库地址"
+    echo "  export OPENCLAW_SANDBOX_BASE_IMAGE=\"${OPENCLAW_SANDBOX_BASE_IMAGE}\""
+    echo ""
+    echo "  docker build \\"
+    echo "    --build-arg OPENCLAW_SANDBOX_BASE_IMAGE=${OPENCLAW_SANDBOX_BASE_IMAGE} \\"
+    echo "    -t ${OPENCLAW_SANDBOX_IMAGE} \\"
+    echo "    -f ${OPENCLAW_SANDBOX_DOCKERFILE} \\"
+    echo "    ${REPO_ROOT}"
+    echo ""
+    echo "  # 验证镜像是否存在"
+    echo "  docker image inspect ${OPENCLAW_SANDBOX_IMAGE}"
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+
+_sandbox_image_available() {
+    if ! cmd_exists docker; then
+        return 1
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        return 1
+    fi
+
+    docker image inspect "$OPENCLAW_SANDBOX_IMAGE" >/dev/null 2>&1
+}
+
+
+prompt_sandbox_plan_if_needed() {
+    if [[ "${ADD_PROVIDER_ONLY}" == "true" ]]; then
+        PLAN_CREATE_SANDBOX_AGENT="false"
+        return 0
+    fi
+
+    if [[ -n "${PLAN_CREATE_SANDBOX_AGENT}" ]]; then
+        return 0
+    fi
+
+    if [[ ! -r /dev/tty ]]; then
+        PLAN_CREATE_SANDBOX_AGENT="true"
+        return 0
+    fi
+
+    echo ""
+    echo "说明: 只有本次需要创建 Docker 沙箱 Agent 时，才需要 Docker 和专用沙箱镜像。"
+    if confirm "本次是否计划创建 Docker 沙箱 Agent? (直接回车默认 Yes)" "y"; then
+        PLAN_CREATE_SANDBOX_AGENT="true"
+        info "已选择创建沙箱 Agent；后续会先检查 Docker 和专用沙箱镜像。"
+    else
+        PLAN_CREATE_SANDBOX_AGENT="false"
+        info "已选择非沙箱流程；后续只有你明确为某个 Agent 启用沙箱时，才会再检查 Docker。"
+    fi
+}
+
+
+ensure_planned_sandbox_runtime_ready() {
+    if [[ "${PLAN_CREATE_SANDBOX_AGENT}" != "true" ]]; then
+        return 0
+    fi
+
+    echo ""
+    step "你已选择创建 Docker 沙箱 Agent，先检查沙箱运行环境..."
+    if require_custom_sandbox_image; then
+        success "Docker 与专用沙箱镜像已就绪，将继续后续引导"
+        return 0
+    fi
+
+    echo ""
+    info "当前 Docker 或专用沙箱镜像未准备完成，已停止后续引导。"
+    info "请按上面的提示准备完成后，重新运行本脚本。"
+    exit 0
+}
+
+# 打印前置依赖安装指南
+_print_prereq_instructions() {
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  前置依赖安装指南${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${CYAN}▸ cmake / 构建工具${NC}（必须，OpenClaw 原生模块编译依赖）"
+    echo ""
+    if cmd_exists apt-get; then
+        echo "  sudo apt-get install -y cmake build-essential"
+    elif cmd_exists dnf; then
+        echo "  sudo dnf install -y cmake gcc-c++ make"
+    elif cmd_exists yum; then
+        echo "  sudo yum install -y cmake gcc-c++ make"
+    else
+        echo "  # Ubuntu/Debian:"
+        echo "  sudo apt-get install -y cmake build-essential"
+        echo "  # RHEL/Rocky/CentOS:"
+        echo "  sudo dnf install -y cmake gcc-c++ make"
+    fi
+    echo ""
+    echo -e "${CYAN}▸ Node.js ${MIN_NODE_VERSION}+${NC}（OpenClaw 运行时，必须）"
+    echo ""
+    echo "  # 方式一：nvm via Gitee 镜像（国内推荐）"
+    echo "  git clone https://gitee.com/mirrors/nvm.git ~/.nvm"
+    echo "  echo 'export NVM_DIR=\"\$HOME/.nvm\"' >> ~/.bashrc"
+    echo "  echo '[ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"' >> ~/.bashrc"
+    echo "  source ~/.bashrc"
+    echo "  NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node nvm install ${MIN_NODE_VERSION}"
+    echo ""
+    echo "  # 方式二：NodeSource 官方源"
+    if cmd_exists apt-get; then
+        echo "  curl -fsSL https://deb.nodesource.com/setup_${MIN_NODE_VERSION}.x | sudo bash -"
+        echo "  sudo apt-get install -y nodejs"
+    elif cmd_exists dnf || cmd_exists yum; then
+        echo "  curl -fsSL https://rpm.nodesource.com/setup_${MIN_NODE_VERSION}.x | sudo bash -"
+        echo "  sudo yum install -y nodejs"
+    else
+        echo "  # Ubuntu/Debian:"
+        echo "  curl -fsSL https://deb.nodesource.com/setup_${MIN_NODE_VERSION}.x | sudo bash -"
+        echo "  sudo apt-get install -y nodejs"
+        echo "  # RHEL/Rocky/CentOS:"
+        echo "  curl -fsSL https://rpm.nodesource.com/setup_${MIN_NODE_VERSION}.x | sudo bash -"
+        echo "  sudo yum install -y nodejs"
+    fi
+    echo ""
+    echo "  # 国内镜像（阿里云）："
+    echo "  Node.js 二进制: https://mirrors.aliyun.com/nodejs-release/"
+    echo "  安装后配置 npm 镜像: npm config set registry https://registry.npmmirror.com"
+    echo ""
+    echo -e "${CYAN}▸ OpenClaw${NC}（必须）"
+    echo ""
+    echo "  # 方式一：官方安装脚本"
+    echo "  curl -fsSL https://openclaw.ai/install.sh | OPENCLAW_VERSION=2026.02.26 bash"
+    echo ""
+    echo "  # 方式二：npm 安装"
+    echo "  npm install -g openclaw@2026.02.26"
+    echo ""
+    echo -e "${CYAN}▸ Docker${NC}（仅启用沙箱 Agent 时需要）"
+    echo ""
+    echo "  无需现在安装。只有在创建 Docker 沙箱 Agent 时，脚本才会继续提示："
+    echo "  1) 安装 Docker"
+    echo "  2) 配置镜像加速"
+    echo "  3) 构建专用沙箱镜像"
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+# 检查前置依赖
+check_prerequisites() {
+    header "第一步：检查前置环境"
+    GATEWAY_TOKEN_PREPARE_REQUIRED=false
+
+    local missing=false
+
+    # --- cmake / 构建工具 ---
+    if cmd_exists cmake; then
+        success "cmake $(cmake --version | head -1 | awk '{print $3}')"
+    else
+        error "未找到 cmake（OpenClaw 原生模块编译依赖）"
+        missing=true
+    fi
+
+    # --- Node.js ---
+    if cmd_exists node; then
+        local node_ver
+        node_ver=$(node -v | sed 's/v//' | cut -d. -f1)
+        if (( node_ver >= MIN_NODE_VERSION )); then
+            success "Node.js $(node -v)"
+        else
+            error "Node.js 版本 $(node -v) 过低，需要 v${MIN_NODE_VERSION}+"
+            missing=true
+        fi
+    else
+        error "未找到 Node.js（需要 v${MIN_NODE_VERSION}+）"
+        missing=true
+    fi
+
+    # --- Docker（可选，仅沙箱 Agent 需要）---
+    if cmd_exists docker; then
+        if docker info &>/dev/null 2>&1; then
+            success "Docker $(docker --version | sed -E 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+            if docker image inspect "$OPENCLAW_SANDBOX_IMAGE" >/dev/null 2>&1; then
+                success "已检测到沙箱镜像: ${OPENCLAW_SANDBOX_IMAGE}"
+            else
+                step "未检测到沙箱镜像（仅当你后续创建 Docker 沙箱 Agent 时才需要）"
+            fi
+        elif sudo docker info &>/dev/null 2>&1; then
+            echo ""
+            warn "Docker 已安装并运行，但当前用户无 socket 访问权限"
+            warn "若后续启用 Docker 沙箱 Agent，请先执行以下任一操作："
+            echo ""
+            echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
+            echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
+            echo "  方式三（临时兜底）：执行 'sudo chmod 777 /var/run/docker.sock' 后再运行脚本"
+            echo ""
+        else
+            warn "未检测到可用 Docker（若后续启用 Docker 沙箱 Agent，请先安装并启动 Docker）"
+        fi
+    else
+        warn "未找到 Docker（仅在启用 Docker 沙箱 Agent 时必须安装）"
+    fi
+
+    # --- OpenClaw ---
+    if cmd_exists openclaw; then
+        success "OpenClaw v$(openclaw --version 2>/dev/null || echo 'unknown')"
+    else
+        error "未找到 openclaw 命令"
+        missing=true
+    fi
+
+    if [[ "$missing" == "true" ]]; then
+        _print_prereq_instructions
+        error "请安装以上缺失依赖后重新运行本脚本"
+        exit 1
+    fi
+
+    ensure_planned_sandbox_runtime_ready
+
+    echo ""
+
+    # --- OpenClaw 初始化（首次 or 重置）---
+    if [[ ! -f "$OPENCLAW_CONFIG" ]]; then
+        step "首次初始化 OpenClaw..."
+        cleanup_openclaw_sandbox_containers || warn "历史沙箱容器未完全清理，请稍后手动执行: openclaw sandbox recreate --all --force"
+        echo -e "${DIM}将启动 OpenClaw 交互式配置向导...${NC}"
+        echo ""
+        run_openclaw_onboard
+        success "OpenClaw 初始化完成"
+        GATEWAY_TOKEN_PREPARE_REQUIRED=true
+    else
+        success "OpenClaw 配置已存在: ${OPENCLAW_CONFIG}"
+        echo ""
+        printf "%s" "是否清理当前安装并重新配置? [y/N]: "
+        read -r reinstall_yn </dev/tty
+        if [[ "$reinstall_yn" =~ ^[Yy] ]]; then
+            step "清理当前 OpenClaw 安装..."
+            openclaw gateway stop 2>/dev/null || true
+            cleanup_openclaw_sandbox_containers || warn "历史沙箱容器未完全清理，请稍后手动执行: openclaw sandbox recreate --all --force"
+            rm -rf "$OPENCLAW_HOME"
+            success "清理完成，启动 OpenClaw 初始化向导..."
+            echo ""
+            run_openclaw_onboard
+            success "OpenClaw 初始化完成"
+            GATEWAY_TOKEN_PREPARE_REQUIRED=true
+        fi
+    fi
+
+    # --- 初始化完成后再准备 Gateway Token ---
+    # 避免在“是否重装”确认之前生成 ~/.openclaw/.env，随后又被 rm -rf 清掉
+    if [[ "$GATEWAY_TOKEN_PREPARE_REQUIRED" == "true" ]]; then
+        ensure_gateway_token
+    fi
+
+    # --- 对齐 Gateway token（auth/remote）---
+    echo ""
+    step "同步 Gateway token 配置..."
+    sync_gateway_tokens
+    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
+        step "检测到 token 变更，将在后续统一重启 Gateway 使配置生效"
+    fi
+}
+
+# 检测 OpenClaw 托管 Gateway 服务能力（launchd / systemd --user / schtasks）
+get_gateway_service_mode() {
+    local os_name
+    os_name="$(uname -s 2>/dev/null || echo unknown)"
+
+    case "$os_name" in
+        Darwin)
+            echo "launchd"
+            ;;
+        Linux)
+            if ! cmd_exists systemctl; then
+                echo "none"
+                return 0
+            fi
+
+            if systemctl --user show-environment >/dev/null 2>&1; then
+                echo "systemd-user"
+            else
+                echo "none"
+            fi
+            ;;
+        CYGWIN*|MINGW*|MSYS*)
+            echo "schtasks"
+            ;;
+        *)
+            echo "none"
+            ;;
+    esac
+}
+
+
+gateway_service_supported() {
+    [[ "$(get_gateway_service_mode)" != "none" ]]
+}
+
+
+gateway_start_hint() {
+    if gateway_service_supported; then
+        echo "openclaw gateway start"
+    else
+        echo "openclaw gateway run"
+    fi
+}
+
+
+resolve_onboard_daemon_skip_flag() {
+    local help_text
+
+    if [[ -n "$OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG" ]]; then
+        echo "$OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG"
+        return 0
+    fi
+
+    help_text="$(openclaw onboard --help 2>&1 || true)"
+    if echo "$help_text" | grep -q -- "--no-install-daemon"; then
+        OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG="--no-install-daemon"
+    elif echo "$help_text" | grep -q -- "--skip-daemon"; then
+        OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG="--skip-daemon"
+    else
+        OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG="unsupported"
+    fi
+
+    echo "$OPENCLAW_ONBOARD_DAEMON_SKIP_FLAG"
+}
+
+
+run_openclaw_onboard() {
+    local skip_flag
+
+    if gateway_service_supported; then
+        openclaw onboard --install-daemon
+        return 0
+    fi
+
+    warn "当前环境没有可用的 OpenClaw 托管服务能力（常见于 systemctl --user 不可用），将跳过 daemon 安装"
+    skip_flag="$(resolve_onboard_daemon_skip_flag)"
+
+    case "$skip_flag" in
+        --no-install-daemon|--skip-daemon)
+            openclaw onboard "$skip_flag"
+            ;;
+        *)
+            warn "当前 OpenClaw 版本不支持跳过 daemon 安装参数，请在向导中手动跳过服务安装"
+            openclaw onboard
+            ;;
+    esac
+}
+
+
+start_gateway_run_fallback() {
+    local pid=""
+
+    mkdir -p "$OPENCLAW_HOME"
+
+    if [[ -f "$OPENCLAW_GATEWAY_RUN_PID_FILE" ]]; then
+        pid="$(cat "$OPENCLAW_GATEWAY_RUN_PID_FILE" 2>/dev/null || true)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            step "检测到兼容模式 Gateway 已在运行（PID: ${pid}）"
+            return 0
+        fi
+        rm -f "$OPENCLAW_GATEWAY_RUN_PID_FILE"
+    fi
+
+    nohup openclaw gateway run >"$OPENCLAW_GATEWAY_RUN_LOG_FILE" 2>&1 &
+    pid=$!
+    echo "$pid" > "$OPENCLAW_GATEWAY_RUN_PID_FILE"
+    sleep 3
+
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && openclaw health &>/dev/null; then
+        success "已用兼容模式启动 Gateway（后台执行 openclaw gateway run）"
+        echo -e "  ${DIM}日志: ${OPENCLAW_GATEWAY_RUN_LOG_FILE}${NC}"
+        return 0
+    fi
+
+    warn "兼容模式 Gateway 启动后仍未通过健康检查，请查看日志: ${OPENCLAW_GATEWAY_RUN_LOG_FILE}"
+    return 1
+}
+
+
+restart_gateway_run_fallback() {
+    local pid=""
+
+    if [[ -f "$OPENCLAW_GATEWAY_RUN_PID_FILE" ]]; then
+        pid="$(cat "$OPENCLAW_GATEWAY_RUN_PID_FILE" 2>/dev/null || true)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" >/dev/null 2>&1 || true
+            sleep 1
+        fi
+        rm -f "$OPENCLAW_GATEWAY_RUN_PID_FILE"
+        start_gateway_run_fallback
+        return $?
+    fi
+
+    if openclaw health &>/dev/null; then
+        warn "当前环境未使用托管服务，若 Gateway 已在运行，请手动重启当前进程使新 token 生效"
+        return 0
+    fi
+
+    start_gateway_run_fallback
+}
+
+
+ensure_gateway_running() {
+    local start_hint
+    start_hint="$(gateway_start_hint)"
+
+    step "检查 Gateway 状态..."
+    if openclaw health &>/dev/null; then
+        success "Gateway 已在运行"
+        return 0
+    fi
+
+    if gateway_service_supported; then
+        step "启动 Gateway 服务..."
+        openclaw gateway start >/dev/null 2>&1 || true
+    else
+        warn "当前环境不可用托管服务，改为后台执行: ${start_hint}"
+        start_gateway_run_fallback || {
+            warn "Gateway 兼容启动失败，请稍后手动运行: ${start_hint}"
+            return 0
+        }
+    fi
+
+    sleep 3
+    if openclaw health &>/dev/null; then
+        success "Gateway 启动成功"
+    else
+        warn "Gateway 启动失败，Agent 创建可能受影响，请稍后手动运行: ${start_hint}"
+    fi
+}
+
+
+restart_gateway_after_token_change() {
+    if gateway_service_supported; then
+        openclaw gateway restart >/dev/null 2>&1 || {
+            warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
+            return 1
+        }
+        sleep 2
+        return 0
+    fi
+
+    restart_gateway_run_fallback || {
+        warn "Gateway 兼容模式重启失败，请手动重启当前 openclaw gateway run 进程"
+        return 1
+    }
+    sleep 2
+    return 0
+}
+
+
+restart_gateway_for_stage() {
+    local stage_label="${1:-应用配置}"
+
+    echo ""
+    step "统一重启 OpenClaw Gateway（${stage_label}）..."
+    ensure_gateway_running
+    if restart_gateway_after_token_change; then
+        success "OpenClaw Gateway 重启完成（${stage_label}）"
+        return 0
+    fi
+
+    warn "OpenClaw Gateway 重启失败（${stage_label}），请稍后手动处理"
+    return 1
+}
 
 # JSON5 配置读取（通过 openclaw config get）
 config_get() { openclaw config get "$1" 2>/dev/null || echo ""; }
@@ -127,40 +849,172 @@ PYEOF
 }
 
 
+_read_sandbox_image_info_from_config_file() {
+    if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
+        return 0
+    fi
+
+python3 - "$OPENCLAW_CONFIG" <<'PYEOF'
+import json
+import re
+import sys
+
+config_path = sys.argv[1]
+
+try:
+    with open(config_path, 'r') as f:
+        content = f.read()
+    try:
+        config = json.loads(content)
+    except json.JSONDecodeError:
+        content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+        content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+        content = re.sub(r',\s*([}\]])', r'\1', content)
+        config = json.loads(content)
+except Exception:
+    sys.exit(0)
+
+seen = set()
+
+def emit(label, image):
+    if not image:
+        return
+    key = (label, image)
+    if key in seen:
+        return
+    seen.add(key)
+    print(f"{label}|{image}")
+
+agents_cfg = config.get('agents', {}) or {}
+defaults = agents_cfg.get('defaults', {}) or {}
+default_image = (((defaults.get('sandbox') or {}).get('docker') or {}).get('image') or '').strip()
+emit('agents.defaults.sandbox.docker.image', default_image)
+
+for agent in agents_cfg.get('list', []) or []:
+    if not isinstance(agent, dict):
+        continue
+    agent_id = (agent.get('id') or '').strip() or 'unknown'
+    image = ((((agent.get('sandbox') or {}).get('docker') or {}).get('image')) or '').strip()
+    emit(f'agents.list[{agent_id}].sandbox.docker.image', image)
+PYEOF
+}
+
+
+_read_openclaw_default_sandbox_image_from_source() {
+    if ! cmd_exists python3 || ! cmd_exists openclaw; then
+        echo ""
+        return 0
+    fi
+
+python3 - "$(command -v openclaw)" <<'PYEOF'
+import os
+import re
+import sys
+
+bin_path = sys.argv[1]
+if not bin_path:
+    print('')
+    sys.exit(0)
+
+real_path = os.path.realpath(bin_path)
+package_root = os.path.dirname(real_path)
+dist_dir = os.path.join(package_root, 'dist')
+
+pattern = re.compile(r'DEFAULT_SANDBOX_IMAGE\s*=\s*"([^"]+)"')
+
+if not os.path.isdir(dist_dir):
+    print('')
+    sys.exit(0)
+
+for root, _, files in os.walk(dist_dir):
+    for name in files:
+        if not name.endswith('.js'):
+            continue
+        path = os.path.join(root, name)
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                match = pattern.search(f.read())
+            if match:
+                print(match.group(1))
+                sys.exit(0)
+        except Exception:
+            continue
+
+print('')
+PYEOF
+}
+
+
+show_current_sandbox_image_info() {
+    echo ""
+    step "识别当前 OpenClaw 沙箱镜像配置..."
+
+    if [[ -f "$OPENCLAW_CONFIG" ]]; then
+        local lines found_any="false"
+        lines="$(_read_sandbox_image_info_from_config_file || true)"
+        if [[ -n "$lines" ]]; then
+            while IFS='|' read -r label image; do
+                [[ -z "$label" || -z "$image" ]] && continue
+                echo -e "  ${DIM}${label}${NC} = ${image}"
+                found_any="true"
+            done <<< "$lines"
+        fi
+        if [[ "$found_any" != "true" ]]; then
+            warn "已检测到 ${OPENCLAW_CONFIG}，但未找到显式 sandbox.docker.image 配置"
+        fi
+        echo -e "  ${DIM}本脚本目标镜像${NC} = ${OPENCLAW_SANDBOX_IMAGE}"
+        return 0
+    fi
+
+    local default_image
+    default_image="$(_read_openclaw_default_sandbox_image_from_source)"
+    if [[ -n "$default_image" ]]; then
+        echo -e "  ${DIM}OpenClaw 源码默认镜像${NC} = ${default_image}"
+    else
+        warn "未检测到本地 OpenClaw 配置，且无法从源码解析默认沙箱镜像"
+    fi
+    echo -e "  ${DIM}本脚本目标镜像${NC} = ${OPENCLAW_SANDBOX_IMAGE}"
+}
+
+
 sync_gateway_tokens() {
-    # 对齐 gateway.auth.token 与 gateway.remote.token，避免 token mismatch
-    local auth_token remote_token desired_token
+    # 将 gateway.auth.token 与 gateway.remote.token 设置为环境变量引用
+    local auth_token remote_token env_token
     GATEWAY_TOKEN_SYNC_CHANGED=false
 
     auth_token=$(_read_token_from_config_file "auth")
     remote_token=$(_read_token_from_config_file "remote")
-    desired_token="$auth_token"
+    env_token="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_GATEWAY_TOKEN")"
 
-    if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
-        desired_token="$OPENCLAW_GATEWAY_TOKEN"
-        if [[ "$auth_token" != "$desired_token" ]]; then
-            config_set "gateway.auth.token" "$desired_token"
-            auth_token="$desired_token"
-            GATEWAY_TOKEN_SYNC_CHANGED=true
-            step "已将 gateway.auth.token 对齐到 OPENCLAW_GATEWAY_TOKEN"
+    if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" && -z "$env_token" && "$GATEWAY_TOKEN_PREPARE_REQUIRED" != "true" ]]; then
+        if [[ "$auth_token" == "\${OPENCLAW_GATEWAY_TOKEN}" || "$remote_token" == "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+            warn "当前 Gateway 配置依赖 OPENCLAW_GATEWAY_TOKEN，但 ${OPENCLAW_ENV_FILE} 中未找到该变量"
+            warn "请先补充 ${OPENCLAW_ENV_FILE}，再重新执行 token 同步"
+        else
+            step "检测到沿用现有安装，跳过 Gateway Token 初始化"
         fi
-    fi
-
-    if [[ -z "$desired_token" ]]; then
-        warn "未检测到 gateway.auth.token，无法自动对齐 remote.token"
         return 0
     fi
 
-    if [[ "$remote_token" != "$desired_token" ]]; then
-        config_set "gateway.remote.token" "$desired_token"
+    ensure_gateway_token
+
+    # 检查是否已经是环境变量引用格式
+    if [[ "$auth_token" != "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+        config_set "gateway.auth.token" "\${OPENCLAW_GATEWAY_TOKEN}"
         GATEWAY_TOKEN_SYNC_CHANGED=true
-        step "已将 gateway.remote.token 对齐到 gateway.auth.token"
+        step "已将 gateway.auth.token 设置为环境变量引用"
+    fi
+
+    if [[ "$remote_token" != "\${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+        config_set "gateway.remote.token" "\${OPENCLAW_GATEWAY_TOKEN}"
+        GATEWAY_TOKEN_SYNC_CHANGED=true
+        step "已将 gateway.remote.token 设置为环境变量引用"
     fi
 
     if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
-        success "Gateway token 已对齐（auth/remote）"
+        success "Gateway token 已设置为环境变量引用"
     else
-        step "Gateway token 已对齐，无需调整"
+        step "Gateway token 已是环境变量引用，无需调整"
     fi
 }
 
@@ -174,6 +1028,11 @@ _status_has_token_mismatch() {
 repair_gateway_service_token_if_needed() {
     # 如果 service token 与 config token 漂移，自动执行 gateway install --force 修复
     local status_output
+
+    if ! gateway_service_supported; then
+        return 0
+    fi
+
     status_output="$(openclaw gateway status 2>&1 || true)"
 
     if ! _status_has_token_mismatch "$status_output"; then
@@ -198,6 +1057,16 @@ hard_check_gateway_token_health() {
     # 硬校验：gateway status 必须 RPC ok，doctor 不得出现 token stale/mismatch
     local status_output doctor_output
 
+    if ! gateway_service_supported; then
+        step "当前环境未启用托管 Gateway 服务，跳过 service token / doctor 硬校验"
+        if openclaw health >/dev/null 2>&1; then
+            success "Gateway 直连健康检查通过"
+        else
+            warn "Gateway 当前未运行，已跳过服务级 token 校验"
+        fi
+        return 0
+    fi
+
     # 先尝试自动修复 service token 漂移（不影响已健康场景）
     if ! repair_gateway_service_token_if_needed; then
         error "自动修复 service token 失败，请先处理后再重试"
@@ -221,7 +1090,7 @@ hard_check_gateway_token_health() {
     success "Gateway RPC probe: ok"
 
     step "OpenClaw doctor token 校验..."
-    doctor_output="$(openclaw doctor 2>&1 || true)"
+    doctor_output="$(openclaw doctor --non-interactive 2>&1 || true)"
     if echo "$doctor_output" | grep -Eqi "service token is stale|gateway token mismatch|gateway auth token mismatch|config token differs from service token"; then
         error "检测到 token 漂移（openclaw doctor）"
         echo "$doctor_output"
@@ -231,8 +1100,135 @@ hard_check_gateway_token_health() {
 }
 
 
+shared_dir_for_agent() {
+    local agent_id="$1"
+    printf "%s/%s\n" "$HOST_SHARED_ROOT" "$agent_id"
+}
+
+
+shared_source_dir_for_agent() {
+    local agent_id="$1"
+    if [[ "$agent_id" == "main" ]]; then
+        printf "%s/shared\n" "${OPENCLAW_HOME}/workspace"
+    else
+        printf "%s/shared\n" "${OPENCLAW_HOME}/workspace-${agent_id}"
+    fi
+}
+
+
+ensure_shared_root() {
+    if [[ -d "$HOST_SHARED_ROOT" && -w "$HOST_SHARED_ROOT" ]]; then
+        return 0
+    fi
+
+    if mkdir -p "$HOST_SHARED_ROOT" 2>/dev/null; then
+        chmod 775 "$HOST_SHARED_ROOT" 2>/dev/null || true
+        return 0
+    fi
+
+    warn "无法自动创建共享根目录: ${HOST_SHARED_ROOT}"
+    echo -e "  ${DIM}请先执行: sudo mkdir -p ${HOST_SHARED_ROOT}${NC}"
+    echo -e "  ${DIM}          sudo chown $(whoami):$(id -gn) ${HOST_SHARED_ROOT}${NC}"
+    echo -e "  ${DIM}          sudo chmod 775 ${HOST_SHARED_ROOT}${NC}"
+    return 1
+}
+
+
+ensure_shared_dir_for_agent() {
+    local agent_id="$1"
+    local shared_dir
+    local shared_source_dir
+    shared_dir="$(shared_dir_for_agent "$agent_id")"
+    shared_source_dir="$(shared_source_dir_for_agent "$agent_id")"
+
+    if ! ensure_shared_root; then
+        return 1
+    fi
+
+    if ! mkdir -p "$shared_source_dir" 2>/dev/null; then
+        warn "无法自动创建共享真实目录: ${shared_source_dir}"
+        echo -e "  ${DIM}请先确认 $(dirname "$shared_source_dir") 对当前用户可写${NC}"
+        return 1
+    fi
+
+    if cmd_exists python3; then
+        local layout_output layout_status
+        layout_output="$(python3 - "$shared_source_dir" "$shared_dir" <<'PYEOF'
+import os
+import shutil
+import sys
+
+source_dir = os.path.realpath(sys.argv[1])
+exposed_dir = sys.argv[2]
+
+os.makedirs(source_dir, exist_ok=True)
+os.makedirs(os.path.dirname(exposed_dir), exist_ok=True)
+
+if os.path.islink(exposed_dir):
+    if os.path.realpath(exposed_dir) != source_dir:
+        os.remove(exposed_dir)
+        os.symlink(source_dir, exposed_dir)
+        print(f"fixed:{exposed_dir}->{source_dir}")
+    else:
+        print(f"ok:{exposed_dir}->{source_dir}")
+    raise SystemExit(0)
+
+if os.path.isdir(exposed_dir):
+    if os.path.realpath(exposed_dir) == source_dir:
+        print(f"ok:{exposed_dir}->{source_dir}")
+        raise SystemExit(0)
+
+    conflicts = [name for name in os.listdir(exposed_dir) if os.path.exists(os.path.join(source_dir, name))]
+    if conflicts:
+        print("conflict:" + ",".join(conflicts))
+        raise SystemExit(2)
+
+    for name in os.listdir(exposed_dir):
+        shutil.move(os.path.join(exposed_dir, name), os.path.join(source_dir, name))
+    os.rmdir(exposed_dir)
+    os.symlink(source_dir, exposed_dir)
+    print(f"migrated:{exposed_dir}->{source_dir}")
+    raise SystemExit(0)
+
+if os.path.lexists(exposed_dir):
+    print(f"unsupported:{exposed_dir}")
+    raise SystemExit(3)
+
+os.symlink(source_dir, exposed_dir)
+print(f"created:{exposed_dir}->{source_dir}")
+PYEOF
+)"
+        layout_status=$?
+
+        case "$layout_status" in
+            0)
+                return 0
+                ;;
+            2)
+                warn "共享路径已存在冲突文件，未自动迁移: ${shared_dir}"
+                echo -e "  ${DIM}请手动整理后改为软链: ${shared_dir} -> ${shared_source_dir}${NC}"
+                return 1
+                ;;
+            *)
+                warn "无法自动创建共享目录软链: ${shared_dir}"
+                echo -e "  ${DIM}${layout_output}${NC}"
+                return 1
+                ;;
+        esac
+    fi
+
+    if [[ ! -e "$shared_dir" ]]; then
+        ln -s "$shared_source_dir" "$shared_dir" 2>/dev/null && return 0
+    fi
+
+    warn "无法自动创建共享目录软链: ${shared_dir}"
+    echo -e "  ${DIM}请手动确认软链: ${shared_dir} -> ${shared_source_dir}${NC}"
+    return 1
+}
+
+
 hard_check_sandbox_shared_contract() {
-    # 硬校验：沙箱 agent 的共享目录契约必须成立（<workspace>/shared -> /app/shared）
+    # 硬校验：沙箱 agent 的共享目录契约必须成立（workspace/shared -> /app/shared/<agent_id>）
     if ! cmd_exists python3; then
         warn "未找到 python3，跳过共享目录契约校验"
         return 0
@@ -281,22 +1277,24 @@ for agent in agents:
         errors.append(f"{agent_id}: workspaceAccess 不是 rw（当前: {sandbox.get('workspaceAccess')}）")
 
     workspace = agent.get('workspace') or os.path.expanduser(f"~/.openclaw/workspace-{agent_id}")
-    shared = os.path.join(workspace, 'shared')
+    shared_src = os.path.join(workspace, 'shared')
+    shared_dst = os.path.join('/app/shared', agent_id)
 
-    if not os.path.isdir(workspace):
-        errors.append(f"{agent_id}: workspace 不存在: {workspace}")
+    if not os.path.exists(shared_src):
+        os.makedirs(shared_src, exist_ok=True)
+        notes.append(f"{agent_id}: 已自动创建共享目录 {shared_src}")
+
+    if not os.path.lexists(shared_dst):
+        errors.append(f"{agent_id}: 缺少宿主机暴露路径 {shared_dst}（应软链到 {shared_src}）")
         continue
 
-    if not os.path.exists(shared):
-        os.makedirs(shared, exist_ok=True)
-        notes.append(f"{agent_id}: 已自动创建共享目录 {shared}")
-
-    if os.path.realpath(shared) != os.path.realpath(os.path.join(workspace, 'shared')):
-        errors.append(f"{agent_id}: 共享目录路径异常: {shared}")
+    if os.path.realpath(shared_dst) != os.path.realpath(shared_src):
+        errors.append(f"{agent_id}: 宿主机暴露路径异常（当前: {shared_dst} -> {os.path.realpath(shared_dst)}，期望: {shared_src}）")
+        continue
 
     docker_cfg = sandbox.get('docker', {})
-    expected_src = os.path.realpath(shared)
-    expected_dst = '/app/shared'
+    expected_src = os.path.realpath(shared_src)
+    expected_dst = shared_dst
     mount_ok = False
 
     for item in (docker_cfg.get('binds') or []):
@@ -322,7 +1320,7 @@ for agent in agents:
                 break
 
     if not mount_ok:
-        errors.append(f"{agent_id}: 缺少共享目录挂载（需要 {shared} -> /app/shared）")
+        errors.append(f"{agent_id}: 缺少共享目录挂载（需要 {shared_src} -> {shared_dst}）")
 
 if errors:
     print('SANDBOX_SHARED_CONTRACT_FAILED')
@@ -349,7 +1347,7 @@ PYEOF
     fi
 
     if [[ "$check_output" == *"SANDBOX_SHARED_CONTRACT_OK"* ]]; then
-        success "沙箱共享目录契约校验通过（容器内路径: /app/shared）"
+        success "沙箱共享目录契约校验通过（workspace/shared 已挂到 /app/shared/<agent_id>）"
         if echo "$check_output" | grep -q "^- "; then
             echo "$check_output" | grep "^- "
         fi
@@ -360,7 +1358,9 @@ PYEOF
             if [[ -n "$containers" ]]; then
                 while IFS= read -r c; do
                     [[ -z "$c" ]] && continue
-                    if ! docker exec -w /workspace "$c" sh -lc 'mkdir -p /app/shared && touch /app/shared/.probe && rm -f /app/shared/.probe' >/dev/null 2>&1; then
+                    local agent_id
+                    agent_id="${c#openclaw-sbx-agent-}"
+                    if ! docker exec -w /workspace "$c" sh -lc "mkdir -p '/app/shared/${agent_id}' && touch '/app/shared/${agent_id}/.probe' && rm -f '/app/shared/${agent_id}/.probe'" >/dev/null 2>&1; then
                         warn "运行时共享目录探针失败: ${c}"
                         probe_failed=1
                     fi
@@ -503,152 +1503,553 @@ select_option() {
     fi
 }
 
+
+cleanup_openclaw_sandbox_containers() {
+    # 清理历史沙箱容器（重装时使用）
+    if ! cmd_exists docker; then
+        warn "未找到 Docker，跳过历史沙箱容器清理"
+        return 0
+    fi
+
+    show_current_sandbox_image_info
+
+    step "执行 openclaw sandbox recreate 清理历史容器..."
+    if cmd_exists openclaw; then
+        if openclaw sandbox recreate --all --force >/dev/null 2>&1; then
+            success "已执行 openclaw sandbox recreate --all --force"
+        else
+            warn "openclaw sandbox recreate 执行失败，继续检查 Docker 残留容器"
+        fi
+    else
+        warn "未找到 openclaw 命令，跳过官方清理命令，直接检查 Docker 残留容器"
+    fi
+
+    step "复查 Docker 残留沙箱容器..."
+    local existing
+    existing=$(docker ps -a --format '{{.Names}}' | grep -E '^openclaw-sbx-' || true)
+    if [[ -z "$existing" ]]; then
+        success "未检测到残留 OpenClaw 沙箱容器"
+        return 0
+    fi
+
+    warn "仍检测到孤儿沙箱容器"
+    local container removed=0 failed=0
+    while IFS= read -r container; do
+        [[ -z "$container" ]] && continue
+        echo -e "  ${YELLOW}残留容器:${NC} ${container}"
+    done <<< "$existing"
+
+    step "使用 docker rm -f 强制清理残留容器..."
+    while IFS= read -r container; do
+        [[ -z "$container" ]] && continue
+        if docker rm -f "$container" >/dev/null 2>&1; then
+            success "已强制删除孤儿沙箱容器: ${container}"
+            removed=$((removed + 1))
+        else
+            warn "删除沙箱容器失败: ${container}"
+            failed=$((failed + 1))
+        fi
+    done <<< "$existing"
+
+    if [[ "$failed" -gt 0 ]]; then
+        warn "历史沙箱容器清理完成（成功 ${removed}，失败 ${failed}）"
+        return 1
+    fi
+
+    success "历史沙箱容器清理完成（共 ${removed} 个）"
+    return 0
+}
+
+
+require_custom_sandbox_image() {
+    # 启用沙箱 Agent 时强制检查专用沙箱镜像是否已准备完成
+    if ! cmd_exists docker; then
+        error "未找到 Docker，无法启用 Docker 沙箱"
+        _print_sandbox_runtime_instructions
+        return 1
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        if sudo docker info >/dev/null 2>&1; then
+            echo ""
+            error "Docker 已安装并运行，但当前用户无 socket 访问权限"
+            warn "请执行以下任一操作后重新运行脚本："
+            echo ""
+            echo "  方式一（推荐）：重新 SSH 登录后再运行脚本"
+            echo "  方式二：在当前终端执行 'newgrp docker'，然后重新运行脚本"
+            echo "  方式三（临时兜底）：执行 'sudo chmod 777 /var/run/docker.sock' 后再运行脚本"
+            echo ""
+        else
+            error "Docker 未运行，无法启用 Docker 沙箱"
+        fi
+        return 1
+    fi
+
+    if [[ ! -f "$OPENCLAW_SANDBOX_DOCKERFILE" ]]; then
+        error "未找到专用沙箱镜像 Dockerfile: ${OPENCLAW_SANDBOX_DOCKERFILE}"
+        return 1
+    fi
+
+    if _sandbox_image_available; then
+        success "检测到专用沙箱镜像已存在: ${OPENCLAW_SANDBOX_IMAGE}"
+        return 0
+    fi
+
+    error "未检测到专用沙箱镜像: ${OPENCLAW_SANDBOX_IMAGE}"
+    warn "启用 Docker 沙箱 Agent 前，请先手动构建专用沙箱镜像"
+    _print_sandbox_runtime_instructions
+    return 1
+}
+
+
+_read_env_file_value() {
+    local env_file="$1"
+    local key="$2"
+    if [[ -z "$env_file" || ! -f "$env_file" ]]; then
+        echo ""
+        return 0
+    fi
+
+python3 - "$env_file" "$key" <<'PYEOF'
+import sys
+
+env_file = sys.argv[1]
+key = sys.argv[2]
+
+try:
+    with open(env_file, 'r', encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            if k.strip() != key:
+                continue
+            value = v.strip().strip('"').strip("'")
+            print(value)
+            break
+except Exception:
+    print('')
+PYEOF
+}
+
+
+_detect_gateway_env_file() {
+    local candidate
+    if [[ -n "${OPENCLAW_GATEWAY_ENV_FILE:-}" && -f "${OPENCLAW_GATEWAY_ENV_FILE}" ]]; then
+        echo "${OPENCLAW_GATEWAY_ENV_FILE}"
+        return 0
+    fi
+
+    for candidate in "/opt/openclaw/gateway/.env" "/opt/openclaw/.env" "${REPO_ROOT}/.env" "$(pwd)/.env"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    echo ""
+}
+
+
+_resolve_file_storage_mode() {
+    local mode env_file
+    mode="${FILE_STORAGE_MODE:-}"
+    if [[ -z "$mode" ]]; then
+        env_file="$(_detect_gateway_env_file)"
+        mode="$(_read_env_file_value "$env_file" "FILE_STORAGE_MODE")"
+    fi
+    mode="${mode:-local}"
+    mode="$(echo "$mode" | tr 'A-Z' 'a-z')"
+
+    case "$mode" in
+        local|s3)
+            echo "$mode"
+            ;;
+        *)
+            warn "检测到未知 FILE_STORAGE_MODE=${mode}，回退 local"
+            echo "local"
+            ;;
+    esac
+}
+
+
+UPLOAD_SKILL_GATEWAY_URL=""
+UPLOAD_SKILL_TOKEN=""
+UPLOAD_SKILL_EXPIRES=""
+UPLOAD_SKILL_SANDBOX_GATEWAY_URL=""
+
+
+_resolve_sandbox_upload_skill_gateway_url() {
+    local gateway_url="$1"
+
+python3 - "$gateway_url" <<'PYEOF'
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+gateway_url = (sys.argv[1] or '').strip()
+if not gateway_url:
+    print('')
+    sys.exit(0)
+
+try:
+    parsed = urlsplit(gateway_url)
+except Exception:
+    print(gateway_url)
+    sys.exit(0)
+
+hostname = (parsed.hostname or '').strip().lower()
+if hostname not in {'localhost', '127.0.0.1', '::1'}:
+    print(gateway_url)
+    sys.exit(0)
+
+netloc = parsed.netloc
+if '@' in netloc:
+    userinfo, hostport = netloc.rsplit('@', 1)
+    prefix = f'{userinfo}@'
+else:
+    prefix = ''
+    hostport = netloc
+
+if hostport.startswith('['):
+    closing = hostport.find(']')
+    remainder = hostport[closing + 1:] if closing >= 0 else ''
+else:
+    remainder = ''
+    if ':' in hostport:
+        remainder = hostport[hostport.find(':'):]
+
+new_netloc = f'{prefix}host.docker.internal{remainder}'
+print(urlunsplit((parsed.scheme, new_netloc, parsed.path, parsed.query, parsed.fragment)))
+PYEOF
+}
+
+
+_resolve_gateway_skill_runtime_values() {
+    local env_file
+    env_file="$(_detect_gateway_env_file)"
+
+    UPLOAD_SKILL_GATEWAY_URL="${OPENCLAW_FILE_UPLOAD_GATEWAY_URL:-}"
+    UPLOAD_SKILL_TOKEN="${OPENCLAW_FILE_UPLOAD_TOKEN:-}"
+    UPLOAD_SKILL_EXPIRES="${OPENCLAW_FILE_UPLOAD_EXPIRES:-}"
+
+    if [[ -z "$UPLOAD_SKILL_GATEWAY_URL" ]]; then
+        UPLOAD_SKILL_GATEWAY_URL="$(_read_env_file_value "$env_file" "GATEWAY_URL")"
+    fi
+    if [[ -z "$UPLOAD_SKILL_GATEWAY_URL" ]]; then
+        UPLOAD_SKILL_GATEWAY_URL="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_FILE_UPLOAD_GATEWAY_URL")"
+    fi
+    if [[ -z "$UPLOAD_SKILL_TOKEN" ]]; then
+        UPLOAD_SKILL_TOKEN="$(_read_env_file_value "$env_file" "FILE_UPLOAD_INTERNAL_TOKEN")"
+    fi
+    if [[ -z "$UPLOAD_SKILL_TOKEN" ]]; then
+        UPLOAD_SKILL_TOKEN="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_FILE_UPLOAD_TOKEN")"
+    fi
+    if [[ -z "$UPLOAD_SKILL_EXPIRES" ]]; then
+        UPLOAD_SKILL_EXPIRES="$(_read_env_file_value "$env_file" "FILE_STORAGE_PRESIGN_EXPIRES")"
+    fi
+    if [[ -z "$UPLOAD_SKILL_EXPIRES" ]]; then
+        UPLOAD_SKILL_EXPIRES="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_FILE_UPLOAD_EXPIRES")"
+    fi
+
+    UPLOAD_SKILL_GATEWAY_URL="${UPLOAD_SKILL_GATEWAY_URL:-http://localhost:8000}"
+    UPLOAD_SKILL_EXPIRES="${UPLOAD_SKILL_EXPIRES:-86400}"
+    UPLOAD_SKILL_SANDBOX_GATEWAY_URL="$(_resolve_sandbox_upload_skill_gateway_url "$UPLOAD_SKILL_GATEWAY_URL")"
+}
+
+
+_list_openclaw_agent_workspaces() {
+    if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
+        return 0
+    fi
+
+python3 - "$OPENCLAW_CONFIG" "$OPENCLAW_HOME" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+config_path, openclaw_home = sys.argv[1:3]
+
+with open(config_path, 'r', encoding='utf-8') as f:
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
+
+agents_cfg = config.get('agents', {})
+defaults = agents_cfg.get('defaults', {})
+default_workspace = defaults.get('workspace') or os.path.join(openclaw_home, 'workspace')
+
+seen = set()
+for agent in agents_cfg.get('list', []):
+    agent_id = (agent.get('id') or '').strip()
+    if not agent_id:
+        continue
+    workspace = (agent.get('workspace') or '').strip()
+    if not workspace:
+        if agent_id == 'main':
+            workspace = default_workspace
+        else:
+            workspace = os.path.join(openclaw_home, f'workspace-{agent_id}')
+    workspace = os.path.abspath(os.path.expanduser(workspace))
+    print(f"{agent_id}\t{workspace}")
+    seen.add(agent_id)
+
+if 'main' not in seen:
+    workspace = os.path.abspath(os.path.expanduser(default_workspace))
+    print(f"main\t{workspace}")
+PYEOF
+}
+
+
+_sync_gateway_skill_to_workspace() {
+    local agent_id="$1"
+    local workspace="$2"
+
+    if [[ -z "$workspace" ]]; then
+        return 0
+    fi
+
+    local target_dir="${workspace}/skills/${GATEWAY_SKILL_NAME}"
+
+    if [[ ! -d "$GATEWAY_SKILL_SOURCE_DIR" ]]; then
+        error "未找到 Skill 模板目录: $GATEWAY_SKILL_SOURCE_DIR"
+        return 1
+    fi
+
+    mkdir -p "${workspace}/skills"
+    rm -rf "$target_dir"
+    cp -R "$GATEWAY_SKILL_SOURCE_DIR" "$target_dir"
+    chmod +x "$target_dir/upload_to_gateway.py" 2>/dev/null || true
+    step "已同步 Skill 到 agent=${agent_id} 的 workspace: ${workspace}/skills"
+}
+
+
+_sync_gateway_skill_to_all_workspaces() {
+    local count=0
+    local line agent_id workspace
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        agent_id="${line%%$'\t'*}"
+        workspace="${line#*$'\t'}"
+        if [[ "$workspace" == "$line" ]]; then
+            continue
+        fi
+        _sync_gateway_skill_to_workspace "$agent_id" "$workspace"
+        count=$((count + 1))
+    done < <(_list_openclaw_agent_workspaces)
+
+    success "已向 ${count} 个 workspace 安装上传 Skill"
+}
+
+
+_configure_gateway_skill_runtime_env() {
+    local enabled="$1"
+    local gateway_url="$2"
+    local upload_token="$3"
+    local expires_seconds="$4"
+    local sandbox_gateway_url
+    local runtime_summary
+
+    if ! cmd_exists python3 || [[ ! -f "$OPENCLAW_CONFIG" ]]; then
+        warn "未找到 OpenClaw 配置文件或 python3，跳过 Skill 环境写入"
+        return 0
+    fi
+
+    sandbox_gateway_url="$(_resolve_sandbox_upload_skill_gateway_url "$gateway_url")"
+    _write_upload_skill_env_to_openclaw_env_file "$gateway_url" "$upload_token" "$expires_seconds"
+
+    runtime_summary="$(python3 - "$OPENCLAW_CONFIG" "$GATEWAY_SKILL_NAME" "$enabled" "$gateway_url" "$sandbox_gateway_url" "$upload_token" "$expires_seconds" <<'PYEOF'
+import json
+import re
+import sys
+from urllib.parse import urlsplit
+
+config_path, skill_key, enabled_raw, gateway_url, sandbox_gateway_url, upload_token, expires_seconds = sys.argv[1:8]
+enabled = enabled_raw.lower() == 'true'
+managed_keys = [
+    'OPENCLAW_FILE_UPLOAD_GATEWAY_URL',
+    'OPENCLAW_FILE_UPLOAD_TOKEN',
+    'OPENCLAW_FILE_UPLOAD_EXPIRES',
+]
+managed_extra_host = 'host.docker.internal:host-gateway'
+
+with open(config_path, 'r', encoding='utf-8') as f:
+    content = f.read()
+
+try:
+    config = json.loads(content)
+except json.JSONDecodeError:
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r',\s*([}\]])', r'\1', content)
+    config = json.loads(content)
+
+skills = config.setdefault('skills', {})
+entries = skills.setdefault('entries', {})
+entry = entries.setdefault(skill_key, {})
+entry['enabled'] = bool(enabled)
+entry_env = entry.get('env')
+if isinstance(entry_env, dict):
+    for key in managed_keys:
+        entry_env.pop(key, None)
+    if not entry_env:
+        entry.pop('env', None)
+
+updates = {
+    'OPENCLAW_FILE_UPLOAD_GATEWAY_URL': gateway_url if enabled else '',
+    'OPENCLAW_FILE_UPLOAD_TOKEN': upload_token if enabled else '',
+    'OPENCLAW_FILE_UPLOAD_EXPIRES': expires_seconds if enabled else '',
+}
+
+sandbox_updates = {
+    'OPENCLAW_FILE_UPLOAD_GATEWAY_URL': sandbox_gateway_url if enabled else '',
+    'OPENCLAW_FILE_UPLOAD_TOKEN': upload_token if enabled else '',
+    'OPENCLAW_FILE_UPLOAD_EXPIRES': expires_seconds if enabled else '',
+}
+
+agents = config.setdefault('agents', {})
+defaults = agents.setdefault('defaults', {})
+default_sandbox = defaults.setdefault('sandbox', {})
+default_docker = default_sandbox.setdefault('docker', {})
+default_env = default_docker.get('env')
+if isinstance(default_env, dict):
+    for key in managed_keys:
+        default_env.pop(key, None)
+    if not default_env:
+        default_docker.pop('env', None)
+
+
+def sandbox_enabled(agent):
+    sandbox = agent.get('sandbox')
+    if not isinstance(sandbox, dict):
+        return False
+    mode = str(sandbox.get('mode', '')).strip().lower()
+    return mode not in ('', 'off', 'none', 'disabled', 'false')
+
+
+def apply_updates_to_docker_env(docker_cfg, values):
+    env = docker_cfg.get('env')
+    if not isinstance(env, dict):
+        env = {}
+        docker_cfg['env'] = env
+
+    for key, value in values.items():
+        if value:
+            env[key] = str(value)
+        else:
+            env.pop(key, None)
+
+    if not env:
+        docker_cfg.pop('env', None)
+
+
+def ensure_managed_extra_host(docker_cfg, enabled_flag):
+    extra_hosts = docker_cfg.get('extraHosts')
+    if not isinstance(extra_hosts, list):
+        extra_hosts = []
+
+    normalized = [item for item in extra_hosts if isinstance(item, str) and item.strip()]
+    normalized = [item for item in normalized if item != managed_extra_host]
+    if enabled_flag:
+        normalized.append(managed_extra_host)
+
+    if normalized:
+        docker_cfg['extraHosts'] = normalized
+    else:
+        docker_cfg.pop('extraHosts', None)
+
+
+def needs_host_gateway_alias(url):
+    try:
+        hostname = (urlsplit(url).hostname or '').strip().lower()
+    except Exception:
+        return False
+    return hostname == 'host.docker.internal'
+
+
+sandbox_agent_ids = []
+for agent in agents.get('list', []):
+    sandbox = agent.get('sandbox')
+    if not isinstance(sandbox, dict):
+        continue
+
+    docker = sandbox.setdefault('docker', {})
+    if sandbox_enabled(agent):
+        apply_updates_to_docker_env(docker, sandbox_updates)
+        ensure_managed_extra_host(docker, bool(enabled and sandbox_gateway_url and needs_host_gateway_alias(sandbox_gateway_url)))
+        sandbox_agent_ids.append((agent.get('id') or '').strip())
+    else:
+        apply_updates_to_docker_env(docker, {
+            'OPENCLAW_FILE_UPLOAD_GATEWAY_URL': '',
+            'OPENCLAW_FILE_UPLOAD_TOKEN': '',
+            'OPENCLAW_FILE_UPLOAD_EXPIRES': '',
+        })
+        ensure_managed_extra_host(docker, False)
+
+with open(config_path, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+
+print(f"{len([x for x in sandbox_agent_ids if x])}\t{','.join([x for x in sandbox_agent_ids if x])}")
+PYEOF
+)"
+
+    UPLOAD_SKILL_SANDBOX_AGENT_COUNT="${runtime_summary%%$'\t'*}"
+    if [[ "$UPLOAD_SKILL_SANDBOX_AGENT_COUNT" == "$runtime_summary" ]]; then
+        UPLOAD_SKILL_SANDBOX_AGENT_IDS=""
+    else
+        UPLOAD_SKILL_SANDBOX_AGENT_IDS="${runtime_summary#*$'\t'}"
+    fi
+}
+
+
+setup_gateway_file_upload_skill() {
+    if [[ ! -d "$GATEWAY_SKILL_SOURCE_DIR" ]]; then
+        error "未找到 Skill 模板目录: $GATEWAY_SKILL_SOURCE_DIR"
+        return 1
+    fi
+
+    mkdir -p "${OPENCLAW_HOME}/skills"
+    rm -rf "$GATEWAY_SKILL_TARGET_DIR"
+    cp -R "$GATEWAY_SKILL_SOURCE_DIR" "$GATEWAY_SKILL_TARGET_DIR"
+    chmod +x "$GATEWAY_SKILL_TARGET_DIR/upload_to_gateway.py" 2>/dev/null || true
+    success "已安装全局 Skill: ${GATEWAY_SKILL_NAME}"
+
+    _resolve_gateway_skill_runtime_values
+
+    if [[ -z "$UPLOAD_SKILL_TOKEN" ]]; then
+        warn "未配置 OPENCLAW_FILE_UPLOAD_TOKEN / FILE_UPLOAD_INTERNAL_TOKEN，Skill 调用会失败"
+    fi
+
+    _configure_gateway_skill_runtime_env "true" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES"
+    _sync_gateway_skill_to_all_workspaces
+    step "已写入 Skill 运行环境（Gateway: ${UPLOAD_SKILL_GATEWAY_URL}，Expires: ${UPLOAD_SKILL_EXPIRES}s）"
+    echo -e "  ${DIM}非沙箱 Agent：变量已写入 ${OPENCLAW_ENV_FILE}${NC}"
+    echo -e "  ${DIM}脚本结束前会统一重启一次 OpenClaw Gateway，使非沙箱 Agent 配置生效${NC}"
+    if [[ "${UPLOAD_SKILL_SANDBOX_AGENT_COUNT:-0}" -gt 0 ]]; then
+        echo -e "  ${DIM}沙箱 Agent：变量已写入 ${UPLOAD_SKILL_SANDBOX_AGENT_COUNT} 个 agent 的 sandbox.docker.env${NC}"
+        if [[ "${UPLOAD_SKILL_SANDBOX_GATEWAY_URL:-}" != "${UPLOAD_SKILL_GATEWAY_URL}" ]]; then
+            echo -e "  ${DIM}检测到上传地址使用 localhost，沙箱内已自动改为: ${UPLOAD_SKILL_SANDBOX_GATEWAY_URL}${NC}"
+        fi
+        if [[ -n "${UPLOAD_SKILL_SANDBOX_AGENT_IDS:-}" ]]; then
+            echo -e "  ${DIM}涉及的沙箱 Agent: ${UPLOAD_SKILL_SANDBOX_AGENT_IDS}${NC}"
+        fi
+        echo -e "  ${DIM}若沙箱容器已存在，请执行: openclaw sandbox recreate --agent <agent_id>${NC}"
+    else
+        echo -e "  ${DIM}当前未检测到启用沙箱的 Agent，未写入 sandbox.docker.env${NC}"
+    fi
+}
+
 # ============================================================================
 # 第一步：检查环境 & 安装 OpenClaw
 # ============================================================================
-
-check_and_install_openclaw() {
-    header "第一步：检查环境 & 安装 OpenClaw"
-
-    # --- 检查 Node.js ---
-    if cmd_exists node; then
-        local node_version
-        node_version=$(node -v | sed 's/v//' | cut -d. -f1)
-        if (( node_version < MIN_NODE_VERSION )); then
-            error "Node.js 版本 $(node -v) 过低，需要 v${MIN_NODE_VERSION}+"
-            echo "  推荐: nvm install ${MIN_NODE_VERSION} && nvm use ${MIN_NODE_VERSION}"
-            exit 1
-        fi
-        success "Node.js $(node -v)"
-    else
-        error "未找到 Node.js，需要 v${MIN_NODE_VERSION}+"
-        echo "  推荐安装方法:"
-        echo "    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"
-        echo "    nvm install ${MIN_NODE_VERSION}"
-        exit 1
-    fi
-
-    # --- 检查 npm ---
-    if cmd_exists npm; then
-        success "npm $(npm -v)"
-    else
-        error "未找到 npm"
-        exit 1
-    fi
-
-    # --- 检查 Docker（可选，沙箱 agent 需要）---
-    if cmd_exists docker; then
-        if docker info &>/dev/null; then
-            success "Docker $(docker --version | sed -E 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-        else
-            warn "Docker 已安装但未运行。沙箱 Agent 需要 Docker"
-        fi
-    else
-        warn "未找到 Docker。沙箱 Agent 需要 Docker，主 Agent 不受影响"
-    fi
-
-    # --- 检查/安装 OpenClaw ---
-    if cmd_exists openclaw; then
-        local current_version
-        current_version=$(openclaw --version 2>/dev/null || echo "unknown")
-        success "OpenClaw 已安装 (v${current_version})"
-
-        echo ""
-        printf "%s" "是否清理当前安装并重新配置? [y/N]: "
-        read -r reinstall_yn </dev/tty
-        if [[ "$reinstall_yn" =~ ^[Yy] ]]; then
-            step "清理当前 OpenClaw 安装..."
-            openclaw gateway stop 2>/dev/null || true
-            rm -rf "$OPENCLAW_HOME"
-            success "清理完成，启动 OpenClaw 初始化向导..."
-            echo ""
-            openclaw onboard --install-daemon
-            success "OpenClaw 初始化完成"
-        fi
-    else
-        step "安装 OpenClaw..."
-        echo ""
-        echo "选择安装方式:"
-        echo "  1) npm install -g openclaw@latest (推荐)"
-        echo "  2) curl -fsSL https://openclaw.ai/install.sh | bash"
-        echo ""
-
-        local install_method
-        read -p "请输入选项 [1-2, 默认 2]: " install_method
-        install_method="${install_method:-2}"
-
-        case "$install_method" in
-            1)
-                # 尝试不用 sudo，如果失败再提示
-                if npm install -g openclaw@latest 2>/dev/null; then
-                    success "OpenClaw 安装成功（用户级）"
-                else
-                    warn "用户级安装失败，需要 sudo 权限"
-                    if sudo -n true 2>/dev/null; then
-                        sudo npm install -g openclaw@latest
-                    else
-                        error "需要 sudo 权限但无法获取。请手动运行: sudo npm install -g openclaw@latest"
-                        exit 1
-                    fi
-                fi
-                ;;
-            2)
-                curl -fsSL https://openclaw.ai/install.sh | bash
-                ;;
-            *)
-                warn "无效选项，使用默认方式（curl）"
-                curl -fsSL https://openclaw.ai/install.sh | bash
-                ;;
-        esac
-
-        if ! cmd_exists openclaw; then
-            error "安装失败，请检查输出并重试"
-            error "你可以手动安装："
-            echo "  方式1: sudo npm install -g openclaw@latest"
-            echo "  方式2: curl -fsSL https://openclaw.ai/install.sh | bash"
-            exit 1
-        fi
-        success "OpenClaw $(openclaw --version) 安装成功"
-    fi
-
-    # --- 首次初始化（如果没有配置文件）---
-    if [[ ! -f "$OPENCLAW_CONFIG" ]]; then
-        step "首次初始化 OpenClaw..."
-        echo -e "${DIM}将启动 OpenClaw 交互式配置向导...${NC}"
-        echo ""
-        openclaw onboard --install-daemon
-        success "OpenClaw 初始化完成"
-    else
-        success "OpenClaw 配置已存在: ${OPENCLAW_CONFIG}"
-    fi
-
-    # --- 确保 gateway 已启动 ---
-    step "检查 Gateway 状态..."
-    if openclaw health &>/dev/null; then
-        success "Gateway 已在运行"
-    else
-        step "启动 Gateway..."
-        openclaw gateway start &>/dev/null &
-        sleep 3
-        if openclaw health &>/dev/null; then
-            success "Gateway 启动成功"
-        else
-            warn "Gateway 启动失败，Agent 创建可能受影响，请稍后手动运行: openclaw gateway start"
-        fi
-    fi
-
-    # --- 对齐 Gateway token（auth/remote）---
-    echo ""
-    step "同步 Gateway token 配置..."
-    sync_gateway_tokens
-    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
-        step "检测到 token 变更，重启 Gateway 使配置生效..."
-        openclaw gateway restart >/dev/null 2>&1 || {
-            warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
-        }
-        sleep 2
-    fi
-}
 
 # ============================================================================
 # 第二步：配置模型提供商
@@ -1033,7 +2434,10 @@ create_agent() {
 
     local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
     local agent_dir="${OPENCLAW_HOME}/agents/${agent_id}/agent"
-
+    local shared_dir
+    local shared_source_dir
+    shared_dir="$(shared_dir_for_agent "$agent_id")"
+    shared_source_dir="$(shared_source_dir_for_agent "$agent_id")"
     # 检查是否已存在
     if openclaw agents list 2>/dev/null | grep -q "^- ${agent_id}"; then
         warn "Agent '${agent_id}' 已存在"
@@ -1072,13 +2476,17 @@ except json.JSONDecodeError:
     content = re.sub(r',\s*([}\]])', r'\1', content)
     config = json.loads(content)
 
-agents = config.setdefault("agents", {}).setdefault("list", [])
+            agents = config.setdefault("agents", {}).setdefault("list", [])
 existing_ids = [a.get("id") for a in agents]
 if "${agent_id}" not in existing_ids:
     agents.append({
         "id": "${agent_id}",
         "name": "${agent_name}",
-        "workspace": "${workspace}"
+        "workspace": "${workspace}",
+        "agentDir": "${agent_dir}",
+        "identity": {
+            "name": "${agent_name}"
+        }
     })
 
 with open(config_path, "w") as f:
@@ -1092,10 +2500,22 @@ PYEOF
         mkdir -p "$workspace"
     fi
 
+    if ensure_shared_dir_for_agent "$agent_id"; then
+        step "共享目录已就绪: ${shared_dir} -> ${shared_source_dir}"
+    else
+        warn "共享目录未就绪，后续请手动确认: ${shared_dir} -> ${shared_source_dir}"
+    fi
+
+    _sync_gateway_skill_to_workspace "$agent_id" "$workspace"
+
     # 配置沙箱（非 main agent）
     if [[ "$use_sandbox" == "true" && "$agent_id" != "main" ]]; then
+        if ! require_custom_sandbox_image; then
+            error "专用沙箱镜像未就绪，无法为 Agent '${agent_id}' 配置沙箱"
+            return 1
+        fi
         step "配置 Docker 沙箱..."
-        _configure_sandbox "$agent_id"
+        _configure_sandbox "$agent_id" "$agent_name" "$shared_source_dir" "$shared_dir"
     fi
 
     # 设置 agent 名称和身份
@@ -1120,6 +2540,8 @@ PYEOF
     success "Agent '${agent_id}' 创建成功"
     echo -e "  ${DIM}Workspace: ${workspace}${NC}"
     echo -e "  ${DIM}Agent Dir: ${agent_dir}${NC}"
+    echo -e "  ${DIM}Shared Dir: ${shared_dir}${NC}"
+    echo -e "  ${DIM}Shared Src: ${shared_source_dir}${NC}"
     echo ""
 
     return 0
@@ -1128,18 +2550,31 @@ PYEOF
 # 配置沙箱（内部函数）
 _configure_sandbox() {
     local agent_id="$1"
+    local agent_name_input="${2:-$1}"
+    local shared_source_dir="${3:-$(shared_source_dir_for_agent "$agent_id")}"
+    local shared_dir="${4:-$(shared_dir_for_agent "$agent_id")}"
     local workspace="${OPENCLAW_HOME}/workspace-${agent_id}"
-    local shared_dir="${workspace}/shared"
+    local agent_dir="${OPENCLAW_HOME}/agents/${agent_id}/agent"
+    local sandbox_image="$OPENCLAW_SANDBOX_IMAGE"
+    local storage_mode
+    storage_mode="$(_resolve_file_storage_mode)"
+    _resolve_gateway_skill_runtime_values
 
-    # 确保共享目录存在。
-    # 约定：容器内通过 /app/shared 访问（避免 /workspace 保留挂载前缀冲突）
-    mkdir -p "$shared_dir"
+    # 约定：workspace 内 shared 目录作为挂载源，对外统一暴露为 /app/shared/<agent_id>。
+    ensure_shared_dir_for_agent "$agent_id" || true
+    mkdir -p "$agent_dir"
 
     if cmd_exists python3; then
-        python3 << PYEOF
-import json, os, re
+        python3 - "$OPENCLAW_CONFIG" "$agent_id" "$agent_name_input" "$workspace" "$agent_dir" "$shared_source_dir" "$shared_dir" "$sandbox_image" "$storage_mode" "$UPLOAD_SKILL_GATEWAY_URL" "$UPLOAD_SKILL_SANDBOX_GATEWAY_URL" "$UPLOAD_SKILL_TOKEN" "$UPLOAD_SKILL_EXPIRES" <<'PYEOF'
+import json
+import os
+import re
+import sys
+from urllib.parse import urlsplit
 
-config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+config_path, agent_id, agent_name_raw, workspace, agent_dir, shared_source_dir, shared_dir, sandbox_image, storage_mode, gateway_url, sandbox_gateway_url, upload_token, upload_expires = sys.argv[1:14]
+agent_name = (agent_name_raw or agent_id or '').strip() or agent_id
+
 with open(config_path, "r") as f:
     content = f.read()
 
@@ -1151,29 +2586,81 @@ except json.JSONDecodeError:
     content = re.sub(r',\s*([}\]])', r'\1', content)
     config = json.loads(content)
 
-shared_dir = "${shared_dir}"
+agents_cfg = config.setdefault("agents", {})
+agents_list = agents_cfg.setdefault("list", [])
 
-agents_list = config.get("agents", {}).get("list", [])
+target = None
 for agent in agents_list:
-    if agent.get("id") == "${agent_id}":
-        agent["sandbox"] = {
-            "mode": "all",
-            "scope": "agent",
-            "workspaceAccess": "rw",
-            "docker": {
-                "network": "bridge",
-                "readOnlyRoot": False,
-                "binds": [
-                    f"{shared_dir}:/app/shared:rw"
-                ]
-            }
-        }
+    if agent.get("id") == agent_id:
+        target = agent
         break
+
+if target is None:
+    target = {"id": agent_id}
+    agents_list.append(target)
+
+target["id"] = agent_id
+target["name"] = agent_name
+target["workspace"] = workspace
+target["agentDir"] = agent_dir
+target["identity"] = {"name": agent_name}
+
+docker_cfg = {
+    "readOnlyRoot": False,
+    "network": "bridge",
+    "image": sandbox_image,
+    "binds": [
+        f"{shared_source_dir}:{shared_dir}:rw"
+    ],
+    "env": {}
+}
+
+if gateway_url:
+    docker_cfg["env"]["OPENCLAW_FILE_UPLOAD_GATEWAY_URL"] = sandbox_gateway_url or gateway_url
+if upload_token:
+    docker_cfg["env"]["OPENCLAW_FILE_UPLOAD_TOKEN"] = upload_token
+if upload_expires:
+    docker_cfg["env"]["OPENCLAW_FILE_UPLOAD_EXPIRES"] = str(upload_expires)
+if not docker_cfg["env"]:
+    docker_cfg.pop("env", None)
+
+try:
+    sandbox_gateway_host = (urlsplit(sandbox_gateway_url or '').hostname or '').strip().lower()
+except Exception:
+    sandbox_gateway_host = ''
+
+if sandbox_gateway_host == 'host.docker.internal':
+    docker_cfg["extraHosts"] = ["host.docker.internal:host-gateway"]
+
+target["sandbox"] = {
+    "mode": "all",
+    "workspaceAccess": "rw",
+    "scope": "agent",
+    "docker": docker_cfg,
+}
+
+defaults = agents_cfg.setdefault("defaults", {})
+default_sandbox = defaults.setdefault("sandbox", {})
+default_docker = default_sandbox.setdefault("docker", {})
+default_docker["image"] = sandbox_image
+default_docker.pop("setupCommand", None)
+
+target["tools"] = {
+    "allow": [
+        "group:fs",
+        "group:runtime",
+        "group:memory",
+        "group:sessions",
+    ],
+    "deny": [
+        "apply_patch"
+    ],
+}
 
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 PYEOF
-        success "沙箱配置已写入（共享目录: ${shared_dir}，容器内路径: /app/shared）"
+        success "沙箱模板配置已写入（挂载源: ${shared_source_dir}，容器路径: ${shared_dir}）"
     else
         warn "未找到 python3，请手动配置沙箱"
     fi
@@ -1236,6 +2723,14 @@ edit_agent_persona() {
 
 configure_agents() {
     header "第三步：创建和配置 Agent"
+    local sandbox_default_yn="y"
+    local sandbox_prompt_suffix="(直接回车默认 Yes) [Y/n]"
+    local gateway_restarted_before_agents="false"
+
+    if [[ "${PLAN_CREATE_SANDBOX_AGENT}" != "true" ]]; then
+        sandbox_default_yn="n"
+        sandbox_prompt_suffix="(直接回车默认 No) [y/N]"
+    fi
 
     # 显示当前 Agent
     step "当前已配置的 Agent:"
@@ -1260,6 +2755,11 @@ configure_agents() {
             break
         fi
 
+        if [[ "$gateway_restarted_before_agents" != "true" ]]; then
+            restart_gateway_for_stage "添加 Agent 前" || true
+            gateway_restarted_before_agents="true"
+        fi
+
         echo ""
         printf "%s" "Agent ID (英文标识, 如 development, testing, service): "
         read -r agent_id </dev/tty
@@ -1272,9 +2772,10 @@ configure_agents() {
         read -r agent_name </dev/tty
         agent_name="${agent_name:-$agent_id}"
 
-        printf "%s" "是否启用 Docker 沙箱? (直接回车默认 Yes) [Y/n]: "
+        echo "说明: 仅启用沙箱时才需要 Docker 和专用沙箱镜像；非沙箱 Agent 无需 Docker。"
+        printf "%s" "是否启用 Docker 沙箱? ${sandbox_prompt_suffix}: "
         read -r sandbox_yn </dev/tty
-        sandbox_yn="${sandbox_yn:-y}"
+        sandbox_yn="${sandbox_yn:-$sandbox_default_yn}"
         if [[ "$sandbox_yn" =~ ^[Yy] ]]; then
             use_sandbox="true"
         else
@@ -1308,7 +2809,13 @@ configure_gateway_integration() {
     # 读取 Gateway 配置
     local gw_port gw_token
     gw_port=$(config_get "gateway.port" 2>/dev/null || echo "18789")
-    gw_token=$(_read_token_from_config_file "auth")
+    gw_token="${OPENCLAW_GATEWAY_TOKEN:-}"
+    if [[ -z "$gw_token" ]]; then
+        gw_token="$(_read_env_file_value "$OPENCLAW_ENV_FILE" "OPENCLAW_GATEWAY_TOKEN")"
+    fi
+    if [[ -z "$gw_token" ]]; then
+        gw_token="$(_read_token_from_config_file "auth")"
+    fi
 
     echo "OpenClaw Gateway 配置:"
     echo -e "  端口: ${BOLD}${gw_port}${NC}"
@@ -1317,11 +2824,7 @@ configure_gateway_integration() {
 
     # 检查 .env 文件
     local env_file
-    env_file="$(dirname "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")")/.env"
-
-    if [[ ! -f "$env_file" ]]; then
-        env_file="$(pwd)/.env"
-    fi
+    env_file="$(_detect_gateway_env_file)"
 
     if [[ -f "$env_file" ]]; then
         step "检测到 Gateway .env 文件: ${env_file}"
@@ -1329,25 +2832,27 @@ configure_gateway_integration() {
         # 显示当前 Gateway 需要的 OpenClaw 连接信息
         echo ""
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
-        echo -e "  ${BOLD}OPENCLAW_URL${NC}=http://localhost:${gw_port}"
-        echo -e "  ${BOLD}OPENCLAW_TOKEN${NC}=${gw_token}"
+        echo -e "  ${BOLD}Gateway URL${NC}: http://localhost:${gw_port}"
+        echo -e "  ${BOLD}Gateway Token${NC}: ${gw_token}"
         echo ""
-        echo "在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 openclaw_url 和 openclaw_token。"
-        echo "不同 Agent 通过 openclaw_agent_id 区分（如 main, development, testing）。"
+        echo "在 04-manage-agent.sh add 时使用以上信息配置每个 Agent 的 Gateway 地址和 Gateway Token。"
+        echo "Agent ID 同时作为 OpenClaw agent_id 与 SQLite 路由名。"
         echo ""
-        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /app/shared 访问）:"
-        echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
+        echo "共享文件目录（Gateway 向 Agent 下发的固定路径）:"
+        echo -e "  对外路径: ${BOLD}/app/shared/<agent_id>${NC}"
+        echo -e "  实际来源: ${BOLD}~/.openclaw/workspace-<agent_id>/shared${NC}（通过软链 + bind 暴露）"
     else
         echo "企业微信 Gateway 连接 OpenClaw 所需信息:"
-        echo -e "  ${BOLD}OpenClaw URL${NC}: http://localhost:${gw_port}"
-        echo -e "  ${BOLD}OpenClaw Token${NC}: ${gw_token}"
+        echo -e "  ${BOLD}Gateway URL${NC}: http://localhost:${gw_port}"
+        echo -e "  ${BOLD}Gateway Token${NC}: ${gw_token}"
         echo ""
         echo "添加 Gateway Agent 绑定时使用:"
-        echo -e "  ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
-        echo "  在交互式提示中填入以上 URL 和 Token，以及对应的 openclaw_agent_id。"
+        echo -e "  ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add [agent_id]${NC}"
+        echo "  在交互式提示中填入以上 URL 和 Token，并保持 Agent ID 与路由名一致。"
         echo ""
-        echo "共享文件目录（Gateway 下载的文件保存于此，容器内通过 /app/shared 访问）:"
-        echo -e "  默认: ${BOLD}~/.openclaw/workspace-<agent_id>/shared/${NC}"
+        echo "共享文件目录（Gateway 向 Agent 下发的固定路径）:"
+        echo -e "  对外路径: ${BOLD}/app/shared/<agent_id>${NC}"
+        echo -e "  实际来源: ${BOLD}~/.openclaw/workspace-<agent_id>/shared${NC}（通过软链 + bind 暴露）"
     fi
 
     echo ""
@@ -1371,23 +2876,27 @@ final_check() {
     openclaw models list 2>/dev/null || echo "  (无)"
     echo ""
 
+    # 对于 --skip-install / --add-agent 模式，也要确保 token 配置对齐
+    step "同步 Gateway token 配置..."
+    sync_gateway_tokens
+    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
+        step "检测到 token 变更，将在最终统一重启 Gateway 使配置生效"
+    fi
+
+    step "安装/刷新每个 Agent workspace 下的文件上传 Skill..."
+    if ! setup_gateway_file_upload_skill; then
+        error "文件上传 Skill 配置失败"
+        exit 1
+    fi
+
+    restart_gateway_for_stage "最终配置完成后" || true
+
     # 健康检查
     step "OpenClaw 健康检查..."
     if openclaw health 2>/dev/null; then
         success "OpenClaw Gateway 运行正常"
     else
-        warn "OpenClaw Gateway 未运行。启动命令: openclaw gateway start"
-    fi
-
-    # 对于 --skip-install / --add-agent 模式，也要确保 token 配置对齐
-    step "同步 Gateway token 配置..."
-    sync_gateway_tokens
-    if [[ "$GATEWAY_TOKEN_SYNC_CHANGED" == "true" ]]; then
-        step "检测到 token 变更，重启 Gateway 使配置生效..."
-        openclaw gateway restart >/dev/null 2>&1 || {
-            warn "Gateway 重启失败，请稍后手动执行: openclaw gateway restart"
-        }
-        sleep 2
+        warn "OpenClaw Gateway 未运行。启动命令: $(gateway_start_hint)"
     fi
 
     # 硬校验：沙箱共享目录契约
@@ -1405,12 +2914,14 @@ final_check() {
     fi
 
     echo ""
+    local gateway_start_cmd
+    gateway_start_cmd="$(gateway_start_hint)"
     echo -e "${BOLD}${GREEN}╔══════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${GREEN}║    OpenClaw 配置完成!                ║${NC}"
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════╝${NC}"
     echo ""
     echo "后续操作:"
-    echo -e "  ${CYAN}1.${NC} 启动 OpenClaw:       ${DIM}openclaw gateway start${NC}"
+    echo -e "  ${CYAN}1.${NC} 启动 OpenClaw:       ${DIM}${gateway_start_cmd}${NC}"
     echo -e "  ${CYAN}2.${NC} 部署企微 Gateway:    ${DIM}sudo bash bin/02-install-gateway.sh${NC}"
     echo -e "  ${CYAN}3.${NC} 更新代码后同步部署: ${DIM}sudo bash bin/02-install-gateway.sh${NC}"
     echo -e "  ${CYAN}4.${NC} 添加企微 Agent 绑定: ${DIM}/opt/openclaw/gateway/bin/04-manage-agent.sh add <name>${NC}"
@@ -1430,12 +2941,16 @@ main() {
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════╝${NC}"
     echo ""
 
+    prompt_sandbox_plan_if_needed
+
     # 快捷模式
     if [[ "$ADD_AGENT_ONLY" == "true" ]]; then
         if ! cmd_exists openclaw; then
-            error "OpenClaw 未安装，请先运行完整安装流程"
+            error "OpenClaw 未安装，请先完成安装后重新运行"
+            _print_prereq_instructions
             exit 1
         fi
+        ensure_planned_sandbox_runtime_ready
         configure_agents
         final_check
         return 0
@@ -1443,7 +2958,8 @@ main() {
 
     if [[ "$ADD_PROVIDER_ONLY" == "true" ]]; then
         if ! cmd_exists openclaw; then
-            error "OpenClaw 未安装，请先运行完整安装流程"
+            error "OpenClaw 未安装，请先完成安装后重新运行"
+            _print_prereq_instructions
             exit 1
         fi
         configure_models
@@ -1453,13 +2969,14 @@ main() {
 
     # 完整流程
     if [[ "$SKIP_INSTALL" != "true" ]]; then
-        check_and_install_openclaw
+        check_prerequisites
     else
         if ! cmd_exists openclaw; then
             error "OpenClaw 未安装，请去掉 --skip-install 运行"
             exit 1
         fi
         success "跳过安装，OpenClaw $(openclaw --version)"
+        ensure_planned_sandbox_runtime_ready
     fi
 
     configure_models

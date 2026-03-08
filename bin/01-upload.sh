@@ -117,11 +117,14 @@ echo "  bin/                          — 部署步骤脚本"
 echo "    ├── 02-install-gateway.sh"
 echo "    ├── 03-install-openclaw.sh"
 echo "    ├── 04-manage-agent.sh"
-echo "    └── 05-cleanup.sh"
+echo "    ├── 05-cleanup.sh"
+echo "    └── openclaw-sandbox-devtools.Dockerfile"
 echo "  scripts/                      — 工具脚本"
 echo "    ├── manage-agent.py"
 echo "    ├── gateway-ctl.sh"
 echo "    └── openclaw-gateway.service"
+echo "  openclaw-skills/             — 全局技能模板"
+echo "    └── gateway-file-upload/"
 echo "  .env.example                  — 环境变量模板"
 echo "  docs/                         — 文档"
 echo "  README.md                     — 项目说明"
@@ -130,7 +133,8 @@ echo "  AGENTS.md                     — AI 编码指南"
 echo ""
 
 print_warning "注意: .env、*.db、data/、logs/ 等敏感/运行时文件不会上传"
-print_warning "远端部署时将仅保留 .env 和 data/，其余文件会清理后再解压"
+print_warning "远端部署时仅清理 ${REMOTE_DIR}/gateway（保留 .env 与 data/）"
+print_warning "会同时保留 ${REMOTE_DIR}/.env 与 ${REMOTE_DIR}/gateway/.env"
 echo ""
 read -p "确认上传？[Y/n] " CONFIRM
 CONFIRM=${CONFIRM:-Y}
@@ -150,9 +154,9 @@ TEMP_DIR="${PROJECT_ROOT}/.tmp_upload"
 
 print_info "创建临时目录..."
 rm -rf "${TEMP_DIR}"
-mkdir -p "${TEMP_DIR}/openclaw-gateway"
+mkdir -p "${TEMP_DIR}/gateway"
 
-STAGING="${TEMP_DIR}/openclaw-gateway"
+STAGING="${TEMP_DIR}/gateway"
 
 # 复制 Gateway 源码（仅核心文件）
 print_info "复制 Gateway 源码..."
@@ -166,6 +170,9 @@ mkdir -p "${STAGING}/bin"
 for f in "${PROJECT_ROOT}/bin/"*.sh; do
     [ -f "$f" ] && cp "$f" "${STAGING}/bin/"
 done
+for f in "${PROJECT_ROOT}/bin/"*.Dockerfile; do
+    [ -f "$f" ] && cp "$f" "${STAGING}/bin/"
+done
 
 # 复制工具脚本
 print_info "复制工具脚本..."
@@ -173,6 +180,12 @@ mkdir -p "${STAGING}/scripts"
 cp "${PROJECT_ROOT}/scripts/manage-agent.py" "${STAGING}/scripts/"
 cp "${PROJECT_ROOT}/scripts/gateway-ctl.sh" "${STAGING}/scripts/" 2>/dev/null || true
 cp "${PROJECT_ROOT}/scripts/openclaw-gateway.service" "${STAGING}/scripts/" 2>/dev/null || true
+
+# 复制全局 skills 模板
+print_info "复制全局 skills..."
+if [ -d "${PROJECT_ROOT}/openclaw-skills" ]; then
+    cp -r "${PROJECT_ROOT}/openclaw-skills" "${STAGING}/"
+fi
 
 # 复制配置模板
 print_info "复制配置文件..."
@@ -192,7 +205,7 @@ cp "${PROJECT_ROOT}/PHASE2-PLAN.md" "${STAGING}/" 2>/dev/null || true
 
 # 打包
 print_info "打包文件..."
-tar -czf "${TEMP_DIR}/${PACKAGE_NAME}" -C "${TEMP_DIR}" openclaw-gateway/
+tar -czf "${TEMP_DIR}/${PACKAGE_NAME}" -C "${TEMP_DIR}" gateway/
 
 # 显示包大小
 PACKAGE_SIZE=$(du -h "${TEMP_DIR}/${PACKAGE_NAME}" | cut -f1)
@@ -222,44 +235,54 @@ cd ${REMOTE_DIR}
 
 # 备份现有 .env 配置
 if [ -f .env ]; then
-    cp .env /tmp/.env.gateway.bak
-    echo "  已备份 .env"
+    cp .env /tmp/.env.openclaw.bak
+    echo "  已备份 /opt/openclaw/.env"
+fi
+
+mkdir -p gateway
+if [ -f gateway/.env ]; then
+    cp gateway/.env /tmp/.env.gateway.bak
+    echo "  已备份 /opt/openclaw/gateway/.env"
 fi
 
 # 备份 SQLite 数据库（如果存在）
-DB_PATH=\$(grep '^DB_PATH=' .env 2>/dev/null | cut -d= -f2 || echo "")
+DB_PATH=\$(grep '^DB_PATH=' gateway/.env 2>/dev/null | cut -d= -f2 || true)
+if [ -z "\$DB_PATH" ]; then
+    DB_PATH=\$(grep '^DB_PATH=' .env 2>/dev/null | cut -d= -f2 || true)
+fi
 if [ -n "\$DB_PATH" ] && [ -f "\$DB_PATH" ]; then
     cp "\$DB_PATH" "\${DB_PATH}.bak.${TIMESTAMP}"
     echo "  已备份数据库: \$DB_PATH"
 fi
 
-# 全量清理旧文件（仅保留白名单：.env、data、当前上传包）
-find . -mindepth 1 -maxdepth 1 \
+# 清理旧 Gateway 文件（仅清理 gateway 目录，保留 .env 与 data）
+find gateway -mindepth 1 -maxdepth 1 \
     ! -name ".env" \
     ! -name "data" \
-    ! -name "${PACKAGE_NAME}" \
     -exec rm -rf {} +
 
 # 解压新文件
 tar -xzf ${PACKAGE_NAME}
-cp -a openclaw-gateway/. .
-rmdir openclaw-gateway 2>/dev/null || true
 rm -f ${PACKAGE_NAME}
 
-# 恢复 .env 配置
+# 恢复 .env 配置（两层都保留）
+if [ -f /tmp/.env.openclaw.bak ]; then
+    mv /tmp/.env.openclaw.bak .env
+    echo "  已恢复 /opt/openclaw/.env"
+fi
 if [ -f /tmp/.env.gateway.bak ]; then
-    mv /tmp/.env.gateway.bak .env
-    echo "  已恢复 .env"
+    mv /tmp/.env.gateway.bak gateway/.env
+    echo "  已恢复 /opt/openclaw/gateway/.env"
 fi
 
 # 设置执行权限
-chmod +x bin/*.sh 2>/dev/null || true
-chmod +x scripts/*.sh 2>/dev/null || true
-chmod +x scripts/*.py 2>/dev/null || true
+chmod +x gateway/bin/*.sh 2>/dev/null || true
+chmod +x gateway/scripts/*.sh 2>/dev/null || true
+chmod +x gateway/scripts/*.py 2>/dev/null || true
 
 echo ""
-echo "部署目录内容:"
-ls -la
+echo "Gateway 部署目录内容:"
+ls -la gateway
 ENDSSH
 
 print_success "文件解压完成"
@@ -283,16 +306,16 @@ echo -e "${YELLOW}1. 登录到服务器：${NC}"
 echo -e "   ${BLUE}ssh ${SERVER_USER}@${SERVER_IP}${NC}\n"
 
 echo -e "${YELLOW}2. 首次部署 — 运行安装脚本：${NC}"
-echo -e "   ${BLUE}cd ${REMOTE_DIR} && sudo bash bin/02-install-gateway.sh${NC}\n"
+echo -e "   ${BLUE}cd ${REMOTE_DIR}/gateway && sudo bash bin/02-install-gateway.sh${NC}\n"
 
 echo -e "${YELLOW}3. 更新部署 — 同步代码并重启服务：${NC}"
-echo -e "   ${BLUE}cd ${REMOTE_DIR} && sudo bash bin/02-install-gateway.sh${NC}\n"
+echo -e "   ${BLUE}cd ${REMOTE_DIR}/gateway && sudo bash bin/02-install-gateway.sh${NC}\n"
 
 echo -e "${YELLOW}   （仅修改 .env 时才只需重启服务）${NC}"
 echo -e "   ${BLUE}sudo systemctl restart openclaw-gateway${NC}\n"
 
 echo -e "${YELLOW}4. 安装配置 OpenClaw（如未安装）：${NC}"
-echo -e "   ${BLUE}cd ${REMOTE_DIR} && bash bin/03-install-openclaw.sh${NC}\n"
+echo -e "   ${BLUE}cd ${REMOTE_DIR}/gateway && bash bin/03-install-openclaw.sh${NC}\n"
 
 echo -e "${YELLOW}5. 添加 Agent 绑定：${NC}"
 echo -e "   ${BLUE}${REMOTE_DIR}/gateway/bin/04-manage-agent.sh add <name>${NC}\n"

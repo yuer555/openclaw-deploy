@@ -1,421 +1,373 @@
 # OpenClaw 企业微信桥接网关
 
-将企业微信机器人消息桥接到 [OpenClaw](https://openclaw.ai) AI Agent 的轻量级网关。
+将企业微信机器人消息桥接到 [OpenClaw](https://openclaw.ai) Agent 的轻量级 Gateway。
 
-Gateway **不管理** OpenClaw 的部署、容器或镜像 — 它只负责消息转发。
-你只需要告诉 Gateway：OpenClaw 的地址和认证 Token。
+Gateway **不负责** OpenClaw 的镜像、容器和生命周期管理；它只负责：
+- 接收企业微信回调
+- 按 SQLite 绑定关系路由到指定 OpenClaw
+- 将回复再发回企业微信
+- 处理文件上传、共享目录和可选的 S3 发布
 
-## 📚 文档导航
+## 文档导航
 
-- **[用户指南](USER-GUIDE.md)** - 从零开始的傻瓜式教程，10 分钟部署完成
-- **[并发分析](docs/CONCURRENCY-ANALYSIS.md)** - 多用户场景下的性能分析和优化建议
-- **[开发指南](AGENTS.md)** - AI 编码助手的项目规范和常用命令
-- **[架构设计](PHASE2-PLAN.md)** - 纯桥接模式的设计文档
+- `USER-GUIDE.md` — 面向使用者的完整部署与操作手册
+- `docs/CONCURRENCY-ANALYSIS.md` — 并发与性能说明
+- `PHASE2-PLAN.md` — 架构设计说明
+- `AGENTS.md` — 仓库开发规范
 
-## 特性
+## 核心规则
 
-- **纯桥接模式** — Gateway 仅做企业微信与 OpenClaw 之间的消息转发
-- **多 Agent 支持** — 每个 Agent 对接一个企业微信机器人，一对一绑定
-- **灵活部署** — 单实例多 Agent / 多实例 / 混合模式，自动兼容
-- **SQLite 存储** — Agent 绑定关系持久化，通过管理脚本操作
-- **多协议** — 支持 WebSocket（默认）、SSE、HTTP 三种通信协议
-- **会话隔离** — 按 Agent + 企业微信用户自动隔离会话
+- **纯桥接模式**：Gateway 只转发消息，不托管 OpenClaw。
+- **强绑定规则**：`agent_id = Gateway 路由名 = SQLite agents.name = openclaw_agent_id`。
+- **local 文件路径固定**：Gateway 下发给 Agent 的本地文件路径固定为 `/app/shared/<agent_id>/...`。
+- **宿主机真实目录**：`/app/shared/<agent_id>` 应指向 `~/.openclaw/workspace-<agent_id>/shared`。
+- **沙箱 bind 规则**：Docker 沙箱必须挂载 workspace 内 source，例如 `~/.openclaw/workspace-<agent_id>/shared:/app/shared/<agent_id>:rw`。
+- **系统依赖安装策略**：沙箱里不要依赖运行时 `apt-get`；需要的系统工具应直接预装到 `bin/openclaw-sandbox-devtools.Dockerfile`。
 
-## 部署模式
+升级提示：
+- 如果旧版本沙箱配置里残留了 `setupCommand: "apt-get ..."`，请重新运行 `bash bin/03-install-openclaw.sh --skip-install`，然后执行 `openclaw sandbox recreate --agent <agent_id>`。
 
-```
-模式 A：单 OpenClaw 实例 + 多 Agent
-  企业微信A ──► /dev/wecom/callback  ──┐
-  企业微信B ──► /ops/wecom/callback  ──┼──► 同一个 OpenClaw（不同 agent_id）
-  企业微信C ──► /svc/wecom/callback  ──┘
+这样设计的原因是同时满足：
+- Gateway 能稳定下发绝对路径
+- OpenClaw 沙箱 allowed roots 要求 bind source 位于 workspace 内
 
-模式 B：多 OpenClaw 实例
-  企业微信A ──► /dev/wecom/callback  ──► OpenClaw 实例 1
-  企业微信B ──► /ops/wecom/callback  ──► OpenClaw 实例 2
+一句话区分：
+- **`FILE_STORAGE_MODE` 决定“企业微信发来的文件怎么交给 Agent”**。
+- **`gateway-file-upload` skill + S3 配置 决定“Agent 能不能把自己的产物再上传出去”**。
 
-模式 C：混合
-  企业微信A ──► /dev/wecom/callback  ──┐
-  企业微信B ──► /ops/wecom/callback  ──┼──► OpenClaw 实例 1（不同 agent_id）
-  企业微信C ──► /svc/wecom/callback  ──────► OpenClaw 实例 2
-```
+## 权限规则
 
-无需额外配置，Gateway 根据 SQLite 中的绑定关系自动路由。
+- `bin/02-install-gateway.sh`、`bin/05-cleanup.sh` 需要 `sudo`
+- `bin/03-install-openclaw.sh`、`bin/04-manage-agent.sh` 必须用**普通用户**运行
+- `scripts/manage-agent.py` 也必须用**普通用户**运行
+
+不要用 `root` 或 `sudo` 运行 `03` / `04`，否则 OpenClaw home 会落到 `/root/.openclaw`，并触发沙箱路径限制。
 
 ## 快速开始
 
-### 方式零：安装配置 OpenClaw
-
-如果服务器上还没有安装 OpenClaw，使用一键安装脚本：
+### 1) 安装和配置 OpenClaw
 
 ```bash
-git clone https://github.com/your-org/openclaw-deploy.git
-cd openclaw-deploy
-
-# 一键安装 OpenClaw + 配置模型 + 创建 Agent + 编辑人格设定
-bash scripts/install-openclaw.sh
+bash bin/03-install-openclaw.sh
 ```
-
-安装脚本会自动完成：
-1. 安装 OpenClaw（需要 Node.js 22+）
-2. 配置模型提供商（官方 API Key + 第三方流量池如 GMN）
-3. 创建多个 Agent（各自 workspace、沙箱配置、人格设定）
-4. 输出 Gateway 集成所需的 URL 和 Token
 
 快捷模式：
-```bash
-bash scripts/install-openclaw.sh --skip-install   # 跳过安装，只做配置
-bash scripts/install-openclaw.sh --add-agent       # 只添加新 Agent
-bash scripts/install-openclaw.sh --add-provider    # 只添加模型提供商
-```
-
-### 方式一：生产环境自动化部署（推荐）
-
-适用于 Ubuntu/Debian/CentOS/RHEL 等 Linux 服务器，一键部署并配置 systemd 服务，支持崩溃自动重启。
 
 ```bash
-# 下载项目
-git clone https://github.com/your-org/openclaw-deploy.git
-cd openclaw-deploy
-
-# 一键部署（需要 root 权限）
-sudo bash deploy/install.sh
+bash bin/03-install-openclaw.sh --skip-install
+bash bin/03-install-openclaw.sh --add-agent
+bash bin/03-install-openclaw.sh --add-provider
 ```
 
-部署完成后：
+说明：
+- 需要 Node.js 22+
+- Docker **仅在创建沙箱 Agent 时需要**
+- 脚本一开始会先问你“本次是否计划创建沙箱 Agent”，默认 Yes
+- 如果你选择创建沙箱，但 Docker / 沙箱镜像未准备，脚本会直接停止后续引导，并提示安装 Docker、配置镜像加速和构建镜像；准备完成后重新运行即可
+- `03-install-openclaw.sh` 会把 Gateway 重启收口成两次：首次新建 Agent 前统一一次、脚本结束时统一一次
+- 如果沙箱 Agent 已创建并完成绑定，但在实际通信时出现 `Failed to inspect sandbox image: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`，可先执行 `newgrp docker`；仍未恢复时，再执行 `sudo chmod 777 /var/run/docker.sock` 兜底
+- 上述 `chmod` 属于运行期权限修复，执行后**无需重启 Docker / OpenClaw / Gateway**，直接重新发消息即可验证
+- Ubuntu 系统已知兼容性提示：
+  - OpenClaw `2026.03.02`（2026 年 3 月 2 日版本）在 Ubuntu 上存在自启动兼容性问题，`03-install-openclaw.sh` 可能无法通过 `openclaw onboard --install-daemon` 正常注册自启动
+  - 当前更推荐使用 OpenClaw `2026.02.26`（2026 年 2 月 26 日版本）
+
+### 2) 部署 Gateway
 
 ```bash
-# 添加 Agent
-sudo bash deploy/gateway-ctl.sh add-agent dev
-
-# 查看服务状态
-sudo bash deploy/gateway-ctl.sh status
-
-# 查看实时日志
-sudo bash deploy/gateway-ctl.sh logs
+sudo bash bin/02-install-gateway.sh
 ```
 
-**更多运维命令** 见下方 [生产环境运维](#生产环境运维) 章节。
+部署完成后，代码会被同步到 `/opt/openclaw/gateway`，并安装为 `systemd` 服务 `openclaw-gateway`。
 
-### 方式二：开发环境手动启动
+### 3) 添加企业微信 Agent 绑定
 
-适用于本地开发和测试。
+生产环境：
 
-#### 环境要求
+```bash
+/opt/openclaw/gateway/bin/04-manage-agent.sh add team-dev
+```
 
-- Python 3.10+
-- 已部署并运行的 OpenClaw 实例（可通过 `bash scripts/install-openclaw.sh` 安装）
-- 企业微信应用（需要 Token 和 EncodingAESKey）
+开发环境：
 
-#### 1. 安装依赖
+```bash
+python3 scripts/manage-agent.py add team-dev
+```
+
+交互顺序与当前脚本一致：
+- **Gateway 地址** — 实际上是 OpenClaw 服务地址，例如 `http://localhost:18789`
+- **Agent ID** — 路由名，同时也是 OpenClaw agent_id
+- **共享文件目录** — 自动生成，固定为 `/app/shared/<agent_id>`
+- **Gateway Token** — 实际上是 OpenClaw token
+- **企业微信 Token**
+- **企业微信 EncodingAESKey**
+- **显示名**
+
+### 4) 验证
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/admin/agents
+```
+
+## 开发环境启动
+
+### 安装依赖
 
 ```bash
 pip3 install -r src/gateway/requirements.txt
 ```
 
-#### 2. 配置环境变量
+### 配置环境变量
 
 ```bash
 cp .env.example .env
-# 编辑 .env，按需修改
 ```
 
-环境变量说明：
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `DB_PATH` | `/opt/openclaw/data/gateway/gateway.db` | SQLite 数据库路径 |
-| `GATEWAY_PORT` | `8000` | Gateway 监听端口 |
-| `OPENCLAW_PROTOCOL` | `ws` | 通信协议：`ws` / `sse` / `http` |
-| `OPENCLAW_TIMEOUT` | `2700` | OpenClaw 调用超时（秒） |
-| `GATEWAY_URL` | `http://localhost:8000` | Gateway 地址（管理脚本用于通知重载） |
-
-#### 3. 启动 Gateway
+### 启动 Gateway
 
 ```bash
 python3 src/gateway/wecom_gateway.py
 ```
 
-首次启动时无 Agent，Gateway 正常运行但不处理任何消息。
+首次启动时即使没有任何 Agent，Gateway 也会正常启动；只是不会处理实际企业微信消息。
 
-#### 4. 添加 Agent
+## 环境变量
 
-```bash
-python3 scripts/manage-agent.py add dev
-```
+`.env.example` 只配置 Gateway 自身参数；Agent 绑定关系都在 SQLite 中维护。
 
-按提示依次输入：
-- **显示名** — 如"开发工程师小明"
-- **企业微信 Token** — 企业微信应用的 Token
-- **企业微信 AES Key** — 企业微信应用的 EncodingAESKey
-- **OpenClaw 地址** — 如 `http://10.0.1.5:18789`
-- **OpenClaw Token** — OpenClaw 的认证 Token
-- **OpenClaw Agent ID** — 回车跳过则使用默认 `main`
+### 常用配置
 
-添加成功后，将企业微信回调地址设为：
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DB_PATH` | `/opt/openclaw/data/gateway/gateway.db` | SQLite 数据库路径 |
+| `GATEWAY_PORT` | `8000` | Gateway 监听端口 |
+| `OPENCLAW_PROTOCOL` | `ws` | `ws` / `sse` / `http` |
+| `OPENCLAW_TIMEOUT` | `180` | 兼容旧配置的总超时 |
+| `OPENCLAW_CONNECT_TIMEOUT` | `10` | 连接 OpenClaw 超时 |
+| `OPENCLAW_WS_IDLE_TIMEOUT` | `30` | WS 空闲超时 |
+| `OPENCLAW_WS_TOTAL_TIMEOUT` | `180` | WS 总超时 |
+| `OPENCLAW_SSE_IDLE_TIMEOUT` | `30` | SSE 空闲超时 |
+| `OPENCLAW_SSE_TOTAL_TIMEOUT` | `180` | SSE 总超时 |
+| `OPENCLAW_HTTP_TIMEOUT` | `180` | HTTP 总超时 |
+| `MAX_GATEWAY_WORKERS` | `8` | Gateway 全局 worker 数 |
+| `MAX_PER_USER_PENDING` | `1` | 单用户最多等待消息数 |
+| `MAX_QUEUE_WAIT_SECONDS` | `60` | 等待队列最大时长 |
+| `GATEWAY_URL` | `http://localhost:8000` | 管理脚本回调 `/admin/reload` 使用；上传 Skill 也会基于它访问 Gateway |
+| `FILE_STORAGE_MODE` | `local` | `local` / `s3` |
+| `FILE_STORAGE_PRESIGN_EXPIRES` | `86400` | S3 预签名有效期 |
+| `FILE_UPLOAD_INTERNAL_TOKEN` | 空 | Gateway 内部上传接口鉴权；`03` 会据此生成 `OPENCLAW_FILE_UPLOAD_TOKEN` |
+| `MAX_INTERNAL_UPLOAD_FILE_SIZE` | `52428800` | 内部上传大小限制 |
+| `FILE_STORAGE_KEY_PREFIX` | `openclaw-gateway` | 对象存储 key 前缀 |
 
-```
-https://your-domain/dev/wecom/callback
-```
+上传 Skill 运行时变量说明：
+- `03-install-openclaw.sh` 会自动生成：
+  - `OPENCLAW_FILE_UPLOAD_GATEWAY_URL` ← `GATEWAY_URL`
+  - `OPENCLAW_FILE_UPLOAD_TOKEN` ← `FILE_UPLOAD_INTERNAL_TOKEN`
+  - `OPENCLAW_FILE_UPLOAD_EXPIRES` ← `FILE_STORAGE_PRESIGN_EXPIRES`
+- 非沙箱 Agent：写入 `~/.openclaw/.env`；如果是通过 `03-install-openclaw.sh` 配置，脚本结束前会统一重启一次；手工修改时仍需自行重启。
+- 沙箱 Agent：写入对应 agent 的 `sandbox.docker.env`；如果原始地址是 `localhost/127.0.0.1`，脚本会自动改成 `host.docker.internal`，并补 `extraHosts: ["host.docker.internal:host-gateway"]`。
+- 沙箱配置变更后，如果容器已存在，执行 `openclaw sandbox recreate --agent <agent_id>`。
+- 这里自动转换的是 **上传 Skill 使用的 `OPENCLAW_FILE_UPLOAD_GATEWAY_URL`**；`GATEWAY_URL` 本身仍保留原值，继续给管理脚本回调 `/admin/reload` 使用。
 
-#### 5. 验证
+不要混淆这两件事：
+- **入站文件处理**：`FILE_STORAGE_MODE=local` 时下发 `/app/shared/<agent_id>/...` 绝对路径；`FILE_STORAGE_MODE=s3` 时下发对象存储下载链接。
+- **主动上传能力**：只要安装了 `gateway-file-upload`、`OPENCLAW_FILE_UPLOAD_*` 生效且 S3 已配置，Agent 就可以主动上传文件或文本。
+- **内部上传返回**：`/internal/files/upload` 始终走 S3，返回对象存储下载链接，不再提供 Gateway 本地下载路由。
 
-```bash
-# 健康检查
-curl http://localhost:8000/health
+快速对照：
 
-# 查看已绑定的 Agent
-curl http://localhost:8000/admin/agents
-```
+| 组合 | 企微来件怎么交给 Agent | Agent 能否主动上传 |
+|------|------------------------|--------------------|
+| `local` + 无 skill | 本地绝对路径 | 否 |
+| `local` + 有 skill + S3 已配置 | 本地绝对路径 | 是（主动上传走 S3） |
+| `s3` + 无 skill | S3 下载链接 | 否 |
+| `s3` + 有 skill + S3 已配置 | S3 下载链接 | 是（主动上传走 S3） |
+
+### S3 模式
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `S3_BUCKET` | 空 | 目标桶 |
+| `S3_ENDPOINT_URL` | 空 | 自建 S3/兼容服务地址 |
+| `S3_ACCESS_KEY_ID` | 空 | 访问密钥 |
+| `S3_SECRET_ACCESS_KEY` | 空 | 密钥 |
+| `S3_REGION` | `us-east-1` | 区域 |
+| `S3_SIGNATURE_VERSION` | `s3` | 签名版本 |
+| `S3_ADDRESSING_STYLE` | `path` | 地址风格 |
+| `S3_KEY_PREFIX` | `openclaw-gateway` | 兼容旧配置 |
+| `S3_SSE_MODE` | 空 | 服务端加密模式 |
+| `S3_SSE_KMS_KEY_ID` | 空 | KMS Key |
 
 ## Agent 管理
 
-所有 Agent 绑定通过 `scripts/manage-agent.py` 管理：
+基础命令：
 
 ```bash
-# 添加 Agent（交互式）
-python3 scripts/manage-agent.py add <name>
-
-# 列出所有 Agent
+python3 scripts/manage-agent.py add [agent_id]
 python3 scripts/manage-agent.py list
-
-# 更新 Agent（交互式，回车保持原值不变）
-python3 scripts/manage-agent.py update <name>
-
-# 删除 Agent（需确认）
-python3 scripts/manage-agent.py remove <name>
+python3 scripts/manage-agent.py update <agent_id>
+python3 scripts/manage-agent.py remove <agent_id>
+python3 scripts/manage-agent.py sync-token [--url <openclaw_url>]
 ```
 
-管理脚本在添加/更新/删除后会自动通知 Gateway 重载配置，无需重启。
+说明：
+- `add` / `update` / `remove` 后会自动通知 Gateway 重载
+- `sync-token` 用于批量同步 DB 中保存的 OpenClaw token
+- 生产环境推荐使用 `/opt/openclaw/gateway/bin/04-manage-agent.sh`
+
+## 手工部署 OpenClaw 时必须满足的约束
+
+如果你不是通过 `bin/03-install-openclaw.sh` 部署 OpenClaw，而是手动安装、手动编辑 `~/.openclaw/openclaw.json`，请确保：
+
+- `agent_id = Gateway 路由名 = SQLite agents.name`
+- Gateway 对外下发的 local 文件路径固定为 `/app/shared/<agent_id>/...`
+- 宿主机上的 `/app/shared/<agent_id>` 指向 `~/.openclaw/workspace-<agent_id>/shared`
+- 若使用仓库自带上传 Skill，请将 `openclaw-skills/gateway-file-upload` 同步到 `~/.openclaw/workspace-<agent_id>/skills/gateway-file-upload`
+- 非沙箱 Agent 若要使用上传 Skill，请把 `OPENCLAW_FILE_UPLOAD_*` 写入 `~/.openclaw/.env`，并在修改后重启 OpenClaw
+- 沙箱 Agent 若要使用上传 Skill，请把同名变量写入该 agent 的 `sandbox.docker.env`，并在修改后重建沙箱容器
+- 若启用沙箱，bind source 必须位于 workspace 内，例如：
+
+```json
+[
+  "/home/ubuntu/.openclaw/workspace-dev/shared:/app/shared/dev:rw"
+]
+```
+
+- `/app/shared` 需提前创建并放权，`02` 脚本默认会创建并设置为 `775`
 
 ## 生产环境运维
 
-### systemd 服务管理
-
-部署后，Gateway 作为 systemd 服务运行，支持崩溃自动重启。
+### systemd
 
 ```bash
-# 启动服务
 sudo systemctl start openclaw-gateway
-
-# 停止服务
 sudo systemctl stop openclaw-gateway
-
-# 重启服务
 sudo systemctl restart openclaw-gateway
-
-# 查看状态
 sudo systemctl status openclaw-gateway
-
-# 查看日志
-sudo journalctl -u openclaw-gateway -f
-
-# 开机自启（默认已启用）
-sudo systemctl enable openclaw-gateway
-```
-
-### 快捷运维脚本
-
-`deploy/gateway-ctl.sh` 提供了常用运维命令：
-
-```bash
-# 服务管理
-sudo bash deploy/gateway-ctl.sh start          # 启动
-sudo bash deploy/gateway-ctl.sh stop           # 停止
-sudo bash deploy/gateway-ctl.sh restart        # 重启
-sudo bash deploy/gateway-ctl.sh status         # 状态
-sudo bash deploy/gateway-ctl.sh logs           # 日志
-
-# 监控检查
-sudo bash deploy/gateway-ctl.sh health         # 健康检查
-sudo bash deploy/gateway-ctl.sh agents         # Agent 列表
-sudo bash deploy/gateway-ctl.sh stats          # 统计信息
-
-# Agent 管理
-sudo bash deploy/gateway-ctl.sh add-agent dev       # 添加 Agent
-sudo bash deploy/gateway-ctl.sh list-agents         # 列出所有 Agent
-sudo bash deploy/gateway-ctl.sh update-agent dev    # 更新 Agent
-sudo bash deploy/gateway-ctl.sh remove-agent dev    # 删除 Agent
-
-# 数据库
-sudo bash deploy/gateway-ctl.sh db             # 打开 SQLite 数据库
-```
-
-### 卸载
-
-```bash
-# 完全卸载（保留数据库）
-sudo bash deploy/uninstall.sh
-```
-
-### 目录结构
-
-生产环境安装后的目录结构：
-
-```
-/opt/openclaw/gateway/          # 安装目录
-├── src/gateway/                # 源代码
-├── scripts/                    # 管理脚本
-└── .env                        # 环境配置
-
-/opt/openclaw/data/             # 数据目录
-└── gateway/
-    └── gateway.db              # SQLite 数据库
-
-/var/log/openclaw/              # 日志目录
-├── gateway.log                 # 标准输出
-└── gateway-error.log           # 错误日志
-```
-
-### 崩溃自动重启
-
-systemd 服务配置了以下重启策略：
-
-- `Restart=always` — 任何退出都自动重启
-- `RestartSec=10` — 重启前等待 10 秒
-- 日志自动追加到 `/var/log/openclaw/` 目录
-
-测试自动重启：
-
-```bash
-# 强制结束进程
-sudo pkill -9 -f wecom_gateway.py
-
-# 查看日志，应看到 10 秒后自动重启
 sudo journalctl -u openclaw-gateway -f
 ```
 
-## Agent 管理
+### 运维脚本
 
-所有 Agent 绑定通过 `scripts/manage-agent.py` 管理：
-
-```bash
-# 添加 Agent（交互式）
-python3 scripts/manage-agent.py add <name>
-
-# 列出所有 Agent
-python3 scripts/manage-agent.py list
-
-# 更新 Agent（交互式，回车保持原值不变）
-python3 scripts/manage-agent.py update <name>
-
-# 删除 Agent（需确认）
-python3 scripts/manage-agent.py remove <name>
-```
-
-生产环境可使用快捷命令：
+部署后可使用：
 
 ```bash
-sudo bash deploy/gateway-ctl.sh add-agent <name>
-sudo bash deploy/gateway-ctl.sh list-agents
-sudo bash deploy/gateway-ctl.sh update-agent <name>
-sudo bash deploy/gateway-ctl.sh remove-agent <name>
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh start
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh stop
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh restart
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh status
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh logs
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh health
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh agents
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh stats
 ```
 
-管理脚本在添加/更新/删除后会自动通知 Gateway 重载配置，无需重启。
+管理 Agent 时同样建议用普通用户执行：
 
-## API 接口
+```bash
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh add-agent team-dev
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh list-agents
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh update-agent team-dev
+bash /opt/openclaw/gateway/scripts/gateway-ctl.sh remove-agent team-dev
+```
+
+### 升级 Gateway
+
+```bash
+cd ~/openclaw-deploy
+git pull
+sudo bash bin/02-install-gateway.sh
+```
+
+`02` 会重新同步仓库代码到 `/opt/openclaw/gateway` 并重启服务；仅执行 `systemctl restart` 不会同步新代码。
+
+### 清理
+
+```bash
+sudo bash bin/05-cleanup.sh
+```
+
+## API
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET/POST | `/{agent_name}/wecom/callback` | 企业微信回调（按 Agent 路由） |
-| GET/POST | `/wecom/callback` | 旧版兼容路径 |
-| GET | `/health` | 健康检查 |
-| GET | `/stats` | 统计信息 |
-| GET | `/admin/agents` | 列出所有 Agent 绑定 |
-| POST | `/admin/reload` | 重载 Agent 配置 |
+| `GET/POST` | `/{agent_name}/wecom/callback` | 企业微信回调 |
+| `GET/POST` | `/wecom/callback` | 兼容旧路径 |
+| `GET` | `/health` | 健康检查 |
+| `GET` | `/stats` | 统计信息 |
+| `GET` | `/admin/agents` | 当前 Agent 绑定 |
+| `POST` | `/admin/reload` | 重载 Agent 配置 |
+| `POST` | `/internal/files/upload` | 内部上传接口（上传 Skill 用，统一走 S3） |
 
 ## 消息处理流程
 
-```
-企业微信用户发消息
-       │
-       ▼
-GET/POST /{agent_name}/wecom/callback
-       │
-       ├─ 从 SQLite 查找 agent 配置（未找到 → 404）
-       │
-       ├─ 用该 agent 的 wecom_token/aes_key 解密验签
-       │
-       ├─ 提取 user_id, content
-       │
-       ├─ 构造 session_key = "wecom:{agent_name}:{user_id}"
-       │
-       ├─ 调用 OpenClaw（WS/SSE/HTTP）
-       │   ├─ URL:      agent 的 openclaw_url
-       │   ├─ Token:    agent 的 openclaw_token
-       │   ├─ Agent ID: agent 的 openclaw_agent_id（默认 main）
-       │   └─ Session:  session_key
-       │
-       └─ 收到回复 → 通过企业微信回复用户
+```text
+企业微信
+  -> /{agent_name}/wecom/callback
+  -> SQLite 查询 agent 配置
+  -> 按 agent 的 Token / AESKey 解密验签
+  -> 组装 session_key = wecom:{agent_name}:{user_id}
+  -> 调用目标 OpenClaw（ws / sse / http）
+  -> 收到回复
+  -> 回发企业微信
 ```
 
 ## 项目结构
 
-```
+```text
 openclaw-deploy/
-├── src/gateway/
-│   ├── wecom_gateway.py      # Gateway 主程序
-│   └── requirements.txt      # Python 依赖
+├── bin/
+│   ├── 01-upload.sh
+│   ├── 02-install-gateway.sh
+│   ├── 03-install-openclaw.sh
+│   ├── 04-manage-agent.sh
+│   ├── 05-cleanup.sh
+│   └── openclaw-sandbox-devtools.Dockerfile
 ├── scripts/
-│   ├── manage-agent.py       # Agent 绑定管理工具
-│   └── install-openclaw.sh   # OpenClaw 一键安装配置脚本
-├── deploy/
-│   ├── install.sh            # 自动化部署脚本
-│   ├── uninstall.sh          # 卸载脚本
-│   ├── gateway-ctl.sh        # 运维快捷命令
-│   └── openclaw-gateway.service  # systemd 服务文件
-├── .env.example              # 环境变量模板
-├── AGENTS.md                 # AI 编码助手指南
-└── PHASE2-PLAN.md            # 架构方案文档
+│   ├── gateway-ctl.sh
+│   ├── manage-agent.py
+│   └── openclaw-gateway.service
+├── src/gateway/
+│   ├── requirements.txt
+│   └── wecom_gateway.py
+├── .env.example
+├── README.md
+└── USER-GUIDE.md
 ```
 
 ## 数据库
 
-Gateway 使用 SQLite 存储 Agent 绑定关系，数据库路径由 `DB_PATH` 环境变量指定。
+### `agents`
 
-### agents 表
+| 字段 | 说明 |
+|------|------|
+| `name` | 路由名 / agent_id 主键 |
+| `display_name` | 显示名 |
+| `wecom_token` | 企业微信 Token |
+| `wecom_aes_key` | 企业微信 EncodingAESKey |
+| `openclaw_url` | OpenClaw 地址 |
+| `openclaw_token` | OpenClaw token |
+| `openclaw_agent_id` | 与 `name` 保持一致 |
+| `shared_dir` | 固定为 `/app/shared/<agent_id>` |
+| `created_at` | 创建时间 |
+| `updated_at` | 更新时间 |
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `name` | TEXT (PK) | 路由标识，用于 URL 路径 |
-| `display_name` | TEXT | 显示名称 |
-| `wecom_token` | TEXT | 企业微信 Token |
-| `wecom_aes_key` | TEXT | 企业微信 EncodingAESKey |
-| `openclaw_url` | TEXT | OpenClaw 地址 |
-| `openclaw_token` | TEXT | OpenClaw 认证 Token |
-| `openclaw_agent_id` | TEXT | OpenClaw Agent ID（空 = 默认 main） |
-| `created_at` | TEXT | 创建时间 |
-| `updated_at` | TEXT | 更新时间 |
+### `task_logs`
 
-### task_logs 表
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `task_id` | TEXT (PK) | 任务 ID |
-| `user_id` | TEXT | 用户 ID |
-| `agent_id` | TEXT | Agent 标识 |
-| `task_content` | TEXT | 任务内容 |
-| `status` | TEXT | 状态 |
-| `result` | TEXT | 结果 |
-| `created_at` | TIMESTAMP | 创建时间 |
-| `updated_at` | TIMESTAMP | 更新时间 |
-
-### 常用查询
-
-```bash
-# 查看数据库结构
-sqlite3 $DB_PATH ".schema"
-
-# 查看所有 Agent 绑定
-sqlite3 $DB_PATH "SELECT name, display_name, openclaw_url FROM agents;"
-
-# 查看任务统计
-sqlite3 $DB_PATH "SELECT COUNT(*), status FROM task_logs GROUP BY status;"
-```
+| 字段 | 说明 |
+|------|------|
+| `task_id` | 任务 ID |
+| `user_id` | 企业微信用户 |
+| `agent_id` | Agent ID |
+| `task_content` | 消息内容 |
+| `status` | 状态 |
+| `result` | 结果 |
+| `created_at` | 创建时间 |
+| `updated_at` | 更新时间 |
 
 ## 注意事项
 
-- **安全**：不要将 `.env` 和 `*.db` 文件提交到 Git
-- **首次启动**：Gateway 正常启动但无 Agent，需通过 `manage-agent.py` 添加
-- **热重载**：添加/删除 Agent 后管理脚本自动通知 Gateway，无需重启
-- **数据目录**：`data/` 目录在运行时自动创建，已在 `.gitignore` 中排除
+- 不要提交 `.env`、`*.db`、运行时日志
+- Gateway 启动成功但没有 Agent 时，不会处理消息
+- `/app/shared` 由 `02` 脚本创建并赋予 `775`
+- 新装系统如果遗留错误的 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`，Gateway 启动时会自动忽略无效证书路径

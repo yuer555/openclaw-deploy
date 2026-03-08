@@ -21,15 +21,67 @@ INSTALL_DIR="/opt/openclaw/gateway"
 DATA_DIR="/opt/openclaw/data"
 LOG_DIR="/var/log/openclaw"
 VENV_DIR="/opt/openclaw/gateway/venv"
+FALLBACK_ENV_FILE="/opt/openclaw/.env"
+SHARED_ROOT="/app/shared"
 
-# 使用调用 sudo 的实际用户运行 Gateway（与 OpenClaw 共用同一用户，避免权限问题）
-RUN_USER="${SUDO_USER:-$(whoami)}"
+sanitize_tls_env_file() {
+    local env_file="$1"
+    [ -f "$env_file" ] || return 0
+
+    local removed
+    removed=$(python3 - "$env_file" <<'PYEOF'
+import os
+import sys
+
+env_file = sys.argv[1]
+target_keys = {"REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE"}
+
+with open(env_file, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+new_lines = []
+removed = []
+
+for raw in lines:
+    stripped = raw.strip()
+    if not stripped or stripped.startswith('#') or '=' not in stripped:
+        new_lines.append(raw)
+        continue
+
+    key, value = stripped.split('=', 1)
+    key = key.strip()
+
+    if key not in target_keys:
+        new_lines.append(raw)
+        continue
+
+    value = value.strip().strip('"').strip("'")
+    if value and os.path.isfile(value):
+        new_lines.append(raw)
+        continue
+
+    removed.append(f"{key}={value}")
+
+if removed:
+    with open(env_file, 'w', encoding='utf-8') as f:
+        f.writelines(new_lines)
+
+for item in removed:
+    print(item)
+PYEOF
+)
+
+    if [ -n "$removed" ]; then
+        while IFS= read -r item; do
+            [ -n "$item" ] || continue
+            echo "   ⚠️  清理无效 TLS 配置: $item ($env_file)"
+        done <<< "$removed"
+    fi
+}
+
+# 已是 root 时直接以 root 运行，通过 sudo 时使用实际调用用户
+RUN_USER="${SUDO_USER:-root}"
 RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"
-if [ "$RUN_USER" = "root" ]; then
-    echo "错误: 请使用 sudo 运行（不要直接以 root 登录运行）"
-    echo "用法: sudo bash $0"
-    exit 1
-fi
 echo "Gateway 将以用户 $RUN_USER:$RUN_GROUP 运行"
 
 # 步骤 1: 检测操作系统
@@ -79,17 +131,25 @@ echo "   ✅ 目录创建完成"
 echo ""
 echo "📄 步骤 5/8: 复制代码文件..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cp -r "$SCRIPT_DIR/src" "$INSTALL_DIR/"
-cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
 
-# 仅安装 Gateway 运行必需的 bin 脚本，避免 /opt/openclaw/bin 与 /opt/openclaw/gateway/bin 双份脚本漂移
-rm -rf "$INSTALL_DIR/bin"
-mkdir -p "$INSTALL_DIR/bin"
-cp "$SCRIPT_DIR/bin/04-manage-agent.sh" "$INSTALL_DIR/bin/"
+if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
+    cp -r "$SCRIPT_DIR/src" "$INSTALL_DIR/"
+    cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
+
+    # 仅安装 Gateway 运行必需的 bin 脚本，避免双份脚本漂移
+    rm -rf "$INSTALL_DIR/bin"
+    mkdir -p "$INSTALL_DIR/bin"
+    cp "$SCRIPT_DIR/bin/04-manage-agent.sh" "$INSTALL_DIR/bin/"
+else
+    echo "   检测到当前目录即安装目录，跳过代码复制"
+fi
 
 # 创建 .env 文件（如果不存在）
 if [ ! -f "$INSTALL_DIR/.env" ]; then
-    if [ -f "$SCRIPT_DIR/.env.example" ]; then
+    if [ -f "$FALLBACK_ENV_FILE" ]; then
+        echo "   检测到回退配置文件: $FALLBACK_ENV_FILE"
+        echo "   ℹ️  将优先使用 $FALLBACK_ENV_FILE（直到创建 $INSTALL_DIR/.env）"
+    elif [ -f "$SCRIPT_DIR/.env.example" ]; then
         cp "$SCRIPT_DIR/.env.example" "$INSTALL_DIR/.env"
         echo "   ✅ 已创建 .env 配置文件"
         echo "   ⚠️  请编辑 $INSTALL_DIR/.env 修改配置"
@@ -99,14 +159,42 @@ if [ ! -f "$INSTALL_DIR/.env" ]; then
 DB_PATH=$DATA_DIR/gateway/gateway.db
 GATEWAY_PORT=8000
 OPENCLAW_PROTOCOL=ws
-OPENCLAW_TIMEOUT=2700
+OPENCLAW_TIMEOUT=180
+OPENCLAW_CONNECT_TIMEOUT=10
+OPENCLAW_WS_IDLE_TIMEOUT=30
+OPENCLAW_WS_TOTAL_TIMEOUT=180
+OPENCLAW_SSE_IDLE_TIMEOUT=30
+OPENCLAW_SSE_TOTAL_TIMEOUT=180
+OPENCLAW_HTTP_TIMEOUT=180
+MAX_GATEWAY_WORKERS=8
+MAX_PER_USER_PENDING=1
+MAX_QUEUE_WAIT_SECONDS=60
 GATEWAY_URL=http://localhost:8000
+FILE_STORAGE_MODE=local
+FILE_STORAGE_PRESIGN_EXPIRES=86400
+FILE_UPLOAD_INTERNAL_TOKEN=
+MAX_INTERNAL_UPLOAD_FILE_SIZE=52428800
+FILE_STORAGE_KEY_PREFIX=openclaw-gateway
+S3_BUCKET=
+S3_REGION=us-east-1
+S3_ENDPOINT_URL=
+S3_ACCESS_KEY_ID=
+S3_SECRET_ACCESS_KEY=
+S3_KEY_PREFIX=openclaw-gateway
+S3_SIGNATURE_VERSION=s3
+S3_ADDRESSING_STYLE=path
+S3_SSE_MODE=
+S3_SSE_KMS_KEY_ID=
 EOF
         echo "   ✅ 已创建默认 .env 配置文件"
     fi
 else
     echo "   .env 已存在，跳过"
 fi
+
+# 自动清理无效 TLS 证书路径（避免 requests 报 invalid certifi/cacert.pem）
+sanitize_tls_env_file "$INSTALL_DIR/.env"
+sanitize_tls_env_file "$FALLBACK_ENV_FILE"
 
 echo "   ✅ 代码文件复制完成"
 
@@ -121,18 +209,42 @@ else
 fi
 "$VENV_DIR/bin/pip" install -q --upgrade pip
 "$VENV_DIR/bin/pip" install -q -r "$INSTALL_DIR/src/gateway/requirements.txt"
+
+# certifi 偶发损坏会导致 requests 报 "invalid path .../certifi/cacert.pem"
+if ! "$VENV_DIR/bin/python" - <<'PYEOF'
+import os
+import certifi
+path = certifi.where()
+if not path or not os.path.isfile(path):
+    raise SystemExit(1)
+print(path)
+PYEOF
+then
+    echo "   ⚠️  检测到 certifi CA 路径异常，尝试修复..."
+    "$VENV_DIR/bin/pip" install -q --force-reinstall certifi
+fi
+
 echo "   ✅ Python 依赖安装完成"
 
 # 步骤 7: 设置权限
 echo ""
 echo "🔐 步骤 7/8: 设置文件权限..."
+mkdir -p "$SHARED_ROOT"
 chown -R "$RUN_USER:$RUN_GROUP" "$INSTALL_DIR"
 chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
 chown -R "$RUN_USER:$RUN_GROUP" "$LOG_DIR"
-chmod 600 "$INSTALL_DIR/.env"
+chown "$RUN_USER:$RUN_GROUP" "$SHARED_ROOT"
+chmod 775 "$SHARED_ROOT"
+if [ -f "$INSTALL_DIR/.env" ]; then
+    chmod 600 "$INSTALL_DIR/.env"
+fi
+if [ -f "$FALLBACK_ENV_FILE" ]; then
+    chmod 600 "$FALLBACK_ENV_FILE" 2>/dev/null || true
+fi
 chmod +x "$INSTALL_DIR/scripts/manage-agent.py"
 chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
 chmod +x "$INSTALL_DIR/bin/"*.sh 2>/dev/null || true
+echo "   ✅ 共享目录已就绪: $SHARED_ROOT"
 echo "   ✅ 权限设置完成"
 
 # 步骤 8: 安装并启动 systemd 服务
